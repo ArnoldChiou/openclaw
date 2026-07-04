@@ -16,6 +16,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { mintAgentRuntimeIdentityToken } from "../../gateway/agent-runtime-identity-token.js";
 import { callGateway } from "../../gateway/call.js";
 import { resolveGatewayCredentialsFromConfig, trimToUndefined } from "../../gateway/credentials.js";
+import { resolveMessageActionTurnCapability } from "../../gateway/message-action-turn-capability.js";
 import {
   resolveLeastPrivilegeOperatorScopesForMethod,
   type OperatorScope,
@@ -294,6 +295,38 @@ function resolveAgentRuntimeIdentityTokenForGatewayTool(params: {
     throw new Error("agent cron gateway calls require the trusted local gateway context");
   }
   return mintAgentRuntimeIdentityToken(identity);
+}
+
+export function resolveMessageActionAgentRuntimeIdentityToken(params: {
+  opts: GatewayCallOptions;
+  target: "local" | "remote";
+  turnCapability?: string;
+  runId?: string;
+  sessionId?: string;
+}): string | undefined {
+  const identity = getGatewayToolCallerIdentity();
+  if (!identity) {
+    return undefined;
+  }
+  const hasGatewayUrlOverride = trimToUndefined(params.opts.gatewayUrl) !== undefined;
+  const hasGatewayTokenOverride = trimToUndefined(params.opts.gatewayToken) !== undefined;
+  if (hasGatewayUrlOverride || hasGatewayTokenOverride || params.target !== "local") {
+    return undefined;
+  }
+  const messageActionContext = resolveMessageActionTurnCapability({
+    token: params.turnCapability,
+    agentId: identity.agentId,
+    runId: params.runId,
+    sessionKey: identity.sessionKey,
+    sessionId: params.sessionId,
+  });
+  if (!messageActionContext) {
+    return undefined;
+  }
+  return mintAgentRuntimeIdentityToken({
+    ...identity,
+    messageActionContext,
+  });
 }
 
 function isStaleGatewayAgentRuntimeIdentityRejection(error: unknown): boolean {
