@@ -261,6 +261,8 @@ export function createMSTeamsMessageHandler(deps: MSTeamsMessageHandlerDeps) {
     const conversationMessageId = extractMSTeamsConversationMessageId(rawConversationId);
     const conversationType = conversation?.conversationType ?? "personal";
     const teamId = activity.channelData?.team?.id;
+    const graphTeamId = activity.channelData?.team?.aadGroupId?.trim();
+    const graphChannelId = activity.channelData?.channel?.id?.trim() || conversationId;
     // For channel thread messages, resolve the thread root message ID so outbound
     // replies land in the correct thread. The root ID comes from the `messageid=`
     // portion of conversation.id (preferred) or from activity.replyToId.
@@ -763,12 +765,11 @@ export function createMSTeamsMessageHandler(deps: MSTeamsMessageHandlerDeps) {
       ? `[Thread history]\n${threadContext}\n[/Thread history]\n\n${agentBody}`
       : agentBody;
 
-    // For Teams *channel* messages (not group chats / DMs), preserve the
-    // `teamId/channelId` pair on NativeChannelId so downstream action handlers
-    // can route through `/teams/{teamId}/channels/{channelId}` via Graph API.
-    // The bare conversation id (`19:...@thread.tacv2`) is insufficient on its
-    // own because channel Graph endpoints require the owning team id too.
-    const nativeChannelId = isChannel && teamId ? `${teamId}/${conversationId}` : undefined;
+    // Bot Framework's team id is a conversation identity; Graph requires the
+    // Entra group id. Keep ingress routing on teamId and expose the Graph pair
+    // only when Teams supplied the owning aadGroupId.
+    const nativeChannelId =
+      isChannel && graphTeamId ? `${graphTeamId}/${graphChannelId}` : undefined;
     const ctxPayload = buildChannelInboundEventContext({
       channel: "msteams",
       finalize: core.channel.reply.finalizeInboundContext,
