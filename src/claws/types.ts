@@ -224,6 +224,7 @@ export type ClawApplyPlanEntry = {
   source?: string;
   consentRequired: boolean;
   blocked: boolean;
+  artifact?: ClawArtifactPreview;
   provenanceRecord?:
     | ClawArtifactProvenanceRecord
     | "workspaceFile.installRecord"

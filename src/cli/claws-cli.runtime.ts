@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { readClawFeedFile, readClawManifestFromFeed } from "../claws/feed.js";
 import { buildClawApplyPlan } from "../claws/lifecycle.js";
 import { buildClawPlan } from "../claws/plan.js";
+import { persistClawArtifactApplyProvenance } from "../claws/provenance.js";
 import { readClawManifestFile } from "../claws/reader.js";
 import type { ClawApplyPlan } from "../claws/types.js";
 import { defaultRuntime, writeRuntimeJson, type RuntimeEnv } from "../runtime.js";
@@ -37,19 +38,56 @@ function logClawApplyPlanSummary(plan: ClawApplyPlan, runtime: RuntimeEnv): void
   }
 }
 
-function failNonDryRun(opts: { dryRun?: boolean; json?: boolean }, runtime: RuntimeEnv): boolean {
-  if (opts.dryRun) {
+function failUnsafeApply(
+  opts: { dryRun?: boolean; json?: boolean; yes?: boolean },
+  runtime: RuntimeEnv,
+): boolean {
+  if (opts.dryRun || opts.yes) {
     return false;
   }
   const message =
-    "Claw apply is dry-run only in this OpenClaw build; pass --dry-run to preview lifecycle actions.";
+    "Claw apply mutates package-like artifact provenance in this OpenClaw build; pass --dry-run to preview or --yes to persist Claw artifact references.";
   if (opts.json) {
-    writeRuntimeJson(runtime, { ok: false, error: { code: "dry_run_required", message } });
+    writeRuntimeJson(runtime, { ok: false, error: { code: "confirmation_required", message } });
   } else {
     runtime.error(message);
   }
   runtime.exit(1);
   return true;
+}
+
+function failBlockedApply(
+  plan: ClawApplyPlan,
+  opts: { json?: boolean },
+  runtime: RuntimeEnv,
+): boolean {
+  if (plan.summary.blockedEntries === 0) {
+    return false;
+  }
+  const message =
+    "Claw apply is blocked by required unsupported entries; run with --dry-run --json to inspect blockers.";
+  if (opts.json) {
+    writeRuntimeJson(runtime, { ok: false, error: { code: "apply_blocked", message }, plan });
+  } else {
+    runtime.error(message);
+  }
+  runtime.exit(1);
+  return true;
+}
+
+function logClawApplyResultSummary(
+  result: ReturnType<typeof persistClawArtifactApplyProvenance>,
+  runtime: RuntimeEnv,
+): void {
+  runtime.log("Dry-run: false");
+  runtime.log("Mutation allowed: true");
+  runtime.log(`Entries: ${result.summary.totalEntries}`);
+  runtime.log(`Recorded artifact refs: ${result.summary.recordedArtifactRefs}`);
+  runtime.log(`Preview-only entries: ${result.summary.previewOnlyEntries}`);
+  runtime.log(`Provenance records: ${result.summary.provenanceRecords}`);
+  if (result.summary.skippedUnsupported > 0) {
+    runtime.log(`Skipped unsupported entries: ${result.summary.skippedUnsupported}`);
+  }
 }
 
 export async function runClawsInspectCommand(
@@ -95,7 +133,7 @@ export async function runClawsApplyCommand(
   opts: ClawsApplyOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ): Promise<void> {
-  if (failNonDryRun(opts, runtime)) {
+  if (failUnsafeApply(opts, runtime)) {
     return;
   }
 
@@ -118,13 +156,27 @@ export async function runClawsApplyCommand(
     }),
   );
 
-  if (opts.json) {
-    writeRuntimeJson(runtime, plan);
+  if (opts.dryRun) {
+    if (opts.json) {
+      writeRuntimeJson(runtime, plan);
+      return;
+    }
+
+    runtime.log(`Claw apply plan: ${plan.claw.name} (${plan.claw.id}@${plan.claw.version})`);
+    logClawApplyPlanSummary(plan, runtime);
     return;
   }
 
-  runtime.log(`Claw apply plan: ${plan.claw.name} (${plan.claw.id}@${plan.claw.version})`);
-  logClawApplyPlanSummary(plan, runtime);
+  if (failBlockedApply(plan, opts, runtime)) {
+    return;
+  }
+  const applied = persistClawArtifactApplyProvenance(plan, { sourcePath: resolve(manifestPath) });
+  if (opts.json) {
+    writeRuntimeJson(runtime, applied);
+    return;
+  }
+  runtime.log(`Claw applied: ${applied.claw.name} (${applied.claw.id}@${applied.claw.version})`);
+  logClawApplyResultSummary(applied, runtime);
 }
 
 export async function runClawsFeedInspectCommand(
@@ -168,7 +220,7 @@ export async function runClawsFeedApplyCommand(
   opts: ClawsFeedApplyOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ): Promise<void> {
-  if (failNonDryRun(opts, runtime)) {
+  if (failUnsafeApply(opts, runtime)) {
     return;
   }
 
@@ -200,14 +252,41 @@ export async function runClawsFeedApplyCommand(
     },
   };
 
-  if (opts.json) {
-    writeRuntimeJson(runtime, payload);
+  if (opts.dryRun) {
+    if (opts.json) {
+      writeRuntimeJson(runtime, payload);
+      return;
+    }
+
+    runtime.log(`Claw apply plan: ${plan.claw.name} (${plan.claw.id}@${plan.claw.version})`);
+    runtime.log(`Feed: ${result.feed.name} (${result.feed.id})`);
+    logClawApplyPlanSummary(plan, runtime);
+    if (result.diagnostics.length > 0) {
+      runtime.log(formatDiagnostics(result.diagnostics));
+    }
     return;
   }
 
-  runtime.log(`Claw apply plan: ${plan.claw.name} (${plan.claw.id}@${plan.claw.version})`);
+  if (failBlockedApply(plan, opts, runtime)) {
+    return;
+  }
+  const applied = persistClawArtifactApplyProvenance(plan, {
+    sourcePath: result.manifestPath,
+    feed: {
+      id: result.feed.id,
+      name: result.feed.name,
+      sourcePath: resolve(feedPath),
+      entry: result.entry,
+    },
+  });
+  const appliedPayload = { ...applied, feed: payload.feed };
+  if (opts.json) {
+    writeRuntimeJson(runtime, appliedPayload);
+    return;
+  }
+  runtime.log(`Claw applied: ${applied.claw.name} (${applied.claw.id}@${applied.claw.version})`);
   runtime.log(`Feed: ${result.feed.name} (${result.feed.id})`);
-  logClawApplyPlanSummary(plan, runtime);
+  logClawApplyResultSummary(applied, runtime);
   if (result.diagnostics.length > 0) {
     runtime.log(formatDiagnostics(result.diagnostics));
   }

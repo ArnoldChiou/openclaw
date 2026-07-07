@@ -21,7 +21,7 @@ function artifactAction(entry: ClawPlanEntry): ClawApplyPlanEntry {
     consentRequired: false,
     blocked,
     ...(entry.artifact && !unsupported
-      ? { provenanceRecord: entry.artifact.provenance.record }
+      ? { artifact: entry.artifact, provenanceRecord: entry.artifact.provenance.record }
       : {}),
     rollback: unsupported
       ? { action: "none" }
@@ -64,7 +64,8 @@ function automationAction(entry: ClawPlanEntry): ClawApplyPlanEntry {
     blocked: false,
     provenanceRecord: "automation.installRecord",
     rollback: { action: "disableAutomation", ...(entry.target ? { target: entry.target } : {}) },
-    reason: "Dry-run would require explicit consent before registering or enabling automation state.",
+    reason:
+      "Dry-run would require explicit consent before registering or enabling automation state.",
   };
 }
 

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 
 const mocks = vi.hoisted(() => {
   const logs: string[] = [];
@@ -223,9 +224,67 @@ describe("claws cli", () => {
     await runCli(["claws", "apply", manifestPath]);
 
     expect(mocks.runtime.error).toHaveBeenCalledWith(
-      "Claw apply is dry-run only in this OpenClaw build; pass --dry-run to preview lifecycle actions.",
+      "Claw apply mutates package-like artifact provenance in this OpenClaw build; pass --dry-run to preview or --yes to persist Claw artifact references.",
     );
     expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+  });
+
+  it("persists artifact provenance when apply is confirmed", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-apply-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "example-plugin",
+            selector: "npm:@openclaw/plugin-example@1.0.0",
+          },
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+
+      await runCli(["claws", "apply", manifestPath, "--yes", "--json"]);
+
+      expect(mocks.runtime.writeJson).toHaveBeenCalledOnce();
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        schemaVersion: "openclaw.clawApplyResult.v1",
+        dryRun: false,
+        mutationAllowed: true,
+        summary: {
+          totalEntries: 2,
+          recordedArtifactRefs: 1,
+          previewOnlyEntries: 1,
+          blockedEntries: 0,
+          provenanceRecords: 1,
+        },
+        artifacts: [
+          {
+            clawId: "starter",
+            entryId: "example-plugin",
+            artifactKey: "plugins:npm:@openclaw/plugin-example@1.0.0",
+            ownership: { clawRefs: ["starter"], refCount: 1 },
+          },
+        ],
+      });
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
   });
 
   it("builds a dry-run JSON apply plan from a feed entry", async () => {

@@ -56,18 +56,24 @@ function parseJson(stdout: string): unknown {
   return JSON.parse(trimmed);
 }
 
+function parseJsonObject(stdout: string): Record<string, unknown> {
+  const parsed = parseJson(stdout);
+  expect(parsed).toEqual(expect.any(Object));
+  return parsed as Record<string, unknown>;
+}
+
 describe("claws lifecycle cli e2e", () => {
   it("runs inspect and dry-run apply for a local Claw manifest", async () => {
     const manifestPath = "src/claws/fixtures/incident-response.claw.json";
 
-    const inspect = parseJson(
+    const inspect = parseJsonObject(
       (await runOpenClaw(["claws", "inspect", manifestPath, "--json"])).stdout,
     );
     expect(inspect).toMatchObject({
       valid: true,
       manifest: { id: "incident-response", entries: expect.any(Array) },
     });
-    const apply = parseJson(
+    const apply = parseJsonObject(
       (await runOpenClaw(["claws", "apply", manifestPath, "--dry-run", "--json"])).stdout,
     );
     expect(apply).toMatchObject({
@@ -88,7 +94,7 @@ describe("claws lifecycle cli e2e", () => {
   it("runs feed inspect and feed dry-run apply from the local feed fixture", async () => {
     const feedPath = "src/claws/fixtures/local-claws.feed.json";
 
-    const inspect = parseJson(
+    const inspect = parseJsonObject(
       (await runOpenClaw(["claws", "feed", "inspect", feedPath, "--json"])).stdout,
     );
     expect(inspect).toMatchObject({
@@ -96,7 +102,7 @@ describe("claws lifecycle cli e2e", () => {
       feed: { id: "local-starter-claws", entries: expect.any(Array) },
     });
 
-    const apply = parseJson(
+    const apply = parseJsonObject(
       (
         await runOpenClaw([
           "claws",
@@ -126,6 +132,41 @@ describe("claws lifecycle cli e2e", () => {
 
     expect(result.ok).toBe(false);
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain("Claw apply is dry-run only");
+    expect(result.stderr).toContain("Claw apply mutates package-like artifact provenance");
+  });
+
+  it("persists artifact provenance when local apply is confirmed", async () => {
+    const apply = parseJsonObject(
+      (
+        await runOpenClaw([
+          "claws",
+          "apply",
+          "src/claws/fixtures/incident-response.claw.json",
+          "--yes",
+          "--json",
+        ])
+      ).stdout,
+    );
+
+    expect(apply).toMatchObject({
+      schemaVersion: "openclaw.clawApplyResult.v1",
+      dryRun: false,
+      mutationAllowed: true,
+      summary: {
+        totalEntries: 5,
+        recordedArtifactRefs: 3,
+        previewOnlyEntries: 2,
+        blockedEntries: 0,
+        provenanceRecords: 3,
+      },
+    });
+    expect(apply.artifacts).toEqual(expect.any(Array));
+    const artifacts = apply.artifacts as unknown[];
+    expect(artifacts[0]).toMatchObject({
+      clawId: "incident-response",
+      entryId: "incident-triage-skill",
+      artifactKey: "skills:clawhub:incident-triage@1.0.0",
+      ownership: { state: "referenced", clawRefs: ["incident-response"], refCount: 1 },
+    });
   });
 });

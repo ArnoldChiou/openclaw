@@ -1,4 +1,4 @@
-// Commander registration for Claws inspection and dry-run apply previews.
+// Commander registration for Claws inspection and apply lifecycle commands.
 import type { Command } from "commander";
 import { applyParentDefaultHelpAction } from "./program/parent-default-help.js";
 
@@ -9,6 +9,7 @@ export type ClawsInspectOptions = {
 export type ClawsApplyOptions = {
   dryRun?: boolean;
   json?: boolean;
+  yes?: boolean;
 };
 
 export type ClawsFeedInspectOptions = {
@@ -18,10 +19,11 @@ export type ClawsFeedInspectOptions = {
 export type ClawsFeedApplyOptions = {
   dryRun?: boolean;
   json?: boolean;
+  yes?: boolean;
 };
 
 export function registerClawsCli(program: Command) {
-  const claws = program.command("claws").description("Inspect and preview OpenClaw Claws");
+  const claws = program.command("claws").description("Inspect and apply OpenClaw Claws");
 
   claws
     .command("inspect")
@@ -35,16 +37,17 @@ export function registerClawsCli(program: Command) {
 
   claws
     .command("apply")
-    .description("Preview the Claw apply lifecycle without mutating state")
+    .description("Preview or persist Claw artifact provenance")
     .argument("<manifest>", "Path to an openclaw.claw.v1 JSON manifest")
     .option("--dry-run", "Preview apply actions without installing or writing files", false)
+    .option("--yes", "Persist package-like Claw artifact provenance without prompting", false)
     .option("--json", "Print JSON", false)
     .action(async (manifest: string, opts: ClawsApplyOptions) => {
       const { runClawsApplyCommand } = await import("./claws-cli.runtime.js");
       await runClawsApplyCommand(manifest, opts);
     });
 
-  const feed = claws.command("feed").description("Inspect and preview Claws from a local feed");
+  const feed = claws.command("feed").description("Inspect and apply Claws from a local feed");
 
   feed
     .command("inspect")
@@ -58,10 +61,11 @@ export function registerClawsCli(program: Command) {
 
   feed
     .command("apply")
-    .description("Preview a feed Claw apply lifecycle without mutating state")
+    .description("Preview or persist feed Claw artifact provenance")
     .argument("<feed>", "Path to an openclaw.clawFeed.v1 JSON feed")
     .argument("<claw>", "Claw feed entry id")
     .option("--dry-run", "Preview apply actions without installing or writing files", false)
+    .option("--yes", "Persist package-like Claw artifact provenance without prompting", false)
     .option("--json", "Print JSON", false)
     .action(async (feedPath: string, claw: string, opts: ClawsFeedApplyOptions) => {
       const { runClawsFeedApplyCommand } = await import("./claws-cli.runtime.js");
