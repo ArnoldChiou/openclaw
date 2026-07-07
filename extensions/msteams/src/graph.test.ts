@@ -6,12 +6,18 @@ const {
   createMSTeamsTokenProviderMock,
   readAccessTokenMock,
   resolveMSTeamsCredentialsMock,
+  fetchWithSsrFGuardMock,
 } = vi.hoisted(() => {
   return {
     loadMSTeamsSdkWithAuthMock: vi.fn(),
     createMSTeamsTokenProviderMock: vi.fn(),
     readAccessTokenMock: vi.fn(),
     resolveMSTeamsCredentialsMock: vi.fn(),
+    fetchWithSsrFGuardMock: vi.fn(async (params: { url: string; init?: RequestInit }) => ({
+      response: await globalThis.fetch(params.url, params.init),
+      finalUrl: params.url,
+      release: async () => undefined,
+    })),
   };
 });
 
@@ -32,11 +38,7 @@ vi.mock("../runtime-api.js", async (importOriginal) => {
   const original = await importOriginal<typeof import("../runtime-api.js")>();
   return {
     ...original,
-    fetchWithSsrFGuard: async (params: { url: string; init?: RequestInit }) => ({
-      response: await globalThis.fetch(params.url, params.init),
-      finalUrl: params.url,
-      release: async () => undefined,
-    }),
+    fetchWithSsrFGuard: fetchWithSsrFGuardMock,
   };
 });
 
@@ -215,6 +217,17 @@ describe("msteams graph helpers", () => {
     expect(normalizeQuery("  Team Alpha  ")).toBe("Team Alpha");
     expect(normalizeQuery("   ")).toBe("");
     expect(escapeOData("alice.o'hara")).toBe("alice.o''hara");
+  });
+
+  it("lets the shared SSRF guard select the Graph transport", async () => {
+    mockGraphCollection();
+
+    await fetchGraphJson({
+      token: graphToken,
+      path: "/groups",
+    });
+
+    expect(fetchWithSsrFGuardMock.mock.calls[0]?.[0]).not.toHaveProperty("fetchImpl");
   });
 
   it("fetches Graph JSON and surfaces Graph errors with response text", async () => {
