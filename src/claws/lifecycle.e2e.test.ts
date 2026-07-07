@@ -1,6 +1,6 @@
 // E2E coverage for experimental grouped Claw inspection and add planning.
 import { execFile } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -32,7 +32,7 @@ async function runOpenClaw(args: string[], options?: { expectFailure?: boolean }
     if (options?.expectFailure) {
       throw new Error(`expected command to fail: ${args.join(" ")}`);
     }
-    return { ok: true as const, stdout: result.stdout, stderr: result.stderr };
+    return { ok: true as const, stdout: result.stdout, stderr: result.stderr, stateDir };
   } catch (error) {
     if (!options?.expectFailure) {
       throw error;
@@ -43,6 +43,7 @@ async function runOpenClaw(args: string[], options?: { expectFailure?: boolean }
       code: failed.code,
       stdout: failed.stdout ?? "",
       stderr: failed.stderr ?? "",
+      stateDir,
     };
   }
 }
@@ -98,13 +99,54 @@ describe("claws lifecycle cli e2e", () => {
     });
   });
 
-  it("fails closed when add is invoked without dry-run", async () => {
+  it("creates exactly one agent and root install record after explicit consent", async () => {
+    const result = await runOpenClaw([
+      "claws",
+      "add",
+      "src/claws/fixtures/minimal-agent.claw.json",
+      "--yes",
+      "--json",
+    ]);
+
+    expect(parseJson(result.stdout)).toMatchObject({
+      schemaVersion: "openclaw.clawAddResult.v1",
+      stability: "experimental",
+      status: "complete",
+      agent: { finalId: "internal-triage" },
+      workspaceCreated: true,
+      configCommitted: true,
+      installRecord: { agentId: "internal-triage", status: "complete" },
+    });
+    const config = JSON.parse(await readFile(join(result.stateDir, "openclaw.json"), "utf8"));
+    expect(config.agents.list).toEqual([
+      expect.objectContaining({
+        id: "internal-triage",
+        name: "Internal Triage",
+        workspace: join(result.stateDir, ".openclaw", "workspace-internal-triage"),
+      }),
+    ]);
+  });
+
+  it("blocks mutation when declared components need later lifecycle slices", async () => {
+    const result = await runOpenClaw(["claws", "add", manifestPath, "--yes", "--json"], {
+      expectFailure: true,
+    });
+
+    expect(result.code).toBe(1);
+    expect(parseJson(result.stdout)).toMatchObject({
+      schemaVersion: "openclaw.clawAddResult.v1",
+      status: "failed",
+      error: { code: "unsupported_components" },
+    });
+  });
+
+  it("fails closed when add is invoked without dry-run or consent", async () => {
     const result = await runOpenClaw(["claws", "add", manifestPath], {
       expectFailure: true,
     });
 
     expect(result.ok).toBe(false);
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain("Claw add is dry-run only");
+    expect(result.stderr).toContain("Claw add requires explicit consent");
   });
 });

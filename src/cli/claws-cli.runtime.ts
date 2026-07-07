@@ -1,3 +1,8 @@
+import {
+  applyClawAddPlan,
+  CLAW_ADD_RESULT_SCHEMA_VERSION,
+  ClawAddMutationError,
+} from "../claws/add.js";
 import { assertExperimentalClawsEnabled } from "../claws/experimental.js";
 import { buildClawAddPlan } from "../claws/lifecycle.js";
 import { readClawManifestFile } from "../claws/reader.js";
@@ -44,17 +49,17 @@ function logClawAddPlanSummary(plan: ClawAddPlan, runtime: RuntimeEnv): void {
 }
 
 function failNonDryRun(opts: ClawsAddOptions, runtime: RuntimeEnv): boolean {
-  if (opts.dryRun) {
+  if (opts.dryRun || opts.yes) {
     return false;
   }
   const message =
-    "Claw add is dry-run only in this OpenClaw build; pass --dry-run to preview lifecycle actions.";
+    "Claw add requires explicit consent; pass --dry-run to preview or --yes to create the new agent and workspace.";
   if (opts.json) {
     writeRuntimeJson(runtime, {
       schemaVersion: CLAW_ADD_PLAN_SCHEMA_VERSION,
       stability: CLAW_OUTPUT_STABILITY,
       ok: false,
-      error: { code: "dry_run_required", message },
+      error: { code: "consent_required", message },
     });
   } else {
     runtime.error(message);
@@ -151,17 +156,58 @@ export async function runClawsAddCommand(
     },
   });
 
-  if (opts.json) {
-    writeRuntimeJson(runtime, plan);
-  } else {
-    logExperimentalWarning(runtime);
-    runtime.log(`Claw add plan: ${plan.claw.name}@${plan.claw.version}`);
-    logClawAddPlanSummary(plan, runtime);
-    if (plan.blockers.length > 0) {
+  if (plan.blockers.length > 0) {
+    if (opts.json) {
+      writeRuntimeJson(runtime, plan);
+    } else {
+      logExperimentalWarning(runtime);
+      logClawAddPlanSummary(plan, runtime);
       runtime.error(formatDiagnostics(plan.blockers));
     }
+    runtime.exit(1);
+    return;
   }
-  if (plan.blockers.length > 0) {
+
+  if (opts.dryRun) {
+    if (opts.json) {
+      writeRuntimeJson(runtime, plan);
+    } else {
+      logExperimentalWarning(runtime);
+      runtime.log(`Claw add plan: ${plan.claw.name}@${plan.claw.version}`);
+      logClawAddPlanSummary(plan, runtime);
+    }
+    return;
+  }
+
+  let addResult;
+  try {
+    addResult = await applyClawAddPlan(plan);
+  } catch (error) {
+    const code = error instanceof ClawAddMutationError ? error.code : "add_failed";
+    const message = (error as Error).message;
+    if (opts.json) {
+      writeRuntimeJson(runtime, {
+        schemaVersion: CLAW_ADD_RESULT_SCHEMA_VERSION,
+        stability: CLAW_OUTPUT_STABILITY,
+        status: "failed",
+        error: { code, message },
+      });
+    } else {
+      runtime.error(message);
+    }
+    runtime.exit(1);
+    return;
+  }
+
+  if (opts.json) {
+    writeRuntimeJson(runtime, addResult);
+  } else {
+    logExperimentalWarning(runtime);
+    runtime.log(`Added agent: ${addResult.agent.finalId}`);
+    runtime.log(`Workspace: ${addResult.agent.workspace}`);
+    runtime.log(`Status: ${addResult.status}`);
+  }
+  if (addResult.status !== "complete") {
     runtime.exit(1);
   }
 }
