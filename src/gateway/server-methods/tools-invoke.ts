@@ -8,6 +8,7 @@ import {
   validateToolsInvokeParams,
   type ToolsInvokeResult,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { resolveGatewayConversationReadOrigin } from "../conversation-read-origin.js";
 import { invokeGatewayTool } from "../tools-invoke-shared.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
@@ -62,6 +63,10 @@ export const toolsInvokeHandlers: GatewayRequestHandlers = {
       cfg: context.getRuntimeConfig(),
       input: params,
       senderIsOwner: client?.connect?.scopes?.includes("operator.admin"),
+      conversationReadOrigin: resolveGatewayConversationReadOrigin({
+        client,
+        requestedOrigin: params.conversationReadOrigin,
+      }),
       toolCallIdPrefix: "rpc",
       approvalMode: params.confirm === true ? "request" : "report",
     });

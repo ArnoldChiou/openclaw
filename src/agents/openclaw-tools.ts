@@ -7,6 +7,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import type { SourceReplyDeliveryMode } from "../auto-reply/get-reply-options.types.js";
 import type { ChatType } from "../channels/chat-type.js";
 import type { InboundEventKind } from "../channels/inbound-event/kind.js";
+import type { ConversationReadInvocationOrigin } from "../channels/plugins/conversation-read-origin.js";
 import { selectApplicableRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { callGateway } from "../gateway/call.js";
@@ -156,6 +157,8 @@ export function createOpenClawTools(
     requesterAgentIdOverride?: string;
     /** Trusted sender identity bit for channel action auth. */
     senderIsOwner?: boolean;
+    /** Server-owned operation-local origin for conversation-read visibility policy. */
+    conversationReadOrigin?: ConversationReadInvocationOrigin;
     /** Restrict the cron tool to self-removing this active cron job. */
     cronSelfRemoveOnlyJobId?: string;
     /** Require explicit message targets (no implicit last-route sends). */
@@ -390,6 +393,7 @@ export function createOpenClawTools(
         inboundEventKind: options?.inboundEventKind,
         requesterSenderId: options?.requesterSenderId ?? undefined,
         senderIsOwner: options?.senderIsOwner,
+        conversationReadOrigin: options?.conversationReadOrigin,
       });
   const heartbeatTool = options?.enableHeartbeatTool ? createHeartbeatResponseTool() : null;
   options?.recordToolPrepStage?.("openclaw-tools:message-tool");

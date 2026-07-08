@@ -53,6 +53,7 @@ type ScopedToolsCall = {
   sourceReplyDeliveryMode?: string;
   requireExplicitMessageTarget?: boolean;
   senderIsOwner?: boolean;
+  conversationReadOrigin?: "delegated" | "direct-operator";
   surface?: string;
   excludeToolNames?: Iterable<string>;
 };
@@ -831,6 +832,7 @@ describe("mcp loopback server", () => {
     expect(call.inboundEventKind).toBe("room_event");
     expect(call.sourceReplyDeliveryMode).toBe("message_tool_only");
     expect(call.requireExplicitMessageTarget).toBe(true);
+    expect(call.conversationReadOrigin).toBe("delegated");
     expect(call.surface).toBe("loopback");
     expect(Array.from(call.excludeToolNames ?? [])).toEqual([
       "read",
@@ -877,6 +879,7 @@ describe("mcp loopback server", () => {
     expect(call.currentThreadTs).toBeUndefined();
     expect(call.sourceReplyDeliveryMode).toBeUndefined();
     expect(call.inboundEventKind).toBeUndefined();
+    expect(call.conversationReadOrigin).toBe("delegated");
   });
 
   it("routes sessions_yield to the current CLI capture", async () => {
