@@ -1,5 +1,5 @@
 // Tests for the Claws CLI inspection and dry-run apply commands.
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
@@ -38,6 +38,8 @@ async function writeManifest(value: unknown): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-"));
   const path = join(dir, "claw.json");
   await writeFile(path, JSON.stringify(value), "utf8");
+  await mkdir(join(dir, "files"), { recursive: true });
+  await writeFile(join(dir, "files", "SOUL.md"), "starter soul\n", "utf8");
   return path;
 }
 
@@ -75,6 +77,8 @@ async function writeFeedWorkspace(params?: {
     ],
   };
   await writeFile(join(dir, "starter.claw.json"), JSON.stringify(manifest), "utf8");
+  await mkdir(join(dir, "files"), { recursive: true });
+  await writeFile(join(dir, "files", "SOUL.md"), "feed soul\n", "utf8");
   const feedPath = join(dir, "claws.feed.json");
   await writeFile(feedPath, JSON.stringify(feed), "utf8");
   return feedPath;
@@ -224,12 +228,12 @@ describe("claws cli", () => {
     await runCli(["claws", "apply", manifestPath]);
 
     expect(mocks.runtime.error).toHaveBeenCalledWith(
-      "Claw apply mutates package-like artifact provenance in this OpenClaw build; pass --dry-run to preview or --yes to persist Claw artifact references.",
+      "Claw apply mutates workspace files and package-like artifact provenance in this OpenClaw build; pass --dry-run to preview or --yes to apply supported Claw mutations.",
     );
     expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
   });
 
-  it("persists artifact provenance when apply is confirmed", async () => {
+  it("applies workspace files and persists artifact provenance when apply is confirmed", async () => {
     const previousStateDir = process.env.OPENCLAW_STATE_DIR;
     process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-apply-"));
     closeOpenClawStateDatabaseForTest();
@@ -254,7 +258,17 @@ describe("claws cli", () => {
         ],
       });
 
-      await runCli(["claws", "apply", manifestPath, "--yes", "--json"]);
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-workspace-"));
+
+      await runCli([
+        "claws",
+        "apply",
+        manifestPath,
+        "--yes",
+        "--workspace",
+        workspaceRoot,
+        "--json",
+      ]);
 
       expect(mocks.runtime.writeJson).toHaveBeenCalledOnce();
       expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
@@ -264,9 +278,10 @@ describe("claws cli", () => {
         summary: {
           totalEntries: 2,
           recordedArtifactRefs: 1,
-          previewOnlyEntries: 1,
+          appliedWorkspaceFiles: 1,
+          previewOnlyEntries: 0,
           blockedEntries: 0,
-          provenanceRecords: 1,
+          provenanceRecords: 2,
         },
         artifacts: [
           {
@@ -276,7 +291,72 @@ describe("claws cli", () => {
             ownership: { clawRefs: ["starter"], refCount: 1 },
           },
         ],
+        workspaceFiles: [
+          {
+            clawId: "starter",
+            entryId: "soul",
+            workspaceRoot,
+            operation: "created",
+          },
+        ],
       });
+      await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toBe(
+        "starter soul\n",
+      );
+      mocks.runtime.writeJson.mockClear();
+      await runCli([
+        "claws",
+        "apply",
+        manifestPath,
+        "--yes",
+        "--workspace",
+        workspaceRoot,
+        "--json",
+      ]);
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        summary: { appliedWorkspaceFiles: 0, provenanceRecords: 2 },
+        workspaceFiles: [{ entryId: "soul", operation: "unchanged" }],
+      });
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("applies workspace files from a feed entry", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(
+      join(tmpdir(), "openclaw-claws-cli-feed-apply-"),
+    );
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const feedPath = await writeFeedWorkspace();
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-feed-workspace-"));
+
+      await runCli([
+        "claws",
+        "feed",
+        "apply",
+        feedPath,
+        "starter",
+        "--yes",
+        "--workspace",
+        workspaceRoot,
+        "--json",
+      ]);
+
+      expect(mocks.runtime.writeJson).toHaveBeenCalledOnce();
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        schemaVersion: "openclaw.clawApplyResult.v1",
+        feed: { id: "local-starters", entry: { id: "starter" } },
+        summary: { appliedWorkspaceFiles: 1, previewOnlyEntries: 0, provenanceRecords: 1 },
+        workspaceFiles: [{ entryId: "soul", workspaceRoot, operation: "created" }],
+      });
+      await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toBe("feed soul\n");
     } finally {
       closeOpenClawStateDatabaseForTest();
       if (previousStateDir === undefined) {

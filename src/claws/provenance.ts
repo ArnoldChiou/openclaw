@@ -6,7 +6,7 @@ import {
   runOpenClawStateWriteTransaction,
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
-import type { ClawApplyPlan, ClawApplyPlanEntry } from "./types.js";
+import type { ClawApplyPlan, ClawApplyPlanEntry, PersistedClawWorkspaceFileRef } from "./types.js";
 
 const CLAW_APPLY_RECORD_SCHEMA_VERSION = "openclaw.clawApplyRecord.v1";
 const CLAW_ARTIFACT_REF_SCHEMA_VERSION = "openclaw.clawArtifactRef.v1";
@@ -49,12 +49,14 @@ export type ClawApplyProvenanceResult = {
   summary: {
     totalEntries: number;
     recordedArtifactRefs: number;
+    appliedWorkspaceFiles: number;
     previewOnlyEntries: number;
     skippedUnsupported: number;
     blockedEntries: number;
     provenanceRecords: number;
   };
   artifacts: PersistedClawArtifactRef[];
+  workspaceFiles: PersistedClawWorkspaceFileRef[];
   previewOnlyEntries: ClawApplyPlanEntry[];
   skippedUnsupportedEntries: ClawApplyPlanEntry[];
   diagnostics: ClawApplyPlan["diagnostics"];
@@ -393,12 +395,14 @@ export function persistClawArtifactApplyProvenance(
       summary: {
         totalEntries: plan.entries.length,
         recordedArtifactRefs: 0,
+        appliedWorkspaceFiles: 0,
         previewOnlyEntries: previewOnlyEntries.length,
         skippedUnsupported: skippedUnsupportedEntries.length,
         blockedEntries: blockedEntries.length,
         provenanceRecords: 0,
       },
       artifacts: [],
+      workspaceFiles: [],
       previewOnlyEntries,
       skippedUnsupportedEntries,
       diagnostics: plan.diagnostics,
@@ -462,12 +466,14 @@ export function persistClawArtifactApplyProvenance(
     summary: {
       totalEntries: plan.entries.length,
       recordedArtifactRefs: artifacts.length,
+      appliedWorkspaceFiles: 0,
       previewOnlyEntries: previewOnlyEntries.length,
       skippedUnsupported: skippedUnsupportedEntries.length,
       blockedEntries: 0,
       provenanceRecords: artifacts.length,
     },
     artifacts,
+    workspaceFiles: [],
     previewOnlyEntries,
     skippedUnsupportedEntries,
     diagnostics: plan.diagnostics,

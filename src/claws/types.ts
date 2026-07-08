@@ -236,6 +236,22 @@ export type ClawApplyPlanEntry = {
   reason: string;
 };
 
+export type PersistedClawWorkspaceFileRef = {
+  schemaVersion: "openclaw.clawWorkspaceFileRef.v1";
+  clawId: string;
+  clawVersion: string;
+  entryId: string;
+  kind: string;
+  targetPath: string;
+  workspaceRoot: string;
+  sourcePath: string;
+  contentSha256: string;
+  operation: "created" | "updated" | "unchanged";
+  provenanceRecord?: "workspaceFile.installRecord";
+  appliedAtMs: number;
+  updatedAtMs: number;
+};
+
 export type ClawApplyPlan = {
   schemaVersion: ClawApplyPlanSchemaVersion;
   dryRun: true;

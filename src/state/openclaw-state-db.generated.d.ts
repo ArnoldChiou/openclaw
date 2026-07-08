@@ -205,6 +205,22 @@ export interface ChannelPairingRequests {
   request_id: string;
 }
 
+export interface ClawWorkspaceFileRefs {
+  applied_at_ms: number;
+  claw_id: string;
+  claw_version: string;
+  content_sha256: string;
+  entry_id: string;
+  kind: string;
+  operation: string;
+  provenance_record: string | null;
+  schema_version: string;
+  source_path: string;
+  target_path: string;
+  updated_at_ms: number;
+  workspace_root: string;
+}
+
 export interface CommandLogEntries {
   action: string;
   entry_json: string;
@@ -1051,6 +1067,7 @@ export interface DB {
   channel_ingress_events: ChannelIngressEvents;
   channel_pairing_allow_entries: ChannelPairingAllowEntries;
   channel_pairing_requests: ChannelPairingRequests;
+  claw_workspace_file_refs: ClawWorkspaceFileRefs;
   command_log_entries: CommandLogEntries;
   commitments: Commitments;
   config_health_entries: ConfigHealthEntries;

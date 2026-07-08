@@ -10,6 +10,7 @@ export type ClawsApplyOptions = {
   dryRun?: boolean;
   json?: boolean;
   yes?: boolean;
+  workspace?: string;
 };
 
 export type ClawsFeedInspectOptions = {
@@ -20,6 +21,7 @@ export type ClawsFeedApplyOptions = {
   dryRun?: boolean;
   json?: boolean;
   yes?: boolean;
+  workspace?: string;
 };
 
 export function registerClawsCli(program: Command) {
@@ -37,10 +39,11 @@ export function registerClawsCli(program: Command) {
 
   claws
     .command("apply")
-    .description("Preview or persist Claw artifact provenance")
+    .description("Preview or apply Claw workspace files and artifact provenance")
     .argument("<manifest>", "Path to an openclaw.claw.v1 JSON manifest")
     .option("--dry-run", "Preview apply actions without installing or writing files", false)
-    .option("--yes", "Persist package-like Claw artifact provenance without prompting", false)
+    .option("--yes", "Apply supported Claw mutations without prompting", false)
+    .option("--workspace <dir>", "Workspace root for workspace and persona file writes")
     .option("--json", "Print JSON", false)
     .action(async (manifest: string, opts: ClawsApplyOptions) => {
       const { runClawsApplyCommand } = await import("./claws-cli.runtime.js");
@@ -61,11 +64,12 @@ export function registerClawsCli(program: Command) {
 
   feed
     .command("apply")
-    .description("Preview or persist feed Claw artifact provenance")
+    .description("Preview or apply feed Claw workspace files and artifact provenance")
     .argument("<feed>", "Path to an openclaw.clawFeed.v1 JSON feed")
     .argument("<claw>", "Claw feed entry id")
     .option("--dry-run", "Preview apply actions without installing or writing files", false)
-    .option("--yes", "Persist package-like Claw artifact provenance without prompting", false)
+    .option("--yes", "Apply supported Claw mutations without prompting", false)
+    .option("--workspace <dir>", "Workspace root for workspace and persona file writes")
     .option("--json", "Print JSON", false)
     .action(async (feedPath: string, claw: string, opts: ClawsFeedApplyOptions) => {
       const { runClawsFeedApplyCommand } = await import("./claws-cli.runtime.js");

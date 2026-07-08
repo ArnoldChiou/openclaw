@@ -5,7 +5,8 @@ import { buildClawApplyPlan } from "../claws/lifecycle.js";
 import { buildClawPlan } from "../claws/plan.js";
 import { persistClawArtifactApplyProvenance } from "../claws/provenance.js";
 import { readClawManifestFile } from "../claws/reader.js";
-import type { ClawApplyPlan } from "../claws/types.js";
+import type { ClawApplyPlan, PersistedClawWorkspaceFileRef } from "../claws/types.js";
+import { applyClawWorkspaceFiles, ClawWorkspaceApplyError } from "../claws/workspace.js";
 import { defaultRuntime, writeRuntimeJson, type RuntimeEnv } from "../runtime.js";
 import type {
   ClawsApplyOptions,
@@ -46,7 +47,7 @@ function failUnsafeApply(
     return false;
   }
   const message =
-    "Claw apply mutates package-like artifact provenance in this OpenClaw build; pass --dry-run to preview or --yes to persist Claw artifact references.";
+    "Claw apply mutates workspace files and package-like artifact provenance in this OpenClaw build; pass --dry-run to preview or --yes to apply supported Claw mutations.";
   if (opts.json) {
     writeRuntimeJson(runtime, { ok: false, error: { code: "confirmation_required", message } });
   } else {
@@ -83,11 +84,54 @@ function logClawApplyResultSummary(
   runtime.log("Mutation allowed: true");
   runtime.log(`Entries: ${result.summary.totalEntries}`);
   runtime.log(`Recorded artifact refs: ${result.summary.recordedArtifactRefs}`);
+  runtime.log(`Applied workspace files: ${result.summary.appliedWorkspaceFiles}`);
   runtime.log(`Preview-only entries: ${result.summary.previewOnlyEntries}`);
   runtime.log(`Provenance records: ${result.summary.provenanceRecords}`);
   if (result.summary.skippedUnsupported > 0) {
     runtime.log(`Skipped unsupported entries: ${result.summary.skippedUnsupported}`);
   }
+}
+
+function combineApplyResult(
+  result: ReturnType<typeof persistClawArtifactApplyProvenance>,
+  workspaceFiles: PersistedClawWorkspaceFileRef[],
+): ReturnType<typeof persistClawArtifactApplyProvenance> {
+  const previewOnlyEntries = result.previewOnlyEntries.filter(
+    (entry) => entry.phase !== "workspace",
+  );
+  return {
+    ...result,
+    summary: {
+      ...result.summary,
+      appliedWorkspaceFiles: workspaceFiles.filter((file) => file.operation !== "unchanged").length,
+      previewOnlyEntries: previewOnlyEntries.length,
+      provenanceRecords: result.artifacts.length + workspaceFiles.length,
+    },
+    workspaceFiles,
+    previewOnlyEntries,
+  };
+}
+
+function failWorkspaceApply(
+  error: unknown,
+  opts: { json?: boolean },
+  runtime: RuntimeEnv,
+): boolean {
+  if (!(error instanceof ClawWorkspaceApplyError)) {
+    throw error;
+  }
+  const message = "Claw apply could not safely write workspace files.";
+  if (opts.json) {
+    writeRuntimeJson(runtime, {
+      ok: false,
+      error: { code: "workspace_apply_failed", message },
+      diagnostics: error.diagnostics,
+    });
+  } else {
+    runtime.error(`${message}\n${formatDiagnostics(error.diagnostics)}`);
+  }
+  runtime.exit(1);
+  return true;
 }
 
 export async function runClawsInspectCommand(
@@ -170,7 +214,22 @@ export async function runClawsApplyCommand(
   if (failBlockedApply(plan, opts, runtime)) {
     return;
   }
-  const applied = persistClawArtifactApplyProvenance(plan, { sourcePath: resolve(manifestPath) });
+  let workspaceFiles: PersistedClawWorkspaceFileRef[];
+  try {
+    workspaceFiles = await applyClawWorkspaceFiles(plan, {
+      sourcePath: resolve(manifestPath),
+      workspaceRoot: opts.workspace,
+    });
+  } catch (error) {
+    if (failWorkspaceApply(error, opts, runtime)) {
+      return;
+    }
+    throw error;
+  }
+  const applied = combineApplyResult(
+    persistClawArtifactApplyProvenance(plan, { sourcePath: resolve(manifestPath) }),
+    workspaceFiles,
+  );
   if (opts.json) {
     writeRuntimeJson(runtime, applied);
     return;
@@ -270,15 +329,30 @@ export async function runClawsFeedApplyCommand(
   if (failBlockedApply(plan, opts, runtime)) {
     return;
   }
-  const applied = persistClawArtifactApplyProvenance(plan, {
-    sourcePath: result.manifestPath,
-    feed: {
-      id: result.feed.id,
-      name: result.feed.name,
-      sourcePath: resolve(feedPath),
-      entry: result.entry,
-    },
-  });
+  let workspaceFiles: PersistedClawWorkspaceFileRef[];
+  try {
+    workspaceFiles = await applyClawWorkspaceFiles(plan, {
+      sourcePath: result.manifestPath,
+      workspaceRoot: opts.workspace,
+    });
+  } catch (error) {
+    if (failWorkspaceApply(error, opts, runtime)) {
+      return;
+    }
+    throw error;
+  }
+  const applied = combineApplyResult(
+    persistClawArtifactApplyProvenance(plan, {
+      sourcePath: result.manifestPath,
+      feed: {
+        id: result.feed.id,
+        name: result.feed.name,
+        sourcePath: resolve(feedPath),
+        entry: result.entry,
+      },
+    }),
+    workspaceFiles,
+  );
   const appliedPayload = { ...applied, feed: payload.feed };
   if (opts.json) {
     writeRuntimeJson(runtime, appliedPayload);

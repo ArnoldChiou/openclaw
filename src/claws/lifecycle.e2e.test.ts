@@ -1,6 +1,6 @@
 // E2E coverage for the staged Claw lifecycle CLI flow.
 import { execFile } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -132,10 +132,11 @@ describe("claws lifecycle cli e2e", () => {
 
     expect(result.ok).toBe(false);
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain("Claw apply mutates package-like artifact provenance");
+    expect(result.stderr).toContain("Claw apply mutates workspace files");
   });
 
-  it("persists artifact provenance when local apply is confirmed", async () => {
+  it("applies workspace files and persists artifact provenance when local apply is confirmed", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-lifecycle-workspace-"));
     const apply = parseJsonObject(
       (
         await runOpenClaw([
@@ -143,6 +144,8 @@ describe("claws lifecycle cli e2e", () => {
           "apply",
           "src/claws/fixtures/incident-response.claw.json",
           "--yes",
+          "--workspace",
+          workspaceRoot,
           "--json",
         ])
       ).stdout,
@@ -155,12 +158,23 @@ describe("claws lifecycle cli e2e", () => {
       summary: {
         totalEntries: 5,
         recordedArtifactRefs: 3,
-        previewOnlyEntries: 2,
+        appliedWorkspaceFiles: 1,
+        previewOnlyEntries: 1,
         blockedEntries: 0,
-        provenanceRecords: 3,
+        provenanceRecords: 4,
       },
     });
     expect(apply.artifacts).toEqual(expect.any(Array));
+    expect(apply.workspaceFiles).toEqual(expect.any(Array));
+    const workspaceFiles = apply.workspaceFiles as unknown[];
+    expect(workspaceFiles[0]).toMatchObject({
+      entryId: "runbook",
+      workspaceRoot,
+      operation: "created",
+    });
+    await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toContain(
+      "Incident Response",
+    );
     const artifacts = apply.artifacts as unknown[];
     expect(artifacts[0]).toMatchObject({
       clawId: "incident-response",

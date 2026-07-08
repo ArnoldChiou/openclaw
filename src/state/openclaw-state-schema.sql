@@ -547,6 +547,26 @@ CREATE TABLE IF NOT EXISTS installed_plugin_index (
 CREATE INDEX IF NOT EXISTS idx_installed_plugin_index_generated
   ON installed_plugin_index(generated_at_ms DESC, index_key);
 
+CREATE TABLE IF NOT EXISTS claw_workspace_file_refs (
+  claw_id TEXT NOT NULL,
+  entry_id TEXT NOT NULL,
+  schema_version TEXT NOT NULL,
+  claw_version TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  target_path TEXT NOT NULL,
+  workspace_root TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  provenance_record TEXT,
+  applied_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (claw_id, workspace_root, entry_id)
+);
+
+CREATE INDEX IF NOT EXISTS claw_workspace_file_refs_by_target
+  ON claw_workspace_file_refs(workspace_root, target_path);
+
 CREATE TABLE IF NOT EXISTS official_external_plugin_catalog_snapshots (
   feed_url TEXT NOT NULL PRIMARY KEY,
   body TEXT NOT NULL,
