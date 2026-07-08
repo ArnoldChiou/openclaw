@@ -47,6 +47,8 @@ vi.mock("../runtime.js", async () => ({
     runtime.writeJson(value, space),
 }));
 
+const { ClawArtifactApplyError } = await import("../claws/artifact-installers.js");
+const { readClawArtifactRefsForArtifactKey } = await import("../claws/provenance.js");
 const { registerClawsCli } = await import("./claws-cli.js");
 
 async function writeManifest(value: unknown): Promise<string> {
@@ -339,6 +341,157 @@ describe("claws cli", () => {
         summary: { appliedWorkspaceFiles: 0, provenanceRecords: 2 },
         workspaceFiles: [{ entryId: "soul", operation: "unchanged" }],
       });
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("does not install artifacts when workspace apply validation fails", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-apply-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "example-plugin",
+            selector: "npm:@openclaw/plugin-example@1.0.0",
+          },
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-workspace-"));
+      await writeFile(join(workspaceRoot, "SOUL.md"), "user content\n", "utf8");
+
+      await runCli(["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot]);
+
+      expect(artifactInstallerMock.applyClawArtifactInstallers).not.toHaveBeenCalled();
+      expect(mocks.runtime.error).toHaveBeenCalledWith(
+        expect.stringContaining("workspace_file_conflict"),
+      );
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("does not write workspace files when artifact installation fails", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-apply-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "example-plugin",
+            selector: "npm:@openclaw/plugin-example@1.0.0",
+          },
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-workspace-"));
+      artifactInstallerMock.applyClawArtifactInstallers.mockRejectedValueOnce(
+        new ClawArtifactApplyError([
+          {
+            level: "error",
+            code: "artifact_install_failed",
+            path: "$.entries[0]",
+            message: "install failed",
+          },
+        ]),
+      );
+
+      await runCli(["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot]);
+
+      await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(mocks.runtime.error).toHaveBeenCalledWith(
+        expect.stringContaining("artifact_install_failed"),
+      );
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("persists artifact provenance when a later workspace write fails", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-apply-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "example-plugin",
+            selector: "npm:@openclaw/plugin-example@1.0.0",
+          },
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-workspace-"));
+      artifactInstallerMock.applyClawArtifactInstallers.mockImplementationOnce(async () => {
+        await writeFile(join(workspaceRoot, "SOUL.md"), "raced user content\n", "utf8");
+        return {
+          directArtifactKeys: new Set<string>(),
+          createdArtifactKeys: new Set<string>(["plugins:npm:@openclaw/plugin-example@1.0.0"]),
+          installedArtifactKeys: new Set<string>(["plugins:npm:@openclaw/plugin-example@1.0.0"]),
+        };
+      });
+
+      await runCli(["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot]);
+
+      expect(mocks.runtime.error).toHaveBeenCalledWith(
+        expect.stringContaining("workspace_file_conflict"),
+      );
+      expect(
+        readClawArtifactRefsForArtifactKey("plugins:npm:@openclaw/plugin-example@1.0.0"),
+      ).toMatchObject([
+        { clawId: "starter", entryId: "example-plugin", ownership: { clawRefs: ["starter"] } },
+      ]);
     } finally {
       closeOpenClawStateDatabaseForTest();
       if (previousStateDir === undefined) {

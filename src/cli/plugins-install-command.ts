@@ -406,7 +406,9 @@ async function tryInstallPluginOrHookPackFromNpmSpec(params: {
   trustedSourceLinkedOfficialInstall?: boolean;
   invalidateRuntimeCache?: boolean;
   runtime?: RuntimeEnv;
+  allowHookFallback?: boolean;
 }): Promise<{ ok: true } | { ok: false }> {
+  const allowHookFallback = params.allowHookFallback ?? true;
   const fullyBlockedReason = resolveFullyBlockedConfigMutationReason(params.snapshot);
   if (fullyBlockedReason) {
     (params.runtime ?? defaultRuntime).error(fullyBlockedReason);
@@ -424,7 +426,7 @@ async function tryInstallPluginOrHookPackFromNpmSpec(params: {
       ...(params.expectedIntegrity ? { expectedIntegrity: params.expectedIntegrity } : {}),
       logger: createHookPackInstallLogger(params.runtime),
     });
-    if (hookProbe.ok && hookProbe.packageKind === "hook-only") {
+    if (allowHookFallback && hookProbe.ok && hookProbe.packageKind === "hook-only") {
       if (params.snapshot.hookMutation.mode === "blocked") {
         (params.runtime ?? defaultRuntime).error(params.snapshot.hookMutation.reason);
         return { ok: false };
@@ -484,6 +486,10 @@ async function tryInstallPluginOrHookPackFromNpmSpec(params: {
         });
         return { ok: true };
       }
+    }
+    if (!allowHookFallback) {
+      (params.runtime ?? defaultRuntime).error(result.error);
+      return { ok: false };
     }
     const hookFallback = await tryInstallHookPackFromNpmSpec({
       snapshot: params.snapshot,
@@ -868,6 +874,7 @@ export async function runPluginInstallCommand(params: {
     link?: boolean;
     pin?: boolean;
     marketplace?: string;
+    pluginOnly?: boolean;
   };
   invalidateRuntimeCache?: boolean;
   runtime?: RuntimeEnv;
@@ -1040,7 +1047,7 @@ export async function runPluginInstallCommand(params: {
         mode: installMode,
         inspection: "package-kind",
       });
-      if (hookProbe.ok && hookProbe.packageKind === "hook-only") {
+      if (!opts.pluginOnly && hookProbe.ok && hookProbe.packageKind === "hook-only") {
         if (snapshot.hookMutation.mode === "blocked") {
           runtime.error(snapshot.hookMutation.reason);
           return runtime.exit(1);
@@ -1079,6 +1086,10 @@ export async function runPluginInstallCommand(params: {
       });
       if (!probe.ok) {
         if (isTerminalPluginInstallFailure(probe.code)) {
+          runtime.error(probe.error);
+          return runtime.exit(1);
+        }
+        if (opts.pluginOnly) {
           runtime.error(probe.error);
           return runtime.exit(1);
         }
@@ -1134,6 +1145,10 @@ export async function runPluginInstallCommand(params: {
     });
     if (!result.ok) {
       if (isTerminalPluginInstallFailure(result.code)) {
+        runtime.error(result.error);
+        return runtime.exit(1);
+      }
+      if (opts.pluginOnly) {
         runtime.error(result.error);
         return runtime.exit(1);
       }
@@ -1193,6 +1208,7 @@ export async function runPluginInstallCommand(params: {
       pin: opts.pin,
       safetyOverrides,
       allowBundledFallback: false,
+      allowHookFallback: !opts.pluginOnly,
       extensionsDir,
       invalidateRuntimeCache,
       ...(officialNpmTrust
@@ -1297,6 +1313,7 @@ export async function runPluginInstallCommand(params: {
       pin: opts.pin,
       safetyOverrides,
       allowBundledFallback: false,
+      allowHookFallback: !opts.pluginOnly,
       extensionsDir,
       expectedPluginId: officialExternalPlan.pluginId,
       expectedIntegrity: officialExternalPlan.expectedIntegrity,
@@ -1354,6 +1371,7 @@ export async function runPluginInstallCommand(params: {
     pin: opts.pin,
     safetyOverrides,
     allowBundledFallback: true,
+    allowHookFallback: !opts.pluginOnly,
     extensionsDir,
     invalidateRuntimeCache,
     ...(officialNpmTrust

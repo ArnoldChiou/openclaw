@@ -373,15 +373,18 @@ export async function applyClawWorkspaceFiles(
     sourcePath?: string;
     workspaceRoot?: string;
     nowMs?: number;
+    validateOnly?: boolean;
   } = {},
 ): Promise<PersistedClawWorkspaceFileRef[]> {
   const entries = workspaceEntries(plan);
   const requestedWorkspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
   if (entries.length === 0) {
     const workspaceRoot = await canonicalWorkspaceRootForNoopApply(requestedWorkspaceRoot);
-    runOpenClawStateWriteTransaction(({ db }) => {
-      deleteStaleWorkspaceRefs(db, plan.claw.id, workspaceRoot, []);
-    }, options);
+    if (!options.validateOnly) {
+      runOpenClawStateWriteTransaction(({ db }) => {
+        deleteStaleWorkspaceRefs(db, plan.claw.id, workspaceRoot, []);
+      }, options);
+    }
     return [];
   }
   let workspace: Awaited<ReturnType<typeof fsSafeRoot>>;
@@ -420,6 +423,10 @@ export async function applyClawWorkspaceFiles(
       nowMs,
     }),
   );
+  if (options.validateOnly) {
+    return refs;
+  }
+
   const refsByEntryId = new Map(refs.map((ref) => [ref.entryId, ref] as const));
   const appliedRefs: PersistedClawWorkspaceFileRef[] = [];
   for (const item of prepared) {

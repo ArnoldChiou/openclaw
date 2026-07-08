@@ -3,10 +3,14 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { buildClawApplyPlan } from "./lifecycle.js";
 import { buildClawPlan } from "./plan.js";
-import { persistClawArtifactApplyProvenance, releaseDirectArtifactOwner } from "./provenance.js";
+import {
+  persistClawArtifactApplyProvenance,
+  readClawArtifactRefsForPluginInstallRecord,
+} from "./provenance.js";
 import { parseClawManifest } from "./schema.js";
 
 function stateEnv() {
@@ -55,6 +59,21 @@ afterEach(() => {
 });
 
 describe("persistClawArtifactApplyProvenance", () => {
+  it("does not persist non-plugin artifact surfaces", () => {
+    const result = persistClawArtifactApplyProvenance(
+      applyPlan({
+        entries: [{ kind: "skill", id: "sec-filings", selector: "clawhub:sec-filings@1.0.0" }],
+      }),
+      { env: stateEnv(), nowMs: 1 },
+    );
+
+    expect(result.summary).toMatchObject({
+      recordedArtifactRefs: 0,
+      provenanceRecords: 0,
+    });
+    expect(result.artifacts).toEqual([]);
+  });
+
   it("persists only package-like artifact refs and leaves workspace entries preview-only", () => {
     const result = persistClawArtifactApplyProvenance(applyPlan(), {
       env: stateEnv(),
@@ -96,48 +115,74 @@ describe("persistClawArtifactApplyProvenance", () => {
     });
   });
 
-  it("counts preexisting direct installs as separate artifact owners", () => {
-    const artifactKey = "plugins:npm:@openclaw/plugin-terminal@2.0.0";
-    const result = persistClawArtifactApplyProvenance(applyPlan(), {
-      env: stateEnv(),
-      nowMs: 1,
-      directArtifactKeys: new Set([artifactKey]),
-    });
-
-    expect(result.artifacts[0]).toMatchObject({
-      artifactKey,
-      ownership: {
-        state: "shared",
-        createdByThisApply: false,
-        preexistingDirectInstall: true,
-        clawRefs: ["starter"],
-        refCount: 2,
-      },
-    });
-  });
-
-  it("releases a direct owner while preserving Claw artifact refs", () => {
+  it("preserves Claw-created ownership across idempotent reapply", () => {
     const env = stateEnv();
     const artifactKey = "plugins:npm:@openclaw/plugin-terminal@2.0.0";
     persistClawArtifactApplyProvenance(applyPlan(), {
       env,
       nowMs: 1,
-      directArtifactKeys: new Set([artifactKey]),
+      createdArtifactKeys: new Set([artifactKey]),
     });
 
-    const refs = releaseDirectArtifactOwner(artifactKey, { env, nowMs: 2 });
+    const reapplied = persistClawArtifactApplyProvenance(applyPlan(), { env, nowMs: 2 });
 
-    expect(refs).toHaveLength(1);
-    expect(refs[0]).toMatchObject({
+    expect(reapplied.artifacts[0]).toMatchObject({
       artifactKey,
       ownership: {
-        state: "referenced",
-        createdByThisApply: false,
+        state: "newly-created",
+        createdByThisApply: true,
         preexistingDirectInstall: false,
-        clawRefs: ["starter"],
         refCount: 1,
       },
     });
+  });
+
+  it("does not carry created ownership across changed artifact selectors", () => {
+    const env = stateEnv();
+    persistClawArtifactApplyProvenance(applyPlan(), {
+      env,
+      nowMs: 1,
+      createdArtifactKeys: new Set(["plugins:npm:@openclaw/plugin-terminal@2.0.0"]),
+    });
+
+    const changed = persistClawArtifactApplyProvenance(
+      applyPlan({ selector: "npm:@openclaw/plugin-terminal@3.0.0" }),
+      { env, nowMs: 2 },
+    );
+
+    expect(changed.artifacts[0]).toMatchObject({
+      artifactKey: "plugins:npm:@openclaw/plugin-terminal@3.0.0",
+      ownership: {
+        state: "referenced",
+        createdByThisApply: false,
+        refCount: 1,
+      },
+    });
+  });
+
+  it("does not match exact persisted npm refs to a different installed version", () => {
+    const env = stateEnv();
+    persistClawArtifactApplyProvenance(
+      applyPlan({ selector: "npm:@openclaw/plugin-terminal@1.0.0" }),
+      {
+        env,
+        nowMs: 1,
+      },
+    );
+
+    const refs = readClawArtifactRefsForPluginInstallRecord(
+      "terminal",
+      {
+        source: "npm",
+        spec: "@openclaw/plugin-terminal@2.0.0",
+        resolvedName: "@openclaw/plugin-terminal",
+        resolvedVersion: "2.0.0",
+        installPath: "/tmp/plugin-terminal",
+      } satisfies PluginInstallRecord,
+      { env },
+    );
+
+    expect(refs).toEqual([]);
   });
 
   it("records shared artifact refs when another Claw already references the same artifact", () => {

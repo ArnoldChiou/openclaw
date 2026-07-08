@@ -6,10 +6,7 @@ import { installedPluginRoot } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildClawApplyPlan } from "../claws/lifecycle.js";
 import { buildClawPlan } from "../claws/plan.js";
-import {
-  persistClawArtifactApplyProvenance,
-  readClawArtifactRefsForArtifactKey,
-} from "../claws/provenance.js";
+import { persistClawArtifactApplyProvenance } from "../claws/provenance.js";
 import { parseClawManifest } from "../claws/schema.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
@@ -36,7 +33,7 @@ const CLI_STATE_ROOT = "/tmp/openclaw-state";
 const ALPHA_INSTALL_PATH = installedPluginRoot(CLI_STATE_ROOT, "alpha");
 const ORIGINAL_OPENCLAW_NIX_MODE = process.env.OPENCLAW_NIX_MODE;
 
-function clawPluginPlan() {
+function clawPluginPlan(selector = "npm:@openclaw/plugin-alpha@1.0.0") {
   const parsed = parseClawManifest({
     schemaVersion: "openclaw.claw.v1",
     id: "starter",
@@ -46,7 +43,7 @@ function clawPluginPlan() {
       {
         kind: "plugin",
         id: "alpha-plugin",
-        selector: "npm:@openclaw/plugin-alpha@1.0.0",
+        selector,
       },
     ],
   });
@@ -113,61 +110,76 @@ describe("plugins cli uninstall", () => {
   });
 
   it("shows uninstall dry-run preview without mutating config", async () => {
-    loadConfig.mockReturnValue({
-      plugins: {
-        entries: {
-          alpha: {
-            enabled: true,
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = mkdtempSync(
+      join(tmpdir(), "openclaw-claw-plugin-uninstall-dry-run-"),
+    );
+    closeOpenClawStateDatabaseForTest();
+    try {
+      loadConfig.mockReturnValue({
+        plugins: {
+          entries: {
+            alpha: {
+              enabled: true,
+            },
+          },
+          installs: {
+            alpha: {
+              source: "path",
+              sourcePath: ALPHA_INSTALL_PATH,
+              installPath: ALPHA_INSTALL_PATH,
+            },
+          },
+          slots: {
+            contextEngine: "alpha",
           },
         },
-        installs: {
-          alpha: {
-            source: "path",
-            sourcePath: ALPHA_INSTALL_PATH,
-            installPath: ALPHA_INSTALL_PATH,
-          },
+      } as OpenClawConfig);
+      buildPluginSnapshotReport.mockReturnValue({
+        plugins: [{ id: "alpha", name: "alpha" }],
+        diagnostics: [],
+      });
+      planPluginUninstall.mockReturnValue({
+        ok: true,
+        config: {} as OpenClawConfig,
+        actions: {
+          entry: true,
+          install: true,
+          allowlist: false,
+          denylist: false,
+          loadPath: false,
+          memorySlot: false,
+          contextEngineSlot: true,
+          directory: false,
         },
-        slots: {
-          contextEngine: "alpha",
-        },
-      },
-    } as OpenClawConfig);
-    buildPluginSnapshotReport.mockReturnValue({
-      plugins: [{ id: "alpha", name: "alpha" }],
-      diagnostics: [],
-    });
-    planPluginUninstall.mockReturnValue({
-      ok: true,
-      config: {} as OpenClawConfig,
-      actions: {
-        entry: true,
-        install: true,
-        allowlist: false,
-        denylist: false,
-        loadPath: false,
-        memorySlot: false,
-        contextEngineSlot: true,
-        directory: false,
-      },
-      directoryRemoval: null,
-    });
+        directoryRemoval: null,
+      });
+      persistClawArtifactApplyProvenance(clawPluginPlan(ALPHA_INSTALL_PATH), { nowMs: 1 });
 
-    await runPluginsCommand(["plugins", "uninstall", "alpha", "--dry-run"]);
+      await runPluginsCommand(["plugins", "uninstall", "alpha", "--dry-run"]);
 
-    expect(buildPluginSnapshotReport).toHaveBeenCalledTimes(1);
-    expect(buildPluginDiagnosticsReport).not.toHaveBeenCalled();
-    expect(planPluginUninstall).toHaveBeenCalledTimes(1);
-    expect(writeConfigFile).not.toHaveBeenCalled();
-    expect(refreshPluginRegistry).not.toHaveBeenCalled();
-    expectRuntimeLogIncludes("Dry run, no changes made.");
-    expectRuntimeLogIncludes("context engine slot");
+      expect(buildPluginSnapshotReport).toHaveBeenCalledTimes(1);
+      expect(buildPluginDiagnosticsReport).not.toHaveBeenCalled();
+      expect(planPluginUninstall).toHaveBeenCalledTimes(1);
+      expect(writeConfigFile).not.toHaveBeenCalled();
+      expect(refreshPluginRegistry).not.toHaveBeenCalled();
+      expectRuntimeLogIncludes("Dry run, no changes made.");
+      expectRuntimeLogIncludes("context engine slot");
+      expect(runtimeLogs.join("\n")).not.toContain("referenced by Claw");
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      closeOpenClawStateDatabaseForTest();
+    }
   });
 
-  it("releases direct ownership but preserves plugins still referenced by Claws", async () => {
+  it("warns but uninstalls plugins referenced by Claws", async () => {
     const previousStateDir = process.env.OPENCLAW_STATE_DIR;
     process.env.OPENCLAW_STATE_DIR = mkdtempSync(join(tmpdir(), "openclaw-claw-plugin-uninstall-"));
     closeOpenClawStateDatabaseForTest();
-    const artifactKey = "plugins:npm:@openclaw/plugin-alpha@1.0.0";
     try {
       const baseConfig = {
         plugins: {
@@ -185,6 +197,7 @@ describe("plugins cli uninstall", () => {
           },
         },
       } as OpenClawConfig;
+      const nextConfig = { plugins: { entries: {}, installs: {} } } as OpenClawConfig;
       loadConfig.mockReturnValue(baseConfig);
       setInstalledPluginIndexInstallRecords(baseConfig.plugins?.installs ?? {});
       buildPluginSnapshotReport.mockReturnValue({
@@ -193,7 +206,7 @@ describe("plugins cli uninstall", () => {
       });
       planPluginUninstall.mockReturnValue({
         ok: true,
-        config: {} as OpenClawConfig,
+        config: nextConfig,
         actions: {
           entry: true,
           install: true,
@@ -203,27 +216,80 @@ describe("plugins cli uninstall", () => {
           memorySlot: false,
           contextEngineSlot: false,
           channelConfig: false,
-          directory: true,
+          directory: false,
         },
-        directoryRemoval: { target: ALPHA_INSTALL_PATH },
+        directoryRemoval: null,
       });
-      persistClawArtifactApplyProvenance(clawPluginPlan(), {
-        directArtifactKeys: new Set([artifactKey]),
+      persistClawArtifactApplyProvenance(clawPluginPlan(), { nowMs: 1 });
+
+      await runPluginsCommand(["plugins", "uninstall", "alpha", "--force", "--keep-files"]);
+
+      expectRuntimeLogIncludes('Warning: plugin "alpha" is referenced by Claw: starter.');
+      expectRuntimeLogIncludes("Uninstalling it may break those Claws");
+      expect(writePersistedInstalledPluginIndexInstallRecords).toHaveBeenCalledWith({});
+      expect(writeConfigFile).toHaveBeenCalledWith({ plugins: { entries: {} } });
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      closeOpenClawStateDatabaseForTest();
+    }
+  });
+
+  it("warns for floating Claw npm refs before uninstalling resolved plugin records", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = mkdtempSync(join(tmpdir(), "openclaw-claw-plugin-uninstall-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const baseConfig = {
+        plugins: {
+          entries: {
+            alpha: { enabled: true },
+          },
+          installs: {
+            alpha: {
+              source: "npm",
+              spec: "@openclaw/plugin-alpha@latest",
+              resolvedName: "@openclaw/plugin-alpha",
+              resolvedVersion: "2.0.0",
+              installPath: ALPHA_INSTALL_PATH,
+            },
+          },
+        },
+      } as OpenClawConfig;
+      const nextConfig = { plugins: { entries: {}, installs: {} } } as OpenClawConfig;
+      loadConfig.mockReturnValue(baseConfig);
+      setInstalledPluginIndexInstallRecords(baseConfig.plugins?.installs ?? {});
+      buildPluginSnapshotReport.mockReturnValue({
+        plugins: [{ id: "alpha", name: "alpha" }],
+        diagnostics: [],
+      });
+      planPluginUninstall.mockReturnValue({
+        ok: true,
+        config: nextConfig,
+        actions: {
+          entry: true,
+          install: true,
+          allowlist: false,
+          denylist: false,
+          loadPath: false,
+          memorySlot: false,
+          contextEngineSlot: false,
+          channelConfig: false,
+          directory: false,
+        },
+        directoryRemoval: null,
+      });
+      persistClawArtifactApplyProvenance(clawPluginPlan("npm:@openclaw/plugin-alpha@latest"), {
         nowMs: 1,
       });
 
-      await runPluginsCommand(["plugins", "uninstall", "alpha", "--force"]);
+      await runPluginsCommand(["plugins", "uninstall", "alpha", "--force", "--keep-files"]);
 
-      expect(writePersistedInstalledPluginIndexInstallRecords).not.toHaveBeenCalled();
-      expect(applyPluginUninstallDirectoryRemoval).not.toHaveBeenCalled();
-      expectRuntimeLogIncludes('Detached direct install ownership for plugin "alpha"');
-      expect(readClawArtifactRefsForArtifactKey(artifactKey)[0]).toMatchObject({
-        ownership: {
-          preexistingDirectInstall: false,
-          clawRefs: ["starter"],
-          refCount: 1,
-        },
-      });
+      expectRuntimeLogIncludes('Warning: plugin "alpha" is referenced by Claw: starter.');
+      expect(writePersistedInstalledPluginIndexInstallRecords).toHaveBeenCalledWith({});
     } finally {
       if (previousStateDir === undefined) {
         delete process.env.OPENCLAW_STATE_DIR;
