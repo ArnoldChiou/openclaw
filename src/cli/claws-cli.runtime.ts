@@ -4,6 +4,7 @@ import {
   applyClawArtifactInstallers,
   ClawArtifactApplyError,
 } from "../claws/artifact-installers.js";
+import { exportClawManifest } from "../claws/export.js";
 import { readClawFeedFile, readClawManifestFromFeed } from "../claws/feed.js";
 import { readClawStatus, removeClawState } from "../claws/lifecycle-state.js";
 import { buildClawApplyPlan } from "../claws/lifecycle.js";
@@ -15,6 +16,7 @@ import { applyClawWorkspaceFiles, ClawWorkspaceApplyError } from "../claws/works
 import { defaultRuntime, writeRuntimeJson, type RuntimeEnv } from "../runtime.js";
 import type {
   ClawsApplyOptions,
+  ClawsExportOptions,
   ClawsFeedApplyOptions,
   ClawsFeedInspectOptions,
   ClawsInspectOptions,
@@ -126,6 +128,23 @@ function logClawRemoveResult(
   runtime.log(`Workspace files retained: ${result.summary.workspaceFilesRetained}`);
   if (result.summary.errors > 0) {
     runtime.log(`Errors: ${result.summary.errors}`);
+  }
+}
+
+function logClawExportSummary(
+  result: Awaited<ReturnType<typeof exportClawManifest>>,
+  runtime: RuntimeEnv,
+): void {
+  runtime.log(`Claw manifest written: ${result.outputPath}`);
+  runtime.log(`Plugins: ${result.summary.plugins}`);
+  runtime.log(`Workspace files: ${result.summary.workspaceFiles}`);
+  runtime.log(`Personas: ${result.summary.personas}`);
+  runtime.log(`Excluded: ${result.summary.excluded}`);
+  if (result.warnings.length > 0) {
+    runtime.log(`Warnings: ${result.warnings.length}`);
+    for (const warning of result.warnings) {
+      runtime.log(`  ${warning}`);
+    }
   }
 }
 
@@ -554,4 +573,53 @@ export async function runClawsRemoveCommand(
     return;
   }
   logClawRemoveResult(result, runtime);
+}
+
+export async function runClawsExportCommand(
+  opts: ClawsExportOptions,
+  runtime: RuntimeEnv = defaultRuntime,
+): Promise<void> {
+  const result = await exportClawManifest({
+    id: opts.id,
+    name: opts.name,
+    version: opts.version,
+    publisher: opts.publisher,
+    description: opts.description,
+    workspaceRoot: opts.workspace,
+    outPath: opts.out,
+    include: opts.include,
+    exclude: opts.exclude,
+    plugins: opts.plugin,
+    workspaceFiles: opts.workspaceFile,
+    personas: opts.persona,
+  });
+  if (result.manifest.entries.length === 0) {
+    const message = "Claw export did not select any entries.";
+    if (opts.json) {
+      writeRuntimeJson(runtime, { ...result, error: { code: "claw_export_empty", message } });
+    } else {
+      runtime.error(message);
+    }
+    runtime.exit(1);
+    return;
+  }
+  if (!result.outputPath && (result.summary.workspaceFiles > 0 || result.summary.personas > 0)) {
+    const message = "Claw export requires --out when exporting workspace or persona files.";
+    if (opts.json) {
+      writeRuntimeJson(runtime, { ...result, error: { code: "claw_export_out_required", message } });
+    } else {
+      runtime.error(message);
+    }
+    runtime.exit(1);
+    return;
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, result);
+    return;
+  }
+  if (result.outputPath) {
+    logClawExportSummary(result, runtime);
+    return;
+  }
+  runtime.log(JSON.stringify(result.manifest, null, 2));
 }

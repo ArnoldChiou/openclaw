@@ -1,10 +1,29 @@
 // Tests for the Claws CLI inspection and dry-run apply commands.
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+
+const pluginRecordMock = vi.hoisted(() => ({
+  loadInstalledPluginIndexInstallRecords: vi.fn(
+    async (): Promise<Record<string, PluginInstallRecord>> => ({
+      terminal: {
+        source: "npm",
+        spec: "@openclaw/plugin-terminal@^1.0.0",
+        resolvedName: "@openclaw/plugin-terminal",
+        resolvedVersion: "1.2.3",
+        version: "1.2.3",
+      },
+      local: {
+        source: "path",
+        sourcePath: "/tmp/openclaw-plugin-local",
+      },
+    }),
+  ),
+}));
 
 const artifactInstallerMock = vi.hoisted(() => ({
   applyClawArtifactInstallers: vi.fn(async () => ({
@@ -38,6 +57,13 @@ vi.mock("../claws/artifact-installers.js", async () => ({
     "../claws/artifact-installers.js",
   )),
   applyClawArtifactInstallers: artifactInstallerMock.applyClawArtifactInstallers,
+}));
+
+vi.mock("../plugins/installed-plugin-index-records.js", async () => ({
+  ...(await vi.importActual<typeof import("../plugins/installed-plugin-index-records.js")>(
+    "../plugins/installed-plugin-index-records.js",
+  )),
+  loadInstalledPluginIndexInstallRecords: pluginRecordMock.loadInstalledPluginIndexInstallRecords,
 }));
 
 vi.mock("../runtime.js", async () => ({
@@ -123,11 +149,415 @@ describe("claws cli", () => {
     mocks.runtime.writeJson.mockClear();
     mocks.runtime.exit.mockClear();
     artifactInstallerMock.applyClawArtifactInstallers.mockClear();
+    pluginRecordMock.loadInstalledPluginIndexInstallRecords.mockClear();
+    pluginRecordMock.loadInstalledPluginIndexInstallRecords.mockResolvedValue({
+      terminal: {
+        source: "npm",
+        spec: "@openclaw/plugin-terminal@^1.0.0",
+        resolvedName: "@openclaw/plugin-terminal",
+        resolvedVersion: "1.2.3",
+        version: "1.2.3",
+      },
+      local: { source: "path", sourcePath: "/tmp/openclaw-plugin-local" },
+    });
     artifactInstallerMock.applyClawArtifactInstallers.mockResolvedValue({
       directArtifactKeys: new Set<string>(),
       createdArtifactKeys: new Set<string>(),
       installedArtifactKeys: new Set<string>(),
     });
+  });
+
+  it("exports selected installed plugins and workspace files as a Claw manifest", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-workspace-"));
+    await writeFile(join(workspaceRoot, "SOUL.md"), "exported soul\n", "utf8");
+    await mkdir(join(workspaceRoot, "runbooks"), { recursive: true });
+    await writeFile(join(workspaceRoot, "runbooks", "incident.md"), "runbook\n", "utf8");
+    const outPath = join(workspaceRoot, "claws", "starter.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--workspace",
+      workspaceRoot,
+      "--plugin",
+      "terminal",
+      "--workspace-file",
+      "runbooks/incident.md",
+      "--persona",
+      "SOUL.md",
+      "--out",
+      outPath,
+      "--json",
+    ]);
+
+    expect(pluginRecordMock.loadInstalledPluginIndexInstallRecords).toHaveBeenCalledOnce();
+    expect(mocks.runtime.writeJson).toHaveBeenCalledOnce();
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      schemaVersion: "openclaw.clawExport.v1",
+      summary: { plugins: 1, workspaceFiles: 1, personas: 1, excluded: 0, warnings: 0 },
+      manifest: {
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "plugin-terminal",
+            selector: "npm:@openclaw/plugin-terminal@1.2.3",
+          },
+          {
+            kind: "workspaceFile",
+            path: "runbooks/incident.md",
+            source: "files/runbooks/incident.md",
+          },
+          { kind: "persona", path: "SOUL.md", source: "files/SOUL.md" },
+        ],
+      },
+    });
+  });
+
+  it("writes exported manifests and honors include and exclude filters", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-workspace-"));
+    await writeFile(join(workspaceRoot, "SOUL.md"), "exported soul\n", "utf8");
+    const outPath = join(workspaceRoot, "claws", "starter.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--workspace",
+      workspaceRoot,
+      "--include",
+      "plugins,persona",
+      "--exclude",
+      "plugin:local",
+      "--persona",
+      "SOUL.md",
+      "--out",
+      outPath,
+      "--json",
+    ]);
+
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      outputPath: outPath,
+      summary: { plugins: 1, workspaceFiles: 0, personas: 1, excluded: 1 },
+    });
+    await expect(readFile(outPath, "utf8")).resolves.toContain('"schemaVersion": "openclaw.claw.v1"');
+    const written = JSON.parse(await readFile(outPath, "utf8"));
+    expect(written.entries).toEqual([
+      expect.objectContaining({ id: "plugin-terminal" }),
+      expect.objectContaining({ kind: "persona", path: "SOUL.md", source: "files/SOUL.md" }),
+    ]);
+    await expect(readFile(join(workspaceRoot, "claws", "files", "SOUL.md"), "utf8")).resolves.toBe(
+      "exported soul\n",
+    );
+  });
+
+  it("deduplicates repeated workspace file selections", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-dedupe-"));
+    await writeFile(join(workspaceRoot, "SOUL.md"), "exported soul\n", "utf8");
+    const outPath = join(workspaceRoot, "claws", "starter.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--include",
+      "persona",
+      "--workspace",
+      workspaceRoot,
+      "--persona",
+      "SOUL.md,SOUL.md",
+      "--out",
+      outPath,
+      "--json",
+    ]);
+
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      summary: { personas: 1, excluded: 1 },
+    });
+    const written = JSON.parse(await readFile(outPath, "utf8"));
+    expect(written.entries).toEqual([
+      expect.objectContaining({ id: "persona-soul.md", source: "files/SOUL.md" }),
+    ]);
+  });
+
+  it("deduplicates workspace and persona selections for the same target", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-cross-dedupe-"));
+    await writeFile(join(workspaceRoot, "SOUL.md"), "exported soul\n", "utf8");
+    const outPath = join(workspaceRoot, "claws", "starter.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--include",
+      "workspace,persona",
+      "--workspace",
+      workspaceRoot,
+      "--workspace-file",
+      "SOUL.md",
+      "--persona",
+      "SOUL.md",
+      "--out",
+      outPath,
+      "--json",
+    ]);
+
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      summary: { workspaceFiles: 1, personas: 0, excluded: 1 },
+    });
+    const written = JSON.parse(await readFile(outPath, "utf8"));
+    expect(written.entries).toEqual([
+      expect.objectContaining({ kind: "workspaceFile", path: "SOUL.md" }),
+    ]);
+  });
+
+  it("skips files larger than the apply workspace file limit", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-large-"));
+    await writeFile(join(workspaceRoot, "large.md"), Buffer.alloc(1024 * 1024 + 1));
+    const outPath = join(workspaceRoot, "claws", "starter.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--include",
+      "workspace",
+      "--workspace",
+      workspaceRoot,
+      "--workspace-file",
+      "large.md",
+      "--out",
+      outPath,
+      "--json",
+    ]);
+
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      error: { code: "claw_export_empty" },
+      summary: { workspaceFiles: 0, warnings: 2 },
+      warnings: [
+        expect.stringContaining("larger than 1048576 bytes"),
+        expect.stringContaining("No Claw entries were selected"),
+      ],
+    });
+    expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+    await expect(readFile(outPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("skips directory workspace selections", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-directory-"));
+    await mkdir(join(workspaceRoot, "docs"), { recursive: true });
+    const outPath = join(workspaceRoot, "claws", "starter.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--include",
+      "workspace",
+      "--workspace",
+      workspaceRoot,
+      "--workspace-file",
+      "docs",
+      "--out",
+      outPath,
+      "--json",
+    ]);
+
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      error: { code: "claw_export_empty" },
+      summary: { workspaceFiles: 0, warnings: 2 },
+      warnings: [
+        expect.stringContaining("not a regular file"),
+        expect.stringContaining("No Claw entries were selected"),
+      ],
+    });
+    expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+  });
+
+  it("generates unique entry ids for normalized path collisions", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-id-collision-"));
+    await mkdir(join(workspaceRoot, "docs", "a"), { recursive: true });
+    await writeFile(join(workspaceRoot, "docs", "a", "b.md"), "nested\n", "utf8");
+    await writeFile(join(workspaceRoot, "docs", "a-b.md"), "flat\n", "utf8");
+    const outPath = join(workspaceRoot, "claws", "starter.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--include",
+      "workspace",
+      "--workspace",
+      workspaceRoot,
+      "--workspace-file",
+      "docs/a/b.md",
+      "--workspace-file",
+      "docs/a-b.md",
+      "--out",
+      outPath,
+      "--json",
+    ]);
+
+    const written = JSON.parse(await readFile(outPath, "utf8"));
+    const ids = written.entries.map((entry: { id: string }) => entry.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual(["file-docs-a-b.md", "file-docs-a-b.md-2"]);
+  });
+
+  it("requires --out when exporting workspace or persona files", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-workspace-"));
+    await writeFile(join(workspaceRoot, "SOUL.md"), "exported soul\n", "utf8");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--include",
+      "persona",
+      "--workspace",
+      workspaceRoot,
+      "--persona",
+      "SOUL.md",
+      "--json",
+    ]);
+
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      error: { code: "claw_export_out_required" },
+      summary: { personas: 1 },
+    });
+    expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+  });
+
+  it("skips workspace file symlinks that resolve outside the workspace", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-symlink-"));
+    const outsideRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-outside-"));
+    await writeFile(join(outsideRoot, "secret.txt"), "secret\n", "utf8");
+    await symlink(join(outsideRoot, "secret.txt"), join(workspaceRoot, "linked-secret.txt"));
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--include",
+      "workspace",
+      "--workspace",
+      workspaceRoot,
+      "--workspace-file",
+      "linked-secret.txt",
+      "--json",
+    ]);
+
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      error: { code: "claw_export_empty" },
+      summary: { workspaceFiles: 0, warnings: 2 },
+      warnings: [
+        expect.stringContaining("resolves outside the workspace root"),
+        expect.stringContaining("No Claw entries were selected"),
+      ],
+    });
+  });
+
+  it("prints only manifest JSON when export has no output path", async () => {
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "starter",
+      "--name",
+      "Starter",
+      "--plugin",
+      "terminal",
+    ]);
+
+    expect(mocks.logs).toHaveLength(1);
+    const manifest = JSON.parse(mocks.logs[0]);
+    expect(manifest).toMatchObject({
+      schemaVersion: "openclaw.claw.v1",
+      id: "starter",
+      entries: [{ id: "plugin-terminal" }],
+    });
+  });
+
+  it("rejects exports that select no manifest entries", async () => {
+    pluginRecordMock.loadInstalledPluginIndexInstallRecords.mockResolvedValue({});
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-empty-"));
+    const outPath = join(workspaceRoot, "empty.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "empty",
+      "--name",
+      "Empty",
+      "--workspace",
+      workspaceRoot,
+      "--out",
+      outPath,
+      "--json",
+    ]);
+
+    expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+      error: { code: "claw_export_empty" },
+      summary: { plugins: 0, workspaceFiles: 0, personas: 0, warnings: 1 },
+    });
+    expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+    await expect(readFile(outPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not report a written manifest for empty text exports", async () => {
+    pluginRecordMock.loadInstalledPluginIndexInstallRecords.mockResolvedValue({});
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-empty-text-"));
+    const outPath = join(workspaceRoot, "empty.claw.json");
+
+    await runCli([
+      "claws",
+      "export",
+      "--id",
+      "empty",
+      "--name",
+      "Empty",
+      "--workspace",
+      workspaceRoot,
+      "--out",
+      outPath,
+    ]);
+
+    expect(mocks.errors).toEqual(["Claw export did not select any entries."]);
+    expect(mocks.logs).not.toContain(`Claw manifest written: `);
+    expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+    await expect(readFile(outPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("prints JSON inspection for a local claw manifest", async () => {

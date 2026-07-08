@@ -16,7 +16,7 @@ import type {
 } from "./types.js";
 
 const CLAW_WORKSPACE_FILE_REF_SCHEMA_VERSION = "openclaw.clawWorkspaceFileRef.v1" as const;
-const MAX_CLAW_WORKSPACE_FILE_BYTES = 1024 * 1024;
+export const MAX_CLAW_WORKSPACE_FILE_BYTES = 1024 * 1024;
 
 type ExistingWorkspaceFileRefRow = {
   claw_id: string;
