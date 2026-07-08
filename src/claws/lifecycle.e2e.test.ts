@@ -8,8 +8,12 @@ import { describe, expect, it } from "vitest";
 
 const execFileAsync = promisify(execFile);
 
-async function runOpenClaw(args: string[], options?: { expectFailure?: boolean }) {
-  const stateDir = await mkdtemp(join(tmpdir(), "openclaw-claws-lifecycle-e2e-"));
+async function runOpenClaw(
+  args: string[],
+  options?: { expectFailure?: boolean; stateDir?: string },
+) {
+  const stateDir =
+    options?.stateDir ?? (await mkdtemp(join(tmpdir(), "openclaw-claws-lifecycle-e2e-")));
   const env = {
     ...process.env,
     HOME: stateDir,
@@ -175,6 +179,65 @@ describe("claws lifecycle cli e2e", () => {
     expect(result.ok).toBe(false);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("Claw apply mutates workspace files");
+  });
+
+  it("runs the full apply, status, dry-run remove, remove lifecycle", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "openclaw-claws-lifecycle-state-"));
+    const { manifestPath } = await writeLocalPluginClawFixture();
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-lifecycle-workspace-"));
+
+    await runOpenClaw(
+      ["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot, "--json"],
+      { stateDir },
+    );
+    const status = parseJsonObject(
+      (await runOpenClaw(["claws", "status", "local-plugin-claw", "--json"], { stateDir })).stdout,
+    );
+    expect(status).toMatchObject({
+      schemaVersion: "openclaw.clawStatus.v1",
+      summary: { claws: 1, artifactRefs: 1, workspaceFileRefs: 1 },
+    });
+
+    const dryRunRemove = parseJsonObject(
+      (
+        await runOpenClaw(["claws", "remove", "local-plugin-claw", "--dry-run", "--json"], {
+          stateDir,
+        })
+      ).stdout,
+    );
+    expect(dryRunRemove).toMatchObject({
+      schemaVersion: "openclaw.clawRemoveResult.v1",
+      dryRun: true,
+      found: true,
+      workspaceFiles: [{ action: "dryRunDelete" }],
+    });
+    await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toContain(
+      "Local Plugin Claw",
+    );
+
+    const removed = parseJsonObject(
+      (await runOpenClaw(["claws", "remove", "local-plugin-claw", "--yes", "--json"], { stateDir }))
+        .stdout,
+    );
+    expect(removed).toMatchObject({
+      dryRun: false,
+      found: true,
+      summary: {
+        artifactRefsRemoved: 1,
+        workspaceFileRefsRemoved: 1,
+        workspaceFilesDeleted: 1,
+        errors: 0,
+      },
+    });
+    await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const finalStatus = parseJsonObject(
+      (await runOpenClaw(["claws", "status", "local-plugin-claw", "--json"], { stateDir })).stdout,
+    );
+    expect(finalStatus).toMatchObject({
+      summary: { claws: 0, artifactRefs: 0, workspaceFileRefs: 0 },
+    });
   });
 
   it("applies a local plugin, workspace files, and artifact provenance when confirmed", async () => {

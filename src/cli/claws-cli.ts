@@ -24,6 +24,16 @@ export type ClawsFeedApplyOptions = {
   workspace?: string;
 };
 
+export type ClawsStatusOptions = {
+  json?: boolean;
+};
+
+export type ClawsRemoveOptions = {
+  dryRun?: boolean;
+  json?: boolean;
+  yes?: boolean;
+};
+
 export function registerClawsCli(program: Command) {
   const claws = program.command("claws").description("Inspect and apply OpenClaw Claws");
 
@@ -48,6 +58,28 @@ export function registerClawsCli(program: Command) {
     .action(async (manifest: string, opts: ClawsApplyOptions) => {
       const { runClawsApplyCommand } = await import("./claws-cli.runtime.js");
       await runClawsApplyCommand(manifest, opts);
+    });
+
+  claws
+    .command("status")
+    .description("Show persisted Claw apply state")
+    .argument("[claw]", "Claw id to inspect")
+    .option("--json", "Print JSON", false)
+    .action(async (claw: string | undefined, opts: ClawsStatusOptions) => {
+      const { runClawsStatusCommand } = await import("./claws-cli.runtime.js");
+      await runClawsStatusCommand(claw, opts);
+    });
+
+  claws
+    .command("remove")
+    .description("Remove persisted Claw refs and managed workspace files")
+    .argument("<claw>", "Claw id to remove")
+    .option("--dry-run", "Preview removal without deleting files or refs", false)
+    .option("--yes", "Remove supported Claw state without prompting", false)
+    .option("--json", "Print JSON", false)
+    .action(async (claw: string, opts: ClawsRemoveOptions) => {
+      const { runClawsRemoveCommand } = await import("./claws-cli.runtime.js");
+      await runClawsRemoveCommand(claw, opts);
     });
 
   const feed = claws.command("feed").description("Inspect and apply Claws from a local feed");

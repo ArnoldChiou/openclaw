@@ -5,6 +5,7 @@ import {
   ClawArtifactApplyError,
 } from "../claws/artifact-installers.js";
 import { readClawFeedFile, readClawManifestFromFeed } from "../claws/feed.js";
+import { readClawStatus, removeClawState } from "../claws/lifecycle-state.js";
 import { buildClawApplyPlan } from "../claws/lifecycle.js";
 import { buildClawPlan } from "../claws/plan.js";
 import { persistClawArtifactApplyProvenance } from "../claws/provenance.js";
@@ -17,6 +18,8 @@ import type {
   ClawsFeedApplyOptions,
   ClawsFeedInspectOptions,
   ClawsInspectOptions,
+  ClawsRemoveOptions,
+  ClawsStatusOptions,
 } from "./claws-cli.js";
 
 type DiagnosticLike = { level: string; code: string; path: string; message: string };
@@ -78,6 +81,52 @@ function failBlockedApply(
   }
   runtime.exit(1);
   return true;
+}
+
+function logClawStatusResult(status: ReturnType<typeof readClawStatus>, runtime: RuntimeEnv): void {
+  runtime.log(`Claws: ${status.summary.claws}`);
+  runtime.log(`Artifact refs: ${status.summary.artifactRefs}`);
+  runtime.log(`Workspace file refs: ${status.summary.workspaceFileRefs}`);
+  for (const record of status.records) {
+    const version = record.clawVersion ? `@${record.clawVersion}` : "";
+    runtime.log(`Claw: ${record.clawId}${version}`);
+    runtime.log(`  Artifacts: ${record.artifacts.length}`);
+    runtime.log(`  Workspace files: ${record.workspaceFiles.length}`);
+  }
+}
+
+function failUnsafeRemove(
+  opts: { dryRun?: boolean; json?: boolean; yes?: boolean },
+  runtime: RuntimeEnv,
+): boolean {
+  if (opts.dryRun || opts.yes) {
+    return false;
+  }
+  const message =
+    "Claw remove deletes Claw-managed workspace files and persisted Claw refs; pass --dry-run to preview or --yes to remove.";
+  if (opts.json) {
+    writeRuntimeJson(runtime, { ok: false, error: { code: "confirmation_required", message } });
+  } else {
+    runtime.error(message);
+  }
+  runtime.exit(1);
+  return true;
+}
+
+function logClawRemoveResult(
+  result: Awaited<ReturnType<typeof removeClawState>>,
+  runtime: RuntimeEnv,
+): void {
+  runtime.log(`Dry-run: ${result.dryRun ? "true" : "false"}`);
+  runtime.log(`Claw: ${result.clawId}`);
+  runtime.log(`Found: ${result.found ? "true" : "false"}`);
+  runtime.log(`Artifact refs removed: ${result.summary.artifactRefsRemoved}`);
+  runtime.log(`Workspace file refs removed: ${result.summary.workspaceFileRefsRemoved}`);
+  runtime.log(`Workspace files deleted: ${result.summary.workspaceFilesDeleted}`);
+  runtime.log(`Workspace files retained: ${result.summary.workspaceFilesRetained}`);
+  if (result.summary.errors > 0) {
+    runtime.log(`Errors: ${result.summary.errors}`);
+  }
 }
 
 function logClawApplyResultSummary(
@@ -455,4 +504,54 @@ export async function runClawsFeedApplyCommand(
   if (result.diagnostics.length > 0) {
     runtime.log(formatDiagnostics(result.diagnostics));
   }
+}
+
+export async function runClawsStatusCommand(
+  clawId: string | undefined,
+  opts: ClawsStatusOptions,
+  runtime: RuntimeEnv = defaultRuntime,
+): Promise<void> {
+  const status = readClawStatus(clawId);
+  if (opts.json) {
+    writeRuntimeJson(runtime, status);
+    return;
+  }
+  logClawStatusResult(status, runtime);
+}
+
+export async function runClawsRemoveCommand(
+  clawId: string,
+  opts: ClawsRemoveOptions,
+  runtime: RuntimeEnv = defaultRuntime,
+): Promise<void> {
+  if (failUnsafeRemove(opts, runtime)) {
+    return;
+  }
+  const result = await removeClawState(clawId, { dryRun: opts.dryRun });
+  if (!result.found) {
+    const message = `No persisted Claw state found for ${JSON.stringify(clawId)}.`;
+    if (opts.json) {
+      writeRuntimeJson(runtime, { ...result, error: { code: "claw_not_found", message } });
+    } else {
+      runtime.error(message);
+    }
+    runtime.exit(1);
+    return;
+  }
+  if (result.summary.errors > 0) {
+    const message = "Claw remove could not safely remove all managed workspace files.";
+    if (opts.json) {
+      writeRuntimeJson(runtime, { ...result, error: { code: "claw_remove_failed", message } });
+    } else {
+      runtime.error(message);
+      logClawRemoveResult(result, runtime);
+    }
+    runtime.exit(1);
+    return;
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, result);
+    return;
+  }
+  logClawRemoveResult(result, runtime);
 }
