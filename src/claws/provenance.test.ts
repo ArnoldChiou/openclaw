@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { buildClawApplyPlan } from "./lifecycle.js";
 import { buildClawPlan } from "./plan.js";
-import { persistClawArtifactApplyProvenance } from "./provenance.js";
+import { persistClawArtifactApplyProvenance, releaseDirectArtifactOwner } from "./provenance.js";
 import { parseClawManifest } from "./schema.js";
 
 function stateEnv() {
@@ -93,6 +93,50 @@ describe("persistClawArtifactApplyProvenance", () => {
         },
       ],
       previewOnlyEntries: [{ id: "soul", phase: "workspace" }],
+    });
+  });
+
+  it("counts preexisting direct installs as separate artifact owners", () => {
+    const artifactKey = "plugins:npm:@openclaw/plugin-terminal@2.0.0";
+    const result = persistClawArtifactApplyProvenance(applyPlan(), {
+      env: stateEnv(),
+      nowMs: 1,
+      directArtifactKeys: new Set([artifactKey]),
+    });
+
+    expect(result.artifacts[0]).toMatchObject({
+      artifactKey,
+      ownership: {
+        state: "shared",
+        createdByThisApply: false,
+        preexistingDirectInstall: true,
+        clawRefs: ["starter"],
+        refCount: 2,
+      },
+    });
+  });
+
+  it("releases a direct owner while preserving Claw artifact refs", () => {
+    const env = stateEnv();
+    const artifactKey = "plugins:npm:@openclaw/plugin-terminal@2.0.0";
+    persistClawArtifactApplyProvenance(applyPlan(), {
+      env,
+      nowMs: 1,
+      directArtifactKeys: new Set([artifactKey]),
+    });
+
+    const refs = releaseDirectArtifactOwner(artifactKey, { env, nowMs: 2 });
+
+    expect(refs).toHaveLength(1);
+    expect(refs[0]).toMatchObject({
+      artifactKey,
+      ownership: {
+        state: "referenced",
+        createdByThisApply: false,
+        preexistingDirectInstall: false,
+        clawRefs: ["starter"],
+        refCount: 1,
+      },
     });
   });
 

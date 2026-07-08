@@ -6,6 +6,14 @@ import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 
+const artifactInstallerMock = vi.hoisted(() => ({
+  applyClawArtifactInstallers: vi.fn(async () => ({
+    directArtifactKeys: new Set<string>(),
+    createdArtifactKeys: new Set<string>(),
+    installedArtifactKeys: new Set<string>(),
+  })),
+}));
+
 const mocks = vi.hoisted(() => {
   const logs: string[] = [];
   const errors: string[] = [];
@@ -24,6 +32,13 @@ const mocks = vi.hoisted(() => {
   };
   return { logs, errors, runtime };
 });
+
+vi.mock("../claws/artifact-installers.js", async () => ({
+  ...(await vi.importActual<typeof import("../claws/artifact-installers.js")>(
+    "../claws/artifact-installers.js",
+  )),
+  applyClawArtifactInstallers: artifactInstallerMock.applyClawArtifactInstallers,
+}));
 
 vi.mock("../runtime.js", async () => ({
   ...(await vi.importActual<typeof import("../runtime.js")>("../runtime.js")),
@@ -105,6 +120,12 @@ describe("claws cli", () => {
     mocks.runtime.error.mockClear();
     mocks.runtime.writeJson.mockClear();
     mocks.runtime.exit.mockClear();
+    artifactInstallerMock.applyClawArtifactInstallers.mockClear();
+    artifactInstallerMock.applyClawArtifactInstallers.mockResolvedValue({
+      directArtifactKeys: new Set<string>(),
+      createdArtifactKeys: new Set<string>(),
+      installedArtifactKeys: new Set<string>(),
+    });
   });
 
   it("prints JSON inspection for a local claw manifest", async () => {
@@ -271,6 +292,7 @@ describe("claws cli", () => {
       ]);
 
       expect(mocks.runtime.writeJson).toHaveBeenCalledOnce();
+      expect(artifactInstallerMock.applyClawArtifactInstallers).toHaveBeenCalledOnce();
       expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
         schemaVersion: "openclaw.clawApplyResult.v1",
         dryRun: false,

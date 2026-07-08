@@ -1,5 +1,9 @@
 // Runtime handlers for local Claws CLI commands.
 import { resolve } from "node:path";
+import {
+  applyClawArtifactInstallers,
+  ClawArtifactApplyError,
+} from "../claws/artifact-installers.js";
 import { readClawFeedFile, readClawManifestFromFeed } from "../claws/feed.js";
 import { buildClawApplyPlan } from "../claws/lifecycle.js";
 import { buildClawPlan } from "../claws/plan.js";
@@ -112,6 +116,33 @@ function combineApplyResult(
   };
 }
 
+async function applyArtifacts(
+  plan: ClawApplyPlan,
+  sourcePath: string,
+  opts: { json?: boolean },
+  runtime: RuntimeEnv,
+): Promise<Awaited<ReturnType<typeof applyClawArtifactInstallers>> | null> {
+  try {
+    return await applyClawArtifactInstallers(plan, { sourcePath, runtime });
+  } catch (error) {
+    if (!(error instanceof ClawArtifactApplyError)) {
+      throw error;
+    }
+    const message = "Claw apply could not safely install package-like artifacts.";
+    if (opts.json) {
+      writeRuntimeJson(runtime, {
+        ok: false,
+        error: { code: "artifact_apply_failed", message },
+        diagnostics: error.diagnostics,
+      });
+    } else {
+      runtime.error(`${message}\n${formatDiagnostics(error.diagnostics)}`);
+    }
+    runtime.exit(1);
+    return null;
+  }
+}
+
 function failWorkspaceApply(
   error: unknown,
   opts: { json?: boolean },
@@ -214,10 +245,15 @@ export async function runClawsApplyCommand(
   if (failBlockedApply(plan, opts, runtime)) {
     return;
   }
+  const sourcePath = resolve(manifestPath);
+  const artifactInstall = await applyArtifacts(plan, sourcePath, opts, runtime);
+  if (!artifactInstall) {
+    return;
+  }
   let workspaceFiles: PersistedClawWorkspaceFileRef[];
   try {
     workspaceFiles = await applyClawWorkspaceFiles(plan, {
-      sourcePath: resolve(manifestPath),
+      sourcePath,
       workspaceRoot: opts.workspace,
     });
   } catch (error) {
@@ -227,7 +263,11 @@ export async function runClawsApplyCommand(
     throw error;
   }
   const applied = combineApplyResult(
-    persistClawArtifactApplyProvenance(plan, { sourcePath: resolve(manifestPath) }),
+    persistClawArtifactApplyProvenance(plan, {
+      sourcePath,
+      directArtifactKeys: artifactInstall.directArtifactKeys,
+      createdArtifactKeys: artifactInstall.createdArtifactKeys,
+    }),
     workspaceFiles,
   );
   if (opts.json) {
@@ -329,6 +369,10 @@ export async function runClawsFeedApplyCommand(
   if (failBlockedApply(plan, opts, runtime)) {
     return;
   }
+  const artifactInstall = await applyArtifacts(plan, result.manifestPath, opts, runtime);
+  if (!artifactInstall) {
+    return;
+  }
   let workspaceFiles: PersistedClawWorkspaceFileRef[];
   try {
     workspaceFiles = await applyClawWorkspaceFiles(plan, {
@@ -350,6 +394,8 @@ export async function runClawsFeedApplyCommand(
         sourcePath: resolve(feedPath),
         entry: result.entry,
       },
+      directArtifactKeys: artifactInstall.directArtifactKeys,
+      createdArtifactKeys: artifactInstall.createdArtifactKeys,
     }),
     workspaceFiles,
   );

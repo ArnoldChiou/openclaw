@@ -77,6 +77,72 @@ export async function runPluginUninstallCommand(
   const extensionsDir = path.join(resolveStateDir(process.env, os.homedir), "extensions");
   const keepFiles = Boolean(opts.keepFiles || opts.keepConfig);
 
+  const releaseClawProtectedDirectOwner = async (params: {
+    pluginId: string;
+    installRecord?: import("../config/types.plugins.js").PluginInstallRecord;
+  }): Promise<boolean> => {
+    if (!params.installRecord) {
+      return false;
+    }
+    const { pluginArtifactKeyFromInstallRecord } = await import("../claws/artifact-identity.js");
+    const { readClawArtifactRefsForArtifactKey, releaseDirectArtifactOwner } =
+      await import("../claws/provenance.js");
+    const artifactKey = pluginArtifactKeyFromInstallRecord(params.pluginId, params.installRecord);
+    if (!artifactKey) {
+      return false;
+    }
+    const refs = readClawArtifactRefsForArtifactKey(artifactKey);
+    if (refs.length === 0) {
+      return false;
+    }
+    const hasDirectOwner = refs.some((ref) => ref.ownership.preexistingDirectInstall);
+    const clawList = refs
+      .map((ref) => ref.clawId)
+      .toSorted()
+      .join(", ");
+    if (!hasDirectOwner) {
+      runtime.error(
+        `Plugin "${params.pluginId}" is referenced by Claw${refs.length === 1 ? "" : "s"}: ${clawList}. Remove the owning Claw before uninstalling this plugin.`,
+      );
+      runtime.exit(1);
+      return true;
+    }
+    runtime.log(
+      `Plugin "${params.pluginId}" is referenced by Claw${refs.length === 1 ? "" : "s"}: ${clawList}.`,
+    );
+    runtime.log("Will remove: direct install ownership (plugin files and config stay installed)");
+    if (opts.dryRun) {
+      runtime.log(theme.muted("Dry run, no changes made."));
+      return true;
+    }
+    if (!opts.force) {
+      let confirmed: boolean;
+      try {
+        confirmed = await promptYesNo(
+          `Detach direct install ownership for plugin "${params.pluginId}"?`,
+        );
+      } catch (error) {
+        if (isPromptInputClosedError(error, PromptInputClosedError)) {
+          runtime.error(
+            "Error: plugins uninstall requires confirmation input. Re-run in an interactive TTY or pass --force.",
+          );
+          runtime.exit(1);
+          return true;
+        }
+        throw error;
+      }
+      if (!confirmed) {
+        runtime.log("Cancelled.");
+        return true;
+      }
+    }
+    releaseDirectArtifactOwner(artifactKey);
+    runtime.log(
+      `Detached direct install ownership for plugin "${params.pluginId}". The plugin remains installed because a Claw still references it.`,
+    );
+    return true;
+  };
+
   if (opts.keepConfig) {
     runtime.log(theme.warn("`--keep-config` is deprecated, use `--keep-files`."));
   }
@@ -106,6 +172,15 @@ export async function runPluginUninstallCommand(
     return;
   }
   const hasInstall = pluginId in (cfg.plugins?.installs ?? {});
+  if (
+    hasInstall &&
+    (await releaseClawProtectedDirectOwner({
+      pluginId,
+      installRecord: cfg.plugins?.installs?.[pluginId],
+    }))
+  ) {
+    return;
+  }
 
   const preview: string[] = [];
   if (plan.actions.entry) {

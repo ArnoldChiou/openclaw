@@ -1,6 +1,6 @@
 // E2E coverage for the staged Claw lifecycle CLI flow.
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -48,6 +48,48 @@ async function runOpenClaw(args: string[], options?: { expectFailure?: boolean }
       stderr: failed.stderr ?? "",
     };
   }
+}
+
+async function writeLocalPluginClawFixture(): Promise<{ manifestPath: string; pluginDir: string }> {
+  const root = await mkdtemp(join(tmpdir(), "openclaw-claws-local-plugin-"));
+  const pluginDir = join(root, "plugin");
+  await mkdir(join(pluginDir, "dist"), { recursive: true });
+  await writeFile(
+    join(pluginDir, "package.json"),
+    JSON.stringify({
+      name: "@openclaw/claw-local-plugin",
+      version: "1.0.0",
+      openclaw: { extensions: ["./dist/index.js"] },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(pluginDir, "openclaw.plugin.json"),
+    JSON.stringify({
+      id: "claw-local-plugin",
+      configSchema: { type: "object", additionalProperties: false, properties: {} },
+    }),
+    "utf8",
+  );
+  await writeFile(join(pluginDir, "dist", "index.js"), "export {};\n", "utf8");
+  await mkdir(join(root, "files"), { recursive: true });
+  await writeFile(join(root, "files", "SOUL.md"), "Local Plugin Claw\n", "utf8");
+  const manifestPath = join(root, "claw.json");
+  await writeFile(
+    manifestPath,
+    JSON.stringify({
+      schemaVersion: "openclaw.claw.v1",
+      id: "local-plugin-claw",
+      name: "Local Plugin Claw",
+      version: "1.0.0",
+      entries: [
+        { kind: "plugin", id: "local-plugin", selector: pluginDir },
+        { kind: "workspaceFile", id: "runbook", path: "SOUL.md", source: "files/SOUL.md" },
+      ],
+    }),
+    "utf8",
+  );
+  return { manifestPath, pluginDir };
 }
 
 function parseJson(stdout: string): unknown {
@@ -135,14 +177,15 @@ describe("claws lifecycle cli e2e", () => {
     expect(result.stderr).toContain("Claw apply mutates workspace files");
   });
 
-  it("applies workspace files and persists artifact provenance when local apply is confirmed", async () => {
+  it("applies a local plugin, workspace files, and artifact provenance when confirmed", async () => {
+    const { manifestPath, pluginDir } = await writeLocalPluginClawFixture();
     const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-lifecycle-workspace-"));
     const apply = parseJsonObject(
       (
         await runOpenClaw([
           "claws",
           "apply",
-          "src/claws/fixtures/incident-response.claw.json",
+          manifestPath,
           "--yes",
           "--workspace",
           workspaceRoot,
@@ -156,15 +199,14 @@ describe("claws lifecycle cli e2e", () => {
       dryRun: false,
       mutationAllowed: true,
       summary: {
-        totalEntries: 5,
-        recordedArtifactRefs: 3,
+        totalEntries: 2,
+        recordedArtifactRefs: 1,
         appliedWorkspaceFiles: 1,
-        previewOnlyEntries: 1,
+        previewOnlyEntries: 0,
         blockedEntries: 0,
-        provenanceRecords: 4,
+        provenanceRecords: 2,
       },
     });
-    expect(apply.artifacts).toEqual(expect.any(Array));
     expect(apply.workspaceFiles).toEqual(expect.any(Array));
     const workspaceFiles = apply.workspaceFiles as unknown[];
     expect(workspaceFiles[0]).toMatchObject({
@@ -173,14 +215,14 @@ describe("claws lifecycle cli e2e", () => {
       operation: "created",
     });
     await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toContain(
-      "Incident Response",
+      "Local Plugin Claw",
     );
     const artifacts = apply.artifacts as unknown[];
     expect(artifacts[0]).toMatchObject({
-      clawId: "incident-response",
-      entryId: "incident-triage-skill",
-      artifactKey: "skills:clawhub:incident-triage@1.0.0",
-      ownership: { state: "referenced", clawRefs: ["incident-response"], refCount: 1 },
+      clawId: "local-plugin-claw",
+      entryId: "local-plugin",
+      artifactKey: `plugins:path:${pluginDir}`,
+      ownership: { state: "newly-created", clawRefs: ["local-plugin-claw"], refCount: 1 },
     });
   });
 });

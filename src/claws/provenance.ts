@@ -177,7 +177,7 @@ function canonicalPackageSelector(artifact: NonNullable<ClawApplyPlanEntry["arti
   return artifact.selector.trim();
 }
 
-function artifactKeyFor(entry: ClawApplyPlanEntry, sourcePath?: string): string {
+export function artifactKeyFor(entry: ClawApplyPlanEntry, sourcePath?: string): string {
   const artifact = entry.artifact;
   const surface = artifact?.installSurface ?? entry.kind;
   const selector = artifact?.selector ?? entry.target ?? entry.id;
@@ -198,20 +198,35 @@ function readExistingArtifactRefs(db: DatabaseSync, artifactKey: string): Existi
     .all(artifactKey) as ExistingArtifactRefRow[];
 }
 
-function buildOwnership(params: ArtifactOwnershipParams): PersistedClawArtifactRef["ownership"] {
+function buildOwnership(
+  params: ArtifactOwnershipParams & {
+    preexistingDirectInstall?: boolean;
+    createdByThisApply?: boolean;
+  },
+): PersistedClawArtifactRef["ownership"] {
+  const preexistingDirectInstall = Boolean(params.preexistingDirectInstall);
+  const createdByThisApply = Boolean(params.createdByThisApply);
   const clawRefs = [
     ...new Set([
       ...params.existingRefs.map((row) => row.claw_id),
       ...(params.includeClawId ? [params.includeClawId] : []),
     ]),
   ].sort();
-  const state = clawRefs.length > 1 ? "shared" : "referenced";
+  const refCount = clawRefs.length + (preexistingDirectInstall ? 1 : 0);
+  const state =
+    refCount > 1
+      ? "shared"
+      : preexistingDirectInstall
+        ? "preexisting-direct"
+        : createdByThisApply
+          ? "newly-created"
+          : "referenced";
   return {
     state,
-    createdByThisApply: false,
-    preexistingDirectInstall: false,
+    createdByThisApply,
+    preexistingDirectInstall,
     clawRefs,
-    refCount: clawRefs.length,
+    refCount,
   };
 }
 
@@ -221,6 +236,8 @@ function buildPersistedRef(params: {
   existingRefs: ExistingArtifactRefRow[];
   nowMs: number;
   sourcePath?: string;
+  directArtifactKeys?: ReadonlySet<string>;
+  createdArtifactKeys?: ReadonlySet<string>;
 }): PersistedClawArtifactRef {
   const artifact = params.entry.artifact;
   const artifactKey = artifactKeyFor(params.entry, params.sourcePath);
@@ -240,6 +257,8 @@ function buildPersistedRef(params: {
     ownership: buildOwnership({
       existingRefs: params.existingRefs,
       includeClawId: params.plan.claw.id,
+      preexistingDirectInstall: params.directArtifactKeys?.has(artifactKey) ?? false,
+      createdByThisApply: params.createdArtifactKeys?.has(artifactKey) ?? false,
     }),
     appliedAtMs: params.nowMs,
     updatedAtMs: params.nowMs,
@@ -355,7 +374,43 @@ function deleteStaleClawArtifactRefs(
 
 function updateArtifactOwnershipRefs(db: DatabaseSync, artifactKey: string, nowMs: number): void {
   const refs = readExistingArtifactRefs(db, artifactKey);
-  const ownership = buildOwnership({ existingRefs: refs });
+  const existingDirect = refs.some((row) => {
+    const current = db
+      .prepare(`SELECT ownership_json FROM claw_artifact_refs WHERE claw_id = ? AND entry_id = ?`)
+      .get(row.claw_id, row.entry_id) as { ownership_json?: string } | undefined;
+    if (!current?.ownership_json) {
+      return false;
+    }
+    try {
+      return Boolean(
+        (JSON.parse(current.ownership_json) as PersistedClawArtifactRef["ownership"])
+          .preexistingDirectInstall,
+      );
+    } catch {
+      return false;
+    }
+  });
+  const createdByThisApply = refs.some((row) => {
+    const current = db
+      .prepare(`SELECT ownership_json FROM claw_artifact_refs WHERE claw_id = ? AND entry_id = ?`)
+      .get(row.claw_id, row.entry_id) as { ownership_json?: string } | undefined;
+    if (!current?.ownership_json) {
+      return false;
+    }
+    try {
+      return Boolean(
+        (JSON.parse(current.ownership_json) as PersistedClawArtifactRef["ownership"])
+          .createdByThisApply,
+      );
+    } catch {
+      return false;
+    }
+  });
+  const ownership = buildOwnership({
+    existingRefs: refs,
+    preexistingDirectInstall: existingDirect,
+    createdByThisApply,
+  });
   db.prepare(
     `UPDATE claw_artifact_refs
         SET ownership_json = @ownership_json,
@@ -368,12 +423,75 @@ function updateArtifactOwnershipRefs(db: DatabaseSync, artifactKey: string, nowM
   });
 }
 
+export function readClawArtifactRefsForArtifactKey(
+  artifactKey: string,
+  options: OpenClawStateDatabaseOptions = {},
+): PersistedClawArtifactRef[] {
+  const database = openOpenClawStateDatabase(options);
+  ensureClawProvenanceTables(database.db);
+  const rows = database.db
+    .prepare(
+      `SELECT claw_id, claw_version, entry_id, kind, artifact_key, selector,
+              install_surface, source, package_name, version, provenance_record,
+              ownership_json, applied_at_ms, updated_at_ms
+         FROM claw_artifact_refs
+        WHERE artifact_key = ?
+        ORDER BY claw_id, entry_id`,
+    )
+    .all(artifactKey) as ArtifactRefRow[];
+  return rows.map(rowToPersistedRef);
+}
+
+export function releaseDirectArtifactOwner(
+  artifactKey: string,
+  options: OpenClawStateDatabaseOptions & { nowMs?: number } = {},
+): PersistedClawArtifactRef[] {
+  const nowMs = options.nowMs ?? Date.now();
+  runOpenClawStateWriteTransaction(({ db }) => {
+    ensureClawProvenanceTables(db);
+    const refs = readExistingArtifactRefs(db, artifactKey);
+    for (const ref of refs) {
+      const row = db
+        .prepare(`SELECT ownership_json FROM claw_artifact_refs WHERE claw_id = ? AND entry_id = ?`)
+        .get(ref.claw_id, ref.entry_id) as { ownership_json?: string } | undefined;
+      if (!row?.ownership_json) {
+        continue;
+      }
+      let previous: PersistedClawArtifactRef["ownership"];
+      try {
+        previous = JSON.parse(row.ownership_json) as PersistedClawArtifactRef["ownership"];
+      } catch {
+        previous = buildOwnership({ existingRefs: refs });
+      }
+      const ownership = buildOwnership({
+        existingRefs: refs,
+        createdByThisApply: previous.createdByThisApply,
+        preexistingDirectInstall: false,
+      });
+      db.prepare(
+        `UPDATE claw_artifact_refs
+            SET ownership_json = @ownership_json,
+                updated_at_ms = @updated_at_ms
+          WHERE claw_id = @claw_id AND entry_id = @entry_id`,
+      ).run({
+        ownership_json: JSON.stringify(ownership),
+        updated_at_ms: nowMs,
+        claw_id: ref.claw_id,
+        entry_id: ref.entry_id,
+      });
+    }
+  }, options);
+  return readClawArtifactRefsForArtifactKey(artifactKey, options);
+}
+
 export function persistClawArtifactApplyProvenance(
   plan: ClawApplyPlan,
   options: OpenClawStateDatabaseOptions & {
     sourcePath?: string;
     feed?: unknown;
     nowMs?: number;
+    directArtifactKeys?: ReadonlySet<string>;
+    createdArtifactKeys?: ReadonlySet<string>;
   } = {},
 ): ClawApplyProvenanceResult {
   const blockedEntries = plan.entries.filter((entry) => entry.blocked);
@@ -445,7 +563,15 @@ export function persistClawArtifactApplyProvenance(
       const existingRefs = readExistingArtifactRefs(db, artifactKey);
       upsertClawArtifactRef(
         db,
-        buildPersistedRef({ plan, entry, existingRefs, nowMs, sourcePath }),
+        buildPersistedRef({
+          plan,
+          entry,
+          existingRefs,
+          nowMs,
+          sourcePath,
+          directArtifactKeys: options.directArtifactKeys,
+          createdArtifactKeys: options.createdArtifactKeys,
+        }),
       );
       affectedArtifactKeys.add(artifactKey);
     }
