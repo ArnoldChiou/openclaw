@@ -1014,73 +1014,55 @@ export async function applySqliteSessionEntryLifecycleMutation(params: {
       }
       throw error;
     };
-    let projected: SqliteProjectedLifecycleMutation = {
-      deletePlans: [],
-      removals: [],
-      upsertedEntries: [],
-    };
-    await runOpenClawAgentWriteTransactionAsync(
-      async (database) => {
-        projected = await projectSqliteSessionEntryLifecycleMutation(database, {
-          archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
-          removals,
-          upserts,
-        });
-      },
-      toDatabaseOptions(resolved),
-      { operationLabel: "session-lifecycle.project" },
-    );
+    const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
+    const projected = await projectSqliteSessionEntryLifecycleMutation(database, {
+      archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+      removals,
+      upserts,
+    });
     let materializedRemovalPlans: MaterializedSqliteSessionStateDeletePlan[] = [];
     try {
       materializedRemovalPlans = materializeSqliteSessionStateDeletePlans(projected.deletePlans);
     } catch (error) {
       captureArtifactCleanupError(error);
     }
-    await runOpenClawAgentWriteTransactionAsync(
-      async (transactionDb) => {
-        for (const removal of projected.removals) {
-          const entry = readExactSessionEntryRow(transactionDb, removal.sessionKey)?.entry;
-          if (!sqliteSessionEntriesEqual(entry, removal.expectedEntry)) {
-            throw new Error(
-              `SQLite session entry changed before lifecycle removal for ${removal.sessionKey}`,
-            );
-          }
-          if (!shouldRemoveSqliteSessionEntry(entry, removal.removal)) {
-            continue;
-          }
-          deleteSqliteSessionEntryRows(transactionDb, removal.sessionKey);
-          removedSessionKeys.push(removal.sessionKey);
+    runOpenClawAgentWriteTransaction((transactionDb) => {
+      for (const removal of projected.removals) {
+        const entry = readExactSessionEntryRow(transactionDb, removal.sessionKey)?.entry;
+        if (!sqliteSessionEntriesEqual(entry, removal.expectedEntry)) {
+          throw new Error(
+            `SQLite session entry changed before lifecycle removal for ${removal.sessionKey}`,
+          );
         }
-        for (const { sessionKey, entry, expectedEntry } of projected.upsertedEntries) {
-          const currentEntry = readExactSessionEntryRow(transactionDb, sessionKey)?.entry;
-          if (!sqliteSessionEntriesEqual(currentEntry, expectedEntry)) {
-            throw new Error(
-              `SQLite session entry changed before lifecycle upsert for ${sessionKey}`,
-            );
-          }
-          writeSessionEntry(transactionDb, sessionKey, entry);
+        if (!shouldRemoveSqliteSessionEntry(entry, removal.removal)) {
+          continue;
         }
-        maintenancePlans.push(
-          applySqliteSessionEntryMaintenance(transactionDb, {
-            activeSessionKey: params.activeSessionKey ?? "",
-            archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
-            forceMaintenance: params.maintenanceOverride !== undefined,
-            maintenanceConfig: params.maintenanceOverride
-              ? { ...resolveMaintenanceConfig(), ...params.maintenanceOverride }
-              : undefined,
-            skipMaintenance: params.skipMaintenance,
-          }),
-        );
-        archivedTranscripts = deleteMaterializedSqliteSessionStatePlans(
-          transactionDb,
-          materializedRemovalPlans,
-        );
-      },
-      toDatabaseOptions(resolved),
-      {
-        operationLabel: "session-lifecycle.apply",
-      },
-    );
+        deleteSqliteSessionEntryRows(transactionDb, removal.sessionKey);
+        removedSessionKeys.push(removal.sessionKey);
+      }
+      for (const { sessionKey, entry, expectedEntry } of projected.upsertedEntries) {
+        const currentEntry = readExactSessionEntryRow(transactionDb, sessionKey)?.entry;
+        if (!sqliteSessionEntriesEqual(currentEntry, expectedEntry)) {
+          throw new Error(`SQLite session entry changed before lifecycle upsert for ${sessionKey}`);
+        }
+        writeSessionEntry(transactionDb, sessionKey, entry);
+      }
+      maintenancePlans.push(
+        applySqliteSessionEntryMaintenance(transactionDb, {
+          activeSessionKey: params.activeSessionKey ?? "",
+          archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+          forceMaintenance: params.maintenanceOverride !== undefined,
+          maintenanceConfig: params.maintenanceOverride
+            ? { ...resolveMaintenanceConfig(), ...params.maintenanceOverride }
+            : undefined,
+          skipMaintenance: params.skipMaintenance,
+        }),
+      );
+      archivedTranscripts = deleteMaterializedSqliteSessionStatePlans(
+        transactionDb,
+        materializedRemovalPlans,
+      );
+    }, toDatabaseOptions(resolved));
     const maintenanceArchivedTranscripts = finalizeSqliteSessionEntryMaintenancePlansBestEffort(
       resolved,
       maintenancePlans,

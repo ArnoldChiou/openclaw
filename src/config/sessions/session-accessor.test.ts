@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MsgContext } from "../../auto-reply/templating.js";
 import { onSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
+import { appendSqliteTrajectoryRuntimeEvents } from "../../trajectory/runtime-store.sqlite.js";
+import type { TrajectoryEvent } from "../../trajectory/types.js";
 import {
   applyRestartRecoveryLifecycle,
   appendTranscriptMessage,
@@ -38,6 +40,7 @@ import {
 import {
   importSqliteSessionRows,
   loadExactSqliteSessionEntry,
+  replaceSqliteSessionEntrySync,
   replaceSqliteTranscriptEvents,
 } from "./session-accessor.sqlite.js";
 import { withOwnedSessionTranscriptWrites } from "./transcript-write-context.js";
@@ -52,6 +55,19 @@ vi.mock("../../gateway/session-archive.runtime.js", async (importOriginal) => {
     cleanupArchivedSessionTranscripts: cleanupArchivedSessionTranscriptsMock,
   };
 });
+
+function createTestTrajectoryEvent(sessionId: string): TrajectoryEvent {
+  return {
+    traceSchema: "openclaw-trajectory",
+    schemaVersion: 1,
+    traceId: sessionId,
+    source: "runtime",
+    type: "test.concurrent-write",
+    ts: "2026-07-09T00:00:00.000Z",
+    seq: 1,
+    sessionId,
+  };
+}
 
 describe("session accessor seam", () => {
   let tempDir: string;
@@ -1378,6 +1394,107 @@ describe("session accessor seam", () => {
       status: "running",
       updatedAt: 20,
     });
+  });
+
+  it("does not hold a write transaction while awaiting a lifecycle entry builder", async () => {
+    const sessionKey = "agent:main:lifecycle-prepare";
+    await upsertSessionEntry(
+      { sessionKey, storePath },
+      { model: "base", sessionId: "lifecycle-prepare", updatedAt: 10 },
+    );
+    let releaseBuilder!: () => void;
+    let markBuilderStarted!: () => void;
+    const builderStarted = new Promise<void>((resolve) => {
+      markBuilderStarted = resolve;
+    });
+    const builderGate = new Promise<void>((resolve) => {
+      releaseBuilder = resolve;
+    });
+    const pendingMutation = applySessionEntryLifecycleMutation({
+      storePath,
+      upserts: [
+        {
+          sessionKey,
+          buildEntry: async ({ currentEntry }) => {
+            markBuilderStarted();
+            await builderGate;
+            return { ...currentEntry, model: "projected" } as SessionEntry;
+          },
+        },
+      ],
+      skipMaintenance: true,
+    });
+
+    await builderStarted;
+    let unrelatedWriteError: unknown;
+    try {
+      appendSqliteTrajectoryRuntimeEvents({ sessionId: "lifecycle-prepare", storePath }, [
+        createTestTrajectoryEvent("lifecycle-prepare"),
+      ]);
+    } catch (error) {
+      unrelatedWriteError = error;
+    } finally {
+      releaseBuilder();
+    }
+
+    await expect(pendingMutation).resolves.toMatchObject({ afterCount: 1 });
+    expect(unrelatedWriteError).toBeUndefined();
+    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({ model: "projected" });
+  });
+
+  it("rejects a lifecycle projection when its source row changes", async () => {
+    const scope = { sessionKey: "agent:main:lifecycle-stale", storePath };
+    await upsertSessionEntry(scope, {
+      model: "base",
+      sessionId: "lifecycle-stale",
+      updatedAt: 10,
+    });
+    let releaseBuilder!: () => void;
+    let markBuilderStarted!: () => void;
+    const builderStarted = new Promise<void>((resolve) => {
+      markBuilderStarted = resolve;
+    });
+    const builderGate = new Promise<void>((resolve) => {
+      releaseBuilder = resolve;
+    });
+    const pendingMutation = applySessionEntryLifecycleMutation({
+      storePath,
+      upserts: [
+        {
+          sessionKey: scope.sessionKey,
+          buildEntry: async ({ currentEntry }) => {
+            markBuilderStarted();
+            await builderGate;
+            return { ...currentEntry, model: "stale-projection" } as SessionEntry;
+          },
+        },
+      ],
+      skipMaintenance: true,
+    });
+
+    await builderStarted;
+    let replacementError: unknown;
+    try {
+      replaceSqliteSessionEntrySync(scope, {
+        model: "newer",
+        sessionId: "lifecycle-stale",
+        updatedAt: 20,
+      });
+    } catch (error) {
+      replacementError = error;
+    } finally {
+      releaseBuilder();
+    }
+    const mutationError = await pendingMutation.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(replacementError).toBeUndefined();
+    expect(mutationError).toMatchObject({
+      message: expect.stringContaining("changed before lifecycle upsert"),
+    });
+    expect(loadSessionEntry(scope)).toMatchObject({ model: "newer", updatedAt: 20 });
   });
 
   it("reclaims SQLite transcript rows for lifecycle removals without archive intent", async () => {
