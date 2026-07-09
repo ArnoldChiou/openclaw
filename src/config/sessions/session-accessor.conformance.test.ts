@@ -10,6 +10,7 @@ import {
   openOpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
+import { appendSqliteTrajectoryRuntimeEvents } from "../../trajectory/runtime-store.sqlite.js";
 import {
   appendTranscriptEvent,
   appendTranscriptMessage,
@@ -53,6 +54,7 @@ import {
   publishSqliteTranscriptUpdate,
   readSqliteSessionUpdatedAt,
   replaceSqliteSessionEntry,
+  replaceSqliteSessionEntrySync,
   replaceSqliteTranscriptEvents,
   restoreSqliteCompactionCheckpointSession,
   sqliteTranscriptExists,
@@ -782,6 +784,107 @@ describe.each([publicAccessorAdapter, sqliteAdapter])(
         model: "updated",
         providerOverride: "anthropic",
       });
+    });
+
+    it("does not hold a write transaction while awaiting a SQLite entry updater", async () => {
+      if (adapter !== sqliteAdapter) {
+        return;
+      }
+      const scope = sqliteAdapter.entryScope(paths);
+      await replaceSqliteSessionEntry(scope, {
+        model: "base",
+        sessionId: "transaction-gap",
+        updatedAt: 10,
+      });
+
+      let releaseUpdater!: () => void;
+      let markUpdaterStarted!: () => void;
+      const updaterStarted = new Promise<void>((resolve) => {
+        markUpdaterStarted = resolve;
+      });
+      const updaterGate = new Promise<void>((resolve) => {
+        releaseUpdater = resolve;
+      });
+      const pendingPatch = patchSqliteSessionEntry(scope, async () => {
+        markUpdaterStarted();
+        await updaterGate;
+        return { model: "patched" };
+      });
+
+      await updaterStarted;
+      let unrelatedWriteError: unknown;
+      try {
+        appendSqliteTrajectoryRuntimeEvents(
+          { sessionId: "transaction-gap", storePath: paths.sqlitePath },
+          [
+            {
+              traceSchema: "openclaw-trajectory",
+              schemaVersion: 1,
+              traceId: "transaction-gap",
+              source: "runtime",
+              type: "test.concurrent-write",
+              ts: "2026-07-09T00:00:00.000Z",
+              seq: 1,
+              sessionId: "transaction-gap",
+            },
+          ],
+        );
+      } catch (error) {
+        unrelatedWriteError = error;
+      } finally {
+        releaseUpdater();
+      }
+
+      await expect(pendingPatch).resolves.toMatchObject({ model: "patched" });
+      expect(unrelatedWriteError).toBeUndefined();
+    });
+
+    it("rejects a prepared SQLite entry patch when its source row changes", async () => {
+      if (adapter !== sqliteAdapter) {
+        return;
+      }
+      const scope = sqliteAdapter.entryScope(paths);
+      await replaceSqliteSessionEntry(scope, {
+        model: "base",
+        sessionId: "stale-prepare",
+        updatedAt: 10,
+      });
+
+      let releaseUpdater!: () => void;
+      let markUpdaterStarted!: () => void;
+      const updaterStarted = new Promise<void>((resolve) => {
+        markUpdaterStarted = resolve;
+      });
+      const updaterGate = new Promise<void>((resolve) => {
+        releaseUpdater = resolve;
+      });
+      const pendingPatch = patchSqliteSessionEntry(scope, async () => {
+        markUpdaterStarted();
+        await updaterGate;
+        return { model: "stale-patch" };
+      });
+
+      await updaterStarted;
+      let replacementError: unknown;
+      try {
+        replaceSqliteSessionEntrySync(scope, {
+          model: "newer",
+          sessionId: "stale-prepare",
+          updatedAt: 20,
+        });
+      } catch (error) {
+        replacementError = error;
+      } finally {
+        releaseUpdater();
+      }
+      const mutationError = await pendingPatch.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+
+      expect(replacementError).toBeUndefined();
+      expect(mutationError).toMatchObject({ name: "SqliteSessionMutationConflictError" });
+      expect(loadSqliteSessionEntry(scope)).toMatchObject({ model: "newer", updatedAt: 20 });
     });
 
     it("dedupes SQLite transcript identities inside the writer path", async () => {
