@@ -170,6 +170,10 @@ describe("CORE_HEALTH_CHECKS", () => {
     ).toBe(false);
   });
 
+  it("includes Claw state diagnostics in core doctor checks", () => {
+    expect(CORE_HEALTH_CHECKS.map((check) => check.id)).toContain("core/doctor/claws-state");
+  });
+
   it("warns when autonomous Skill Workshop capture is enabled but policy hides its tool", async () => {
     const check = getCheck(
       createCoreHealthChecks(createDeps()),

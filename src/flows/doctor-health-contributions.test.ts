@@ -1515,6 +1515,12 @@ describe("doctor health contributions", () => {
     );
   });
 
+  it("wires Claw state diagnostics into doctor contributions", async () => {
+    const contributionChecks = await resolveDoctorContributionHealthChecks();
+
+    expect(contributionChecks.map((check) => check.id)).toContain("core/doctor/claws-state");
+  });
+
   it("keeps implemented core health checks owned by ordered doctor contributions", async () => {
     const coreIds = CORE_HEALTH_CHECKS.map((check) => check.id);
     const contributionIds = resolveDoctorHealthContributions().flatMap(

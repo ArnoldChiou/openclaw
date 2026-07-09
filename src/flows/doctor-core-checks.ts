@@ -1131,6 +1131,21 @@ function createConvertedWorkflowChecks(
     createRuntimeToolSchemaCheck(deps),
     createWorkspaceSuggestionsCheck(deps),
     skillWorkshopToolPolicyCheck,
+    {
+      id: "core/doctor/claws-state",
+      kind: "core",
+      description:
+        "Applied Claw provenance, MCP refs, connector refs, and workspace files are consistent.",
+      defaultEnabled: false,
+      source: "doctor",
+      async detect(ctx) {
+        const { collectClawStateHealthFindings } = await import("../claws/doctor.js");
+        return collectClawStateHealthFindings({
+          cfg: ctx.cfg,
+          env: process.env,
+        });
+      },
+    },
   ];
 }
 

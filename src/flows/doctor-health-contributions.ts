@@ -1502,6 +1502,10 @@ async function runSkillWorkshopToolPolicyHealth(ctx: DoctorHealthFlowContext): P
   await runCoreHealthFindingNote(ctx, "core/doctor/skill-workshop-tool-policy");
 }
 
+async function runClawStateHealth(ctx: DoctorHealthFlowContext): Promise<void> {
+  await runCoreHealthFindingNote(ctx, "core/doctor/claws-state");
+}
+
 export function resolveDoctorHealthContributions(): DoctorHealthContribution[] {
   return [
     createDoctorHealthContribution({
@@ -2037,6 +2041,12 @@ export function resolveDoctorHealthContributions(): DoctorHealthContribution[] {
         },
       },
       run: runWorkspaceStatusHealth,
+    }),
+    createDoctorHealthContribution({
+      id: "doctor:claws-state",
+      label: "Claws state",
+      healthCheckIds: ["core/doctor/claws-state"],
+      run: runClawStateHealth,
     }),
     createDoctorHealthContribution({
       id: "doctor:skill-curator",
