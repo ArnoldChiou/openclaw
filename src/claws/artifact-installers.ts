@@ -1,11 +1,27 @@
 // Applies supported Claw artifact installers through existing OpenClaw install paths.
+import fs from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
+import {
+  resolveAgentIdByWorkspacePath,
+  resolveAgentWorkspaceDir,
+  resolveDefaultAgentId,
+} from "../agents/agent-scope.js";
 import { runPluginInstallCommand } from "../cli/plugins-install-command.js";
-import { readConfigFileSnapshot } from "../config/config.js";
+import { getRuntimeConfig, readConfigFileSnapshot } from "../config/config.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { resolveFileNpmSpecToLocalPath } from "../infra/plugin-install-specs.js";
 import { loadInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-records.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { resolveWorkspaceSkillInstallDir } from "../skills/lifecycle/archive-install.js";
+import {
+  installSkillFromClawHub,
+  readClawHubSkillsLockfileStatusSync,
+  resolveClawHubSkillStatusLinkSync,
+} from "../skills/lifecycle/clawhub.js";
+import {
+  installSkillFromSource,
+  isSkillSourceInstallSpec,
+} from "../skills/lifecycle/source-install.js";
 import { pluginInstallRecordMatchesClawArtifact } from "./artifact-identity.js";
 import { artifactKeyFor } from "./provenance.js";
 import type { ClawApplyPlan, ClawApplyPlanEntry, ClawDiagnostic } from "./types.js";
@@ -28,6 +44,12 @@ export type ClawArtifactInstallerResult = {
 type ClawArtifactInstallerDeps = {
   loadInstalledPluginIndexInstallRecords?: typeof loadInstalledPluginIndexInstallRecords;
   runPluginInstallCommand?: typeof runPluginInstallCommand;
+  installSkillFromClawHub?: typeof installSkillFromClawHub;
+  installSkillFromSource?: typeof installSkillFromSource;
+  readClawHubSkillsLockfileStatusSync?: typeof readClawHubSkillsLockfileStatusSync;
+  readSkillSourceOrigin?: typeof readSkillSourceOrigin;
+  resolveClawHubSkillStatusLinkSync?: typeof resolveClawHubSkillStatusLinkSync;
+  resolveSkillsWorkspaceDir?: typeof resolveSkillsWorkspaceDir;
 };
 
 type EnabledPluginMatcher = Pick<ReadonlySet<string>, "has">;
@@ -94,9 +116,16 @@ function pluginArtifactEntries(plan: ClawApplyPlan): ClawApplyPlanEntry[] {
   return artifactEntries(plan).filter((entry) => entry.artifact?.installSurface === "plugins");
 }
 
+function skillArtifactEntries(plan: ClawApplyPlan): ClawApplyPlanEntry[] {
+  return artifactEntries(plan).filter((entry) => entry.artifact?.installSurface === "skills");
+}
+
 function unsupportedArtifactEntries(plan: ClawApplyPlan): ClawApplyPlanEntry[] {
   return artifactEntries(plan).filter(
-    (entry) => entry.required !== false && entry.artifact?.installSurface !== "plugins",
+    (entry) =>
+      entry.required !== false &&
+      entry.artifact?.installSurface !== "plugins" &&
+      entry.artifact?.installSurface !== "skills",
   );
 }
 
@@ -157,6 +186,185 @@ async function readEnabledPluginIds(): Promise<EnabledPluginMatcher | undefined>
   }
 }
 
+function resolveSkillsWorkspaceDir(): {
+  config: ReturnType<typeof getRuntimeConfig>;
+  workspaceDir: string;
+} {
+  const config = getRuntimeConfig();
+  const agentId =
+    resolveAgentIdByWorkspacePath(config, process.cwd()) ?? resolveDefaultAgentId(config);
+  return {
+    config,
+    workspaceDir: resolveAgentWorkspaceDir(config, agentId),
+  };
+}
+
+type ClawHubSkillTarget = {
+  installRef: string;
+  slug: string;
+  ownerHandle?: string;
+  version?: string;
+};
+
+function stripClawHubSkillVersion(ref: string, version?: string): string {
+  if (version && ref.endsWith(`@${version}`)) {
+    return ref.slice(0, -`@${version}`.length);
+  }
+  if (!ref.startsWith("@")) {
+    return ref.replace(/@[^/@]+$/, "");
+  }
+  const slashIndex = ref.indexOf("/");
+  if (slashIndex < 0) {
+    return ref;
+  }
+  const owner = ref.slice(0, slashIndex + 1);
+  const slug = ref.slice(slashIndex + 1).replace(/@[^/@]+$/, "");
+  return `${owner}${slug}`;
+}
+
+function parseClawHubSkillSelector(entry: ClawApplyPlanEntry): ClawHubSkillTarget | undefined {
+  const artifact = entry.artifact;
+  const selector = artifact?.selector?.trim() ?? "";
+  if (!selector.toLowerCase().startsWith("clawhub:")) {
+    return undefined;
+  }
+  const ref = selector.slice("clawhub:".length).trim();
+  if (!ref) {
+    return undefined;
+  }
+  const installRef = stripClawHubSkillVersion(ref, artifact?.version);
+  if (installRef.startsWith("@")) {
+    const slashIndex = installRef.indexOf("/");
+    if (slashIndex <= 1 || slashIndex === installRef.length - 1) {
+      return undefined;
+    }
+    return {
+      installRef,
+      ownerHandle: installRef.slice(1, slashIndex),
+      slug: installRef.slice(slashIndex + 1),
+      ...(artifact?.version ? { version: artifact.version } : {}),
+    };
+  }
+  if (installRef.includes("/")) {
+    return undefined;
+  }
+  return {
+    installRef,
+    slug: installRef,
+    ...(artifact?.version ? { version: artifact.version } : {}),
+  };
+}
+
+function readTrackedClawHubSkill(
+  entry: ClawApplyPlanEntry,
+  workspaceDir: string,
+  deps: ClawArtifactInstallerDeps,
+): { installed: boolean } {
+  const target = parseClawHubSkillSelector(entry);
+  if (!target) {
+    return { installed: false };
+  }
+  const readLock = deps.readClawHubSkillsLockfileStatusSync ?? readClawHubSkillsLockfileStatusSync;
+  const lock = readLock(workspaceDir);
+  if (lock.kind !== "found") {
+    return { installed: false };
+  }
+  const readStatus = deps.resolveClawHubSkillStatusLinkSync ?? resolveClawHubSkillStatusLinkSync;
+  const status = readStatus({
+    workspaceDir,
+    skillDir: resolveWorkspaceSkillInstallDir(workspaceDir, target.slug),
+    skillKey: target.slug,
+    lockRead: lock,
+  });
+  if (!status?.valid || status.slug !== target.slug) {
+    return { installed: false };
+  }
+  if (target.ownerHandle && status.ownerHandle !== target.ownerHandle) {
+    return { installed: false };
+  }
+  if (target.version && status.installedVersion !== target.version) {
+    return { installed: false };
+  }
+  return { installed: true };
+}
+
+type SkillSourceOrigin = {
+  version: 1;
+  source: "path" | "git";
+  spec: string;
+  slug: string;
+};
+
+async function readSkillSourceOrigin(skillDir: string): Promise<SkillSourceOrigin | undefined> {
+  try {
+    const raw = await fs.readFile(resolve(skillDir, ".openclaw", "source-origin.json"), "utf8");
+    const parsed = JSON.parse(raw) as Partial<SkillSourceOrigin>;
+    if (
+      parsed.version === 1 &&
+      (parsed.source === "path" || parsed.source === "git") &&
+      typeof parsed.spec === "string" &&
+      typeof parsed.slug === "string"
+    ) {
+      return {
+        version: 1,
+        source: parsed.source,
+        spec: parsed.spec,
+        slug: parsed.slug,
+      };
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+async function hasMatchingSkillInstall(
+  entry: ClawApplyPlanEntry,
+  workspaceDir: string,
+  deps: ClawArtifactInstallerDeps,
+  sourcePath?: string,
+): Promise<boolean> {
+  if (entry.artifact?.source === "clawhub") {
+    return readTrackedClawHubSkill(entry, workspaceDir, deps).installed;
+  }
+  if (entry.artifact?.source === "path" || entry.artifact?.source === "git") {
+    const readOrigin = deps.readSkillSourceOrigin ?? readSkillSourceOrigin;
+    const origin = await readOrigin(resolveWorkspaceSkillInstallDir(workspaceDir, entry.id));
+    const selector = resolveLocalSelector(
+      entry.artifact?.selector ?? entry.target ?? entry.id,
+      sourcePath,
+    );
+    return (
+      origin?.source === entry.artifact.source &&
+      origin.slug === entry.id &&
+      origin.spec === selector
+    );
+  }
+  return false;
+}
+
+function unsupportedSkillEntry(entry: ClawApplyPlanEntry): ClawDiagnostic | undefined {
+  const source = entry.artifact?.source;
+  if (source === "clawhub" || source === "path" || source === "git") {
+    return undefined;
+  }
+  return {
+    level: "error",
+    code: "skill_artifact_source_unsupported",
+    path: "$.entries",
+    message: `Claw skill artifact ${entry.id} uses selector ${entry.artifact?.selector ?? entry.target ?? entry.id}, which is not supported by mutating apply yet.`,
+  };
+}
+
+function invalidClawHubSkillSelectorDiagnostic(entry: ClawApplyPlanEntry): ClawDiagnostic {
+  return {
+    level: "error",
+    code: "skill_artifact_selector_invalid",
+    path: "$.entries",
+    message: `Claw skill artifact ${entry.id} uses invalid ClawHub selector ${entry.artifact?.selector ?? entry.target ?? entry.id}.`,
+  };
+}
+
 function createInstallerRuntime(
   runtime: RuntimeEnv,
   diagnostics: ClawDiagnostic[],
@@ -204,6 +412,8 @@ export async function applyClawArtifactInstallers(
   const loadRecords =
     deps.loadInstalledPluginIndexInstallRecords ?? loadInstalledPluginIndexInstallRecords;
   const installPlugin = deps.runPluginInstallCommand ?? runPluginInstallCommand;
+  const installSkillHub = deps.installSkillFromClawHub ?? installSkillFromClawHub;
+  const installSkillSource = deps.installSkillFromSource ?? installSkillFromSource;
   const runtime = options.runtime ?? defaultRuntime;
   const diagnostics: ClawDiagnostic[] = [];
   const unsupportedEntries = unsupportedArtifactEntries(plan);
@@ -217,7 +427,8 @@ export async function applyClawArtifactInstallers(
       })),
     );
   }
-  const entries = pluginArtifactEntries(plan);
+  const pluginEntries = pluginArtifactEntries(plan);
+  const skillEntries = skillArtifactEntries(plan);
   const sourcePath = options.sourcePath ?? plan.claw.sourcePath;
   let currentRecords = await loadRecords();
   let enabledPluginIds = await readEnabledPluginIds();
@@ -226,22 +437,126 @@ export async function applyClawArtifactInstallers(
   const installedArtifactKeys = new Set<string>();
   const installedEntries = new Map<string, ClawApplyPlanEntry>();
   const satisfiedArtifactKeys = new Set<string>();
+  const partialResult = () => ({
+    directArtifactKeys,
+    createdArtifactKeys,
+    installedArtifactKeys,
+  });
 
-  for (const entry of entries) {
+  if (skillEntries.length > 0) {
+    const unsupportedSkillDiagnostics = skillEntries
+      .filter((entry) => entry.required !== false)
+      .map(unsupportedSkillEntry)
+      .filter((diagnostic): diagnostic is ClawDiagnostic => Boolean(diagnostic));
+    if (unsupportedSkillDiagnostics.length > 0) {
+      throw new ClawArtifactApplyError(unsupportedSkillDiagnostics, partialResult());
+    }
+    const { config, workspaceDir } = (deps.resolveSkillsWorkspaceDir ?? resolveSkillsWorkspaceDir)();
+    for (const entry of skillEntries) {
+      const artifactKey = artifactKeyFor(entry, sourcePath);
+      if (satisfiedArtifactKeys.has(artifactKey)) {
+        continue;
+      }
+      if (unsupportedSkillEntry(entry)) {
+        continue;
+      }
+      if (await hasMatchingSkillInstall(entry, workspaceDir, deps, sourcePath)) {
+        installedArtifactKeys.add(artifactKey);
+        satisfiedArtifactKeys.add(artifactKey);
+        continue;
+      }
+      const selector = resolveLocalSelector(
+        entry.artifact?.selector ?? entry.target ?? entry.id,
+        sourcePath,
+      );
+      const clawHubTarget = parseClawHubSkillSelector({
+        ...entry,
+        artifact: entry.artifact ? { ...entry.artifact, selector } : entry.artifact,
+      });
+      let result:
+        | Awaited<ReturnType<typeof installSkillFromClawHub>>
+        | Awaited<ReturnType<typeof installSkillFromSource>>;
+      if (entry.artifact?.source === "clawhub") {
+        if (!clawHubTarget) {
+          throw new ClawArtifactApplyError(
+            [invalidClawHubSkillSelectorDiagnostic(entry)],
+            partialResult(),
+          );
+        }
+        result = await installSkillHub({
+          workspaceDir,
+          slug: clawHubTarget.installRef,
+          ...(clawHubTarget.version ? { version: clawHubTarget.version } : {}),
+          acknowledgeClawHubRisk: true,
+          logger: {
+            info: (message) => {
+              if (!options.quiet) {
+                runtime.log(message);
+              }
+            },
+            warn: (message) => {
+              if (!options.quiet) {
+                runtime.log(message);
+              }
+            },
+          },
+          config,
+        });
+      } else if (isSkillSourceInstallSpec(selector)) {
+        result = await installSkillSource({
+          workspaceDir,
+          spec: selector,
+          slug: entry.id,
+          logger: {
+            info: (message) => {
+              if (!options.quiet) {
+                runtime.log(message);
+              }
+            },
+            warn: (message) => {
+              if (!options.quiet) {
+                runtime.log(message);
+              }
+            },
+          },
+          config,
+        });
+      } else {
+        throw new ClawArtifactApplyError(
+          [unsupportedSkillEntry(entry)].filter(Boolean) as ClawDiagnostic[],
+          partialResult(),
+        );
+      }
+      if (!result.ok) {
+        throw new ClawArtifactApplyError(
+          [
+            {
+              level: "error",
+              code: "skill_artifact_install_failed",
+              path: `$.entries[${plan.entries.indexOf(entry)}]`,
+              message: result.error,
+            },
+          ],
+          partialResult(),
+        );
+      }
+      installedArtifactKeys.add(artifactKey);
+      createdArtifactKeys.add(artifactKey);
+      satisfiedArtifactKeys.add(artifactKey);
+    }
+  }
+
+  for (const entry of pluginEntries) {
     const artifactKey = artifactKeyFor(entry, sourcePath);
     if (satisfiedArtifactKeys.has(artifactKey)) {
       continue;
     }
     if (hasMatchingPluginInstallRecord(entry, currentRecords, sourcePath, enabledPluginIds)) {
+      installedArtifactKeys.add(artifactKey);
       satisfiedArtifactKeys.add(artifactKey);
       continue;
     }
 
-    const partialResult = () => ({
-      directArtifactKeys,
-      createdArtifactKeys,
-      installedArtifactKeys,
-    });
     try {
       await installPlugin({
         raw: resolveLocalSelector(entry.artifact?.selector ?? entry.target ?? entry.id, sourcePath),

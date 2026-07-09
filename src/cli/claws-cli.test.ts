@@ -162,8 +162,8 @@ describe("claws cli", () => {
     });
     artifactInstallerMock.applyClawArtifactInstallers.mockResolvedValue({
       directArtifactKeys: new Set<string>(),
-      createdArtifactKeys: new Set<string>(),
-      installedArtifactKeys: new Set<string>(),
+      createdArtifactKeys: new Set<string>(["plugins:npm:@openclaw/plugin-example@1.0.0"]),
+      installedArtifactKeys: new Set<string>(["plugins:npm:@openclaw/plugin-example@1.0.0"]),
     });
   });
 

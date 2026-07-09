@@ -59,7 +59,7 @@ afterEach(() => {
 });
 
 describe("persistClawArtifactApplyProvenance", () => {
-  it("does not persist non-plugin artifact surfaces", () => {
+  it("persists skill artifact refs", () => {
     const result = persistClawArtifactApplyProvenance(
       applyPlan({
         entries: [{ kind: "skill", id: "sec-filings", selector: "clawhub:sec-filings@1.0.0" }],
@@ -68,10 +68,16 @@ describe("persistClawArtifactApplyProvenance", () => {
     );
 
     expect(result.summary).toMatchObject({
-      recordedArtifactRefs: 0,
-      provenanceRecords: 0,
+      recordedArtifactRefs: 1,
+      provenanceRecords: 1,
     });
-    expect(result.artifacts).toEqual([]);
+    expect(result.artifacts[0]).toMatchObject({
+      clawId: "starter",
+      entryId: "sec-filings",
+      artifactKey: "skills:clawhub:sec-filings@1.0.0",
+      installSurface: "skills",
+      provenanceRecord: "skill.clawhubOrigin",
+    });
   });
 
   it("persists only package-like artifact refs and leaves workspace entries preview-only", () => {

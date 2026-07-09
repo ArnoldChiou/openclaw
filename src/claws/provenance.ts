@@ -561,7 +561,8 @@ export function persistClawArtifactApplyProvenance(
       entry.blocked ||
       entry.phase !== "artifact" ||
       entry.action !== "installArtifact" ||
-      entry.artifact?.installSurface !== "plugins"
+      (entry.artifact?.installSurface !== "plugins" &&
+        entry.artifact?.installSurface !== "skills")
     ) {
       return false;
     }

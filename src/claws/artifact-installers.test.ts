@@ -117,9 +117,9 @@ describe("applyClawArtifactInstallers", () => {
     readConfigFileSnapshotMock.mockRejectedValue(new Error("no config"));
   });
 
-  it("rejects non-plugin artifact surfaces until installers exist", async () => {
+  it("rejects required artifact surfaces until installers exist", async () => {
     const applyPlan = planWithEntries([
-      { kind: "skill", id: "sec-filings", selector: "clawhub:sec-filings@1.0.0" },
+      { kind: "mcpServer", id: "market-data", selector: "clawhub:market-data@1.0.0" },
     ]);
 
     await expect(
@@ -135,7 +135,7 @@ describe("applyClawArtifactInstallers", () => {
         {
           code: "artifact_install_surface_unsupported",
           path: "$.entries[0]",
-          message: expect.stringContaining("install surface skills"),
+          message: expect.stringContaining("install surface mcpServers"),
         },
       ],
     });
@@ -144,9 +144,9 @@ describe("applyClawArtifactInstallers", () => {
   it("skips optional non-plugin artifact surfaces while applying plugins", async () => {
     const applyPlan = planWithEntries([
       {
-        kind: "skill",
-        id: "optional-sec-filings",
-        selector: "clawhub:sec-filings@1.0.0",
+        kind: "connector",
+        id: "optional-market-data",
+        selector: "clawhub:market-data@1.0.0",
         required: false,
       },
       { kind: "plugin", id: "example-plugin", selector: "npm:@openclaw/plugin-example@1.0.0" },
@@ -164,6 +164,323 @@ describe("applyClawArtifactInstallers", () => {
 
     expect(runPluginInstallCommand).toHaveBeenCalledOnce();
     expect([...result.createdArtifactKeys]).toEqual(["plugins:npm:@openclaw/plugin-example@1.0.0"]);
+  });
+
+  it("delegates missing ClawHub skills to the existing skill installer", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "sec-filings", selector: "clawhub:sec-filings@1.0.0" },
+    ]);
+    const installSkillFromClawHub = vi.fn(async () => ({
+      ok: true as const,
+      slug: "sec-filings",
+      version: "1.0.0",
+      targetDir: "/workspace/.agents/skills/sec-filings",
+    }));
+
+    const result = await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        installSkillFromClawHub,
+        readClawHubSkillsLockfileStatusSync: vi.fn(() => ({ kind: "missing" as const })),
+        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+      },
+    });
+
+    expect(installSkillFromClawHub).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceDir: "/workspace",
+        slug: "sec-filings",
+        version: "1.0.0",
+        acknowledgeClawHubRisk: true,
+      }),
+    );
+    expect([...result.createdArtifactKeys]).toEqual(["skills:clawhub:sec-filings@1.0.0"]);
+  });
+
+  it("skips owner-qualified ClawHub skills tracked under their normalized slug", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "sec-filings", selector: "clawhub:@owner/sec-filings@1.0.0" },
+    ]);
+    const installSkillFromClawHub = vi.fn();
+
+    const result = await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        installSkillFromClawHub,
+        readClawHubSkillsLockfileStatusSync: vi.fn(() => ({
+          kind: "found" as const,
+          path: "/workspace/.clawhub/lock.json",
+          lock: {
+            version: 1 as const,
+            skills: {
+              "sec-filings": { version: "1.0.0", installedAt: 1, ownerHandle: "owner" },
+            },
+          },
+        })),
+        resolveClawHubSkillStatusLinkSync: vi.fn(() => ({
+          status: "linked" as const,
+          valid: true as const,
+          registry: "https://clawhub.openclaw.ai",
+          slug: "sec-filings",
+          ownerHandle: "owner",
+          installedVersion: "1.0.0",
+          installedAt: 1,
+          originPath: "/workspace/.agents/skills/sec-filings/.clawhub/origin.json",
+          lockPath: "/workspace/.clawhub/lock.json",
+        })),
+        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+      },
+    });
+
+    expect(installSkillFromClawHub).not.toHaveBeenCalled();
+    expect([...result.createdArtifactKeys]).toEqual([]);
+  });
+
+  it("skips ClawHub skill installs already tracked in the workspace lockfile", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "sec-filings", selector: "clawhub:sec-filings@1.0.0" },
+    ]);
+    const installSkillFromClawHub = vi.fn();
+
+    const result = await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        installSkillFromClawHub,
+        readClawHubSkillsLockfileStatusSync: vi.fn(() => ({
+          kind: "found" as const,
+          path: "/workspace/.clawhub/lock.json",
+          lock: {
+            version: 1 as const,
+            skills: { "sec-filings": { version: "1.0.0", installedAt: 1 } },
+          },
+        })),
+        resolveClawHubSkillStatusLinkSync: vi.fn(() => ({
+          status: "linked" as const,
+          valid: true as const,
+          registry: "https://clawhub.openclaw.ai",
+          slug: "sec-filings",
+          installedVersion: "1.0.0",
+          installedAt: 1,
+          originPath: "/workspace/.agents/skills/sec-filings/.clawhub/origin.json",
+          lockPath: "/workspace/.clawhub/lock.json",
+        })),
+        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+      },
+    });
+
+    expect(installSkillFromClawHub).not.toHaveBeenCalled();
+    expect([...result.createdArtifactKeys]).toEqual([]);
+  });
+
+  it("does not skip ClawHub skills with stale lockfile-only state", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "sec-filings", selector: "clawhub:sec-filings@1.0.0" },
+    ]);
+    const installSkillFromClawHub = vi.fn(async () => ({
+      ok: true as const,
+      slug: "sec-filings",
+      version: "1.0.0",
+      targetDir: "/workspace/.agents/skills/sec-filings",
+    }));
+
+    await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        installSkillFromClawHub,
+        readClawHubSkillsLockfileStatusSync: vi.fn(() => ({
+          kind: "found" as const,
+          path: "/workspace/.clawhub/lock.json",
+          lock: {
+            version: 1 as const,
+            skills: { "sec-filings": { version: "1.0.0", installedAt: 1 } },
+          },
+        })),
+        resolveClawHubSkillStatusLinkSync: vi.fn(() => ({
+          status: "invalid" as const,
+          valid: false as const,
+          reason: "missing local ClawHub origin metadata",
+        })),
+        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+      },
+    });
+
+    expect(installSkillFromClawHub).toHaveBeenCalledOnce();
+  });
+
+  it("delegates local skill artifacts to source installs relative to the manifest", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "sec-filings", selector: "./skills/sec-filings" },
+    ]);
+    applyPlan.claw.sourcePath = "/repo/claws/starter.claw.json";
+    const installSkillFromSource = vi.fn(async () => ({
+      ok: true as const,
+      slug: "sec-filings",
+      targetDir: "/workspace/.agents/skills/sec-filings",
+      source: "path" as const,
+    }));
+
+    const result = await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        installSkillFromSource,
+        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+      },
+    });
+
+    expect(installSkillFromSource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceDir: "/workspace",
+        spec: "/repo/claws/skills/sec-filings",
+        slug: "sec-filings",
+      }),
+    );
+    expect([...result.createdArtifactKeys]).toEqual(["skills:path:/repo/claws/skills/sec-filings"]);
+  });
+
+  it("skips local skill artifacts when source-origin metadata matches", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "sec-filings", selector: "./skills/sec-filings" },
+    ]);
+    applyPlan.claw.sourcePath = "/repo/claws/starter.claw.json";
+    const installSkillFromSource = vi.fn();
+
+    await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        installSkillFromSource,
+        readSkillSourceOrigin: vi.fn(async () => ({
+          version: 1 as const,
+          source: "path" as const,
+          slug: "sec-filings",
+          spec: "/repo/claws/skills/sec-filings",
+        })),
+        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+      },
+    });
+
+    expect(installSkillFromSource).not.toHaveBeenCalled();
+  });
+
+  it("does not skip local skill artifacts without matching source-origin metadata", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "sec-filings", selector: "./skills/sec-filings" },
+    ]);
+    applyPlan.claw.sourcePath = "/repo/claws/starter.claw.json";
+    const installSkillFromSource = vi.fn(async () => ({
+      ok: true as const,
+      slug: "sec-filings",
+      targetDir: "/workspace/.agents/skills/sec-filings",
+      source: "path" as const,
+    }));
+
+    await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        installSkillFromSource,
+        readSkillSourceOrigin: vi.fn(async () => undefined),
+        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+      },
+    });
+
+    expect(installSkillFromSource).toHaveBeenCalledOnce();
+  });
+
+  it("skips optional skill selectors without an existing skill install path", async () => {
+    const applyPlan = planWithEntries([
+      {
+        kind: "skill",
+        id: "optional-sec-filings",
+        selector: "npm:@openclaw/skill-sec-filings@1.0.0",
+        required: false,
+      },
+    ]);
+    const result = await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+      },
+    });
+
+    expect([...result.createdArtifactKeys]).toEqual([]);
+  });
+
+  it("rejects non-owner-qualified ClawHub skill paths with diagnostics", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "bad-skill", selector: "clawhub:owner/sec@1.0.0" },
+    ]);
+
+    await expect(
+      applyClawArtifactInstallers(applyPlan, {
+        runtime: runtime() as never,
+        deps: {
+          loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+          readClawHubSkillsLockfileStatusSync: vi.fn(() => ({ kind: "missing" as const })),
+          resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+        },
+      }),
+    ).rejects.toMatchObject({
+      diagnostics: [
+        {
+          code: "skill_artifact_selector_invalid",
+          message: expect.stringContaining("clawhub:owner/sec@1.0.0"),
+        },
+      ],
+    });
+  });
+
+  it("rejects invalid ClawHub skill selectors with diagnostics", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "bad-skill", selector: "clawhub:@bad" },
+    ]);
+
+    await expect(
+      applyClawArtifactInstallers(applyPlan, {
+        runtime: runtime() as never,
+        deps: {
+          loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+          readClawHubSkillsLockfileStatusSync: vi.fn(() => ({ kind: "missing" as const })),
+          resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+        },
+      }),
+    ).rejects.toMatchObject({
+      diagnostics: [
+        {
+          code: "skill_artifact_selector_invalid",
+          message: expect.stringContaining("clawhub:@bad"),
+        },
+      ],
+    });
+  });
+
+  it("rejects skill selectors without an existing skill install path", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "skill", id: "sec-filings", selector: "npm:@openclaw/skill-sec-filings@1.0.0" },
+    ]);
+
+    await expect(
+      applyClawArtifactInstallers(applyPlan, {
+        runtime: runtime() as never,
+        deps: {
+          loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+          resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+        },
+      }),
+    ).rejects.toMatchObject({
+      diagnostics: [
+        {
+          code: "skill_artifact_source_unsupported",
+          message: expect.stringContaining("npm:@openclaw/skill-sec-filings@1.0.0"),
+        },
+      ],
+    });
   });
 
   it("skips installer when the plugin already exists", async () => {

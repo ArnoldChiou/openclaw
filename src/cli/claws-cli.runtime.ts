@@ -340,7 +340,7 @@ export async function runClawsApplyCommand(
   persistClawArtifactApplyProvenance(plan, {
     sourcePath,
     createdArtifactKeys: artifactInstall.createdArtifactKeys,
-    artifactKeys: artifactInstall.createdArtifactKeys,
+    artifactKeys: artifactInstall.installedArtifactKeys,
   });
   let workspaceFiles: PersistedClawWorkspaceFileRef[];
   try {
@@ -358,6 +358,7 @@ export async function runClawsApplyCommand(
     persistClawArtifactApplyProvenance(plan, {
       sourcePath,
       createdArtifactKeys: artifactInstall.createdArtifactKeys,
+      artifactKeys: artifactInstall.installedArtifactKeys,
     }),
     workspaceFiles,
   );
@@ -485,7 +486,7 @@ export async function runClawsFeedApplyCommand(
       entry: result.entry,
     },
     createdArtifactKeys: artifactInstall.createdArtifactKeys,
-    artifactKeys: artifactInstall.createdArtifactKeys,
+    artifactKeys: artifactInstall.installedArtifactKeys,
   });
   let workspaceFiles: PersistedClawWorkspaceFileRef[];
   try {
@@ -509,6 +510,7 @@ export async function runClawsFeedApplyCommand(
         entry: result.entry,
       },
       createdArtifactKeys: artifactInstall.createdArtifactKeys,
+      artifactKeys: artifactInstall.installedArtifactKeys,
     }),
     workspaceFiles,
   );
