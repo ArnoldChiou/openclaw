@@ -416,7 +416,7 @@ async function preflightWorkspaceFiles(
   return results;
 }
 
-async function removeWorkspaceFiles(
+export async function removeWorkspaceFiles(
   refs: PersistedClawWorkspaceFileRef[],
   dryRun: boolean,
 ): Promise<RemovedWorkspaceFile[]> {

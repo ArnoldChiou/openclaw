@@ -61,7 +61,7 @@ function emptyPlan(params: {
   };
 }
 
-async function canonicalWorkspaceRoot(workspaceRoot?: string): Promise<string | undefined> {
+export async function canonicalWorkspaceRoot(workspaceRoot?: string): Promise<string | undefined> {
   if (!workspaceRoot) {
     return undefined;
   }

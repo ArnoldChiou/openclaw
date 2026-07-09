@@ -593,6 +593,7 @@ export function persistClawArtifactApplyProvenance(
     nowMs?: number;
     createdArtifactKeys?: ReadonlySet<string>;
     artifactKeys?: ReadonlySet<string>;
+    deleteStaleRefs?: boolean;
   } = {},
 ): ClawApplyProvenanceResult {
   const blockedEntries = plan.entries.filter((entry) => entry.blocked);
@@ -670,7 +671,7 @@ export function persistClawArtifactApplyProvenance(
     const previousArtifactRows = readExistingClawArtifactRows(db, plan.claw.id);
     const affectedArtifactKeys = new Set(previousArtifactRows.map((row) => row.artifact_key));
     const currentEntryIds = artifactEntries.map((entry) => entry.id);
-    if (!options.artifactKeys) {
+    if (!options.artifactKeys || options.deleteStaleRefs) {
       deleteStaleClawArtifactRefs(db, plan.claw.id, currentEntryIds);
     }
 

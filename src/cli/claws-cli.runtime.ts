@@ -6,7 +6,12 @@ import {
 } from "../claws/artifact-installers.js";
 import { exportClawManifest } from "../claws/export.js";
 import { readClawFeedFile, readClawManifestFromFeed } from "../claws/feed.js";
-import { readClawStatus, removeClawState } from "../claws/lifecycle-state.js";
+import {
+  readClawStatus,
+  removeClawState,
+  removeWorkspaceFiles,
+  type RemovedWorkspaceFile,
+} from "../claws/lifecycle-state.js";
 import { buildClawApplyPlan } from "../claws/lifecycle.js";
 import { buildClawPlan } from "../claws/plan.js";
 import { persistClawArtifactApplyProvenance } from "../claws/provenance.js";
@@ -16,7 +21,7 @@ import type {
   ClawUpdatePlan,
   PersistedClawWorkspaceFileRef,
 } from "../claws/types.js";
-import { buildClawUpdatePlan } from "../claws/update-plan.js";
+import { buildClawUpdatePlan, canonicalWorkspaceRoot } from "../claws/update-plan.js";
 import { applyClawWorkspaceFiles, ClawWorkspaceApplyError } from "../claws/workspace.js";
 import { defaultRuntime, writeRuntimeJson, type RuntimeEnv } from "../runtime.js";
 import type {
@@ -31,6 +36,17 @@ import type {
 } from "./claws-cli.js";
 
 type DiagnosticLike = { level: string; code: string; path: string; message: string };
+type ClawApplyProvenanceResult = ReturnType<typeof persistClawArtifactApplyProvenance>;
+
+type ClawUpdateApplyResult = Omit<ClawApplyProvenanceResult, "schemaVersion" | "summary"> & {
+  schemaVersion: "openclaw.clawUpdateResult.v1";
+  updatePlan: ClawUpdatePlan;
+  removedWorkspaceFiles: RemovedWorkspaceFile[];
+  summary: ClawApplyProvenanceResult["summary"] & {
+    removedWorkspaceFiles: number;
+    retainedWorkspaceFiles: number;
+  };
+};
 
 function formatDiagnostics(diagnostics: DiagnosticLike[]): string {
   return diagnostics
@@ -155,19 +171,113 @@ function logClawUpdatePlanSummary(plan: ClawUpdatePlan, runtime: RuntimeEnv): vo
     runtime.log(`Blocked: ${plan.summary.blocked}`);
   }
 }
+function logClawUpdateApplySummary(result: ClawUpdateApplyResult, runtime: RuntimeEnv): void {
+  runtime.log("Dry-run: false");
+  runtime.log("Mutation allowed: true");
+  runtime.log(`Claw: ${result.claw.id}`);
+  runtime.log(`Added: ${result.updatePlan.summary.added}`);
+  runtime.log(`Changed: ${result.updatePlan.summary.changed}`);
+  runtime.log(`Removed: ${result.updatePlan.summary.removed}`);
+  runtime.log(`Unchanged: ${result.updatePlan.summary.unchanged}`);
+  runtime.log(`Recorded artifact refs: ${result.summary.recordedArtifactRefs}`);
+  runtime.log(`Applied workspace files: ${result.summary.appliedWorkspaceFiles}`);
+  runtime.log(
+    `Removed workspace files: ${result.removedWorkspaceFiles.filter((file) => file.action === "deleted").length}`,
+  );
+  runtime.log(
+    `Retained workspace files: ${result.removedWorkspaceFiles.filter((file) => file.action === "retainedModified").length}`,
+  );
+}
+
+function failBlockedUpdate(
+  plan: ClawUpdatePlan,
+  opts: { json?: boolean },
+  runtime: RuntimeEnv,
+): boolean {
+  if (plan.summary.blocked === 0 && plan.summary.manual === 0 && !hasErrorDiagnostics(plan)) {
+    return false;
+  }
+  const message = hasErrorDiagnostics(plan)
+    ? "Claw update target has validation diagnostics and cannot be applied."
+    : plan.summary.manual > 0
+      ? "Claw update requires manual action before it can be applied safely."
+      : "Claw update is blocked by required unsupported or unsafe entries.";
+  if (opts.json) {
+    writeRuntimeJson(runtime, {
+      ...plan,
+      error: {
+        code: hasErrorDiagnostics(plan)
+          ? "update_invalid_target"
+          : plan.summary.manual > 0
+            ? "update_manual_required"
+            : "update_blocked",
+        message,
+      },
+    });
+  } else {
+    runtime.error(message);
+    logClawUpdatePlanSummary(plan, runtime);
+  }
+  runtime.exit(1);
+  return true;
+}
+
+function failWorkspaceRequiredForUpdate(
+  plan: ClawUpdatePlan,
+  opts: { workspace?: string; json?: boolean },
+  runtime: RuntimeEnv,
+): boolean {
+  if (opts.workspace || !plan.entries.some((entry) => entry.phase === "workspace")) {
+    return false;
+  }
+  const message =
+    "Claw update apply requires --workspace when the reconcile plan includes workspace or persona files.";
+  if (opts.json) {
+    writeRuntimeJson(runtime, { ...plan, error: { code: "workspace_required", message } });
+  } else {
+    runtime.error(message);
+  }
+  runtime.exit(1);
+  return true;
+}
+
+async function removeStaleWorkspaceFilesForUpdate(
+  clawId: string,
+  targetPlan: ClawApplyPlan,
+  workspaceRoot: string,
+  workspaceFiles: PersistedClawWorkspaceFileRef[],
+): Promise<RemovedWorkspaceFile[]> {
+  const currentTargets = new Map(
+    targetPlan.entries
+      .filter(
+        (entry) =>
+          !entry.blocked && entry.phase === "workspace" && typeof entry.target === "string",
+      )
+      .map((entry) => [entry.id, resolve(workspaceRoot, entry.target as string)] as const),
+  );
+  return removeWorkspaceFiles(
+    workspaceFiles.filter((ref) => {
+      if (ref.clawId !== clawId) {
+        return false;
+      }
+      const currentTargetPath = currentTargets.get(ref.entryId);
+      return !currentTargetPath || currentTargetPath !== ref.targetPath;
+    }),
+    false,
+  );
+}
 
 function failUnsafeUpdate(
   opts: { dryRun?: boolean; json?: boolean; yes?: boolean },
   runtime: RuntimeEnv,
 ): boolean {
-  if (opts.dryRun) {
+  if (opts.dryRun || opts.yes) {
     return false;
   }
-  const message = opts.yes
-    ? "Claw update apply is not implemented in this OpenClaw build; pass --dry-run to preview the reconcile plan."
-    : "Claw update is read-only in this OpenClaw build; pass --dry-run to preview the reconcile plan.";
+  const message =
+    "Claw update can mutate package-like artifact provenance and Claw-managed workspace files; pass --dry-run to preview or --yes to apply the reconcile plan.";
   if (opts.json) {
-    writeRuntimeJson(runtime, { ok: false, error: { code: "update_apply_unsupported", message } });
+    writeRuntimeJson(runtime, { ok: false, error: { code: "confirmation_required", message } });
   } else {
     runtime.error(message);
   }
@@ -668,24 +778,10 @@ export async function runClawsUpdateCommand(
     targetSourcePath,
     workspaceRoot: opts.workspace,
   });
-  if (!plan.found || plan.summary.blocked > 0 || hasErrorDiagnostics(plan)) {
-    const message = !plan.found
-      ? `No persisted Claw state found for ${JSON.stringify(clawId)}.`
-      : hasErrorDiagnostics(plan)
-        ? "Claw update target has validation diagnostics and cannot produce a valid reconcile plan."
-        : "Claw update is blocked by required unsupported or unsafe entries.";
+  if (!plan.found) {
+    const message = `No persisted Claw state found for ${JSON.stringify(clawId)}.`;
     if (opts.json) {
-      writeRuntimeJson(runtime, {
-        ...plan,
-        error: {
-          code: !plan.found
-            ? "claw_not_found"
-            : hasErrorDiagnostics(plan)
-              ? "update_invalid_target"
-              : "update_blocked",
-          message,
-        },
-      });
+      writeRuntimeJson(runtime, { ...plan, error: { code: "claw_not_found", message } });
     } else {
       runtime.error(message);
       logClawUpdatePlanSummary(plan, runtime);
@@ -693,11 +789,117 @@ export async function runClawsUpdateCommand(
     runtime.exit(1);
     return;
   }
-  if (opts.json) {
-    writeRuntimeJson(runtime, plan);
+  if (opts.dryRun) {
+    if (opts.json) {
+      writeRuntimeJson(runtime, plan);
+      return;
+    }
+    logClawUpdatePlanSummary(plan, runtime);
     return;
   }
-  logClawUpdatePlanSummary(plan, runtime);
+  if (failBlockedUpdate(plan, opts, runtime)) {
+    return;
+  }
+  if (failWorkspaceRequiredForUpdate(plan, opts, runtime)) {
+    return;
+  }
+
+  try {
+    await applyClawWorkspaceFiles(targetPlan, {
+      sourcePath: targetSourcePath,
+      workspaceRoot: opts.workspace,
+      validateOnly: true,
+    });
+  } catch (error) {
+    if (failWorkspaceApply(error, opts, runtime)) {
+      return;
+    }
+    throw error;
+  }
+
+  const artifactInstall = await applyArtifacts(targetPlan, targetSourcePath, opts, runtime);
+  if (!artifactInstall) {
+    return;
+  }
+  let workspaceFiles: PersistedClawWorkspaceFileRef[] = [];
+  let removedWorkspaceFiles: RemovedWorkspaceFile[] = [];
+  try {
+    const scopedWorkspaceRoot = opts.workspace
+      ? ((await canonicalWorkspaceRoot(opts.workspace)) ?? resolve(opts.workspace))
+      : undefined;
+    const currentRecord = readClawStatus(clawId).records.find((record) => record.clawId === clawId);
+    const currentWorkspaceFiles = scopedWorkspaceRoot
+      ? (currentRecord?.workspaceFiles ?? []).filter(
+          (ref) => ref.workspaceRoot === scopedWorkspaceRoot,
+        )
+      : [];
+    if (!scopedWorkspaceRoot && currentWorkspaceFiles.length > 0) {
+      throw new ClawWorkspaceApplyError([
+        {
+          level: "error",
+          code: "workspace_required",
+          path: "$.workspace",
+          message: "Claw update apply requires a workspace root to reconcile stale workspace refs.",
+        },
+      ]);
+    }
+    removedWorkspaceFiles = scopedWorkspaceRoot
+      ? await removeStaleWorkspaceFilesForUpdate(
+          clawId,
+          targetPlan,
+          scopedWorkspaceRoot,
+          currentWorkspaceFiles,
+        )
+      : [];
+    const removalErrors = removedWorkspaceFiles.filter((file) => file.action === "error");
+    if (removalErrors.length > 0) {
+      throw new ClawWorkspaceApplyError(
+        removalErrors.map((file, index) => ({
+          level: "error",
+          code: "workspace_file_remove_failed",
+          path: `$.removedWorkspaceFiles[${index}]`,
+          message: file.message ?? `Could not remove ${file.targetPath}.`,
+        })),
+      );
+    }
+    workspaceFiles = await applyClawWorkspaceFiles(targetPlan, {
+      sourcePath: targetSourcePath,
+      workspaceRoot: opts.workspace,
+    });
+  } catch (error) {
+    if (failWorkspaceApply(error, opts, runtime)) {
+      return;
+    }
+    throw error;
+  }
+  const applied = combineApplyResult(
+    persistClawArtifactApplyProvenance(targetPlan, {
+      sourcePath: targetSourcePath,
+      createdArtifactKeys: artifactInstall.createdArtifactKeys,
+      artifactKeys: artifactInstall.installedArtifactKeys,
+      deleteStaleRefs: true,
+    }),
+    workspaceFiles,
+  );
+  const resultPayload: ClawUpdateApplyResult = {
+    ...applied,
+    schemaVersion: "openclaw.clawUpdateResult.v1",
+    updatePlan: plan,
+    removedWorkspaceFiles,
+    summary: {
+      ...applied.summary,
+      removedWorkspaceFiles: removedWorkspaceFiles.filter((file) => file.action === "deleted")
+        .length,
+      retainedWorkspaceFiles: removedWorkspaceFiles.filter(
+        (file) => file.action === "retainedModified",
+      ).length,
+    },
+  };
+  if (opts.json) {
+    writeRuntimeJson(runtime, resultPayload);
+    return;
+  }
+  logClawUpdateApplySummary(resultPayload, runtime);
 }
 
 export async function runClawsExportCommand(

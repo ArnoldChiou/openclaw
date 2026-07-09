@@ -1,7 +1,7 @@
 // Tests for the Claws CLI inspection and dry-run apply commands.
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
@@ -1106,6 +1106,430 @@ describe("claws cli", () => {
           },
         ],
       });
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("applies a Claw update with artifact, workspace, and stale-ref reconciliation", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "example-plugin",
+            selector: "npm:@openclaw/plugin-example@1.0.0",
+          },
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+          {
+            kind: "workspaceFile",
+            id: "old-runbook",
+            path: "runbooks/old.md",
+            source: "files/old.md",
+          },
+        ],
+      });
+      await writeFile(join(dirname(manifestPath), "files", "old.md"), "old runbook\n", "utf8");
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-workspace-"));
+      await runCli(["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot]);
+
+      const targetPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "2.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "example-plugin",
+            selector: "npm:@openclaw/plugin-example@2.0.0",
+          },
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      await writeFile(join(dirname(targetPath), "files", "SOUL.md"), "updated soul\n", "utf8");
+      artifactInstallerMock.applyClawArtifactInstallers.mockResolvedValueOnce({
+        directArtifactKeys: new Set<string>(),
+        createdArtifactKeys: new Set<string>(["plugins:npm:@openclaw/plugin-example@2.0.0"]),
+        installedArtifactKeys: new Set<string>(["plugins:npm:@openclaw/plugin-example@2.0.0"]),
+      });
+      mocks.runtime.writeJson.mockClear();
+
+      await runCli([
+        "claws",
+        "update",
+        "starter",
+        "--from",
+        targetPath,
+        "--yes",
+        "--workspace",
+        workspaceRoot,
+        "--json",
+      ]);
+
+      expect(mocks.runtime.writeJson).toHaveBeenCalledOnce();
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        schemaVersion: "openclaw.clawUpdateResult.v1",
+        claw: { id: "starter", version: "2.0.0" },
+        updatePlan: {
+          summary: { changed: 2, removed: 1, manual: 0, blocked: 0 },
+        },
+        summary: {
+          recordedArtifactRefs: 1,
+          appliedWorkspaceFiles: 1,
+          removedWorkspaceFiles: 1,
+          retainedWorkspaceFiles: 0,
+        },
+        removedWorkspaceFiles: [{ entryId: "old-runbook", action: "deleted" }],
+      });
+      await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toBe(
+        "updated soul\n",
+      );
+      await expect(
+        readFile(join(workspaceRoot, "runbooks", "old.md"), "utf8"),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(
+        readClawArtifactRefsForArtifactKey("plugins:npm:@openclaw/plugin-example@1.0.0"),
+      ).toEqual([]);
+      expect(
+        readClawArtifactRefsForArtifactKey("plugins:npm:@openclaw/plugin-example@2.0.0"),
+      ).toMatchObject([{ clawId: "starter", entryId: "example-plugin" }]);
+
+      mocks.runtime.writeJson.mockClear();
+      await runCli(["claws", "status", "starter", "--json"]);
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        summary: { claws: 1, artifactRefs: 1, workspaceFileRefs: 1 },
+        records: [
+          {
+            clawId: "starter",
+            clawVersion: "2.0.0",
+            artifacts: [{ entryId: "example-plugin" }],
+            workspaceFiles: [{ entryId: "soul" }],
+          },
+        ],
+      });
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("removes the old managed path when a Claw update moves a workspace entry", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-workspace-"));
+      await runCli(["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot]);
+
+      const targetPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "2.0.0",
+        entries: [
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "docs/SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      await writeFile(join(dirname(targetPath), "files", "SOUL.md"), "moved soul\n", "utf8");
+      mocks.runtime.writeJson.mockClear();
+
+      await runCli([
+        "claws",
+        "update",
+        "starter",
+        "--from",
+        targetPath,
+        "--yes",
+        "--workspace",
+        workspaceRoot,
+        "--json",
+      ]);
+
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        schemaVersion: "openclaw.clawUpdateResult.v1",
+        updatePlan: { summary: { changed: 1, removed: 0 } },
+        removedWorkspaceFiles: [{ entryId: "soul", action: "deleted" }],
+      });
+      await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(readFile(join(workspaceRoot, "docs", "SOUL.md"), "utf8")).resolves.toBe(
+        "moved soul\n",
+      );
+      mocks.runtime.writeJson.mockClear();
+      await runCli(["claws", "status", "starter", "--json"]);
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        records: [
+          {
+            workspaceFiles: [
+              { entryId: "soul", targetPath: join(workspaceRoot, "docs", "SOUL.md") },
+            ],
+          },
+        ],
+      });
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("does not advance Claw provenance when update workspace reconciliation fails", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "example-plugin",
+            selector: "npm:@openclaw/plugin-example@1.0.0",
+          },
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-workspace-"));
+      await runCli(["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot]);
+
+      const targetPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "2.0.0",
+        entries: [
+          {
+            kind: "plugin",
+            id: "example-plugin",
+            selector: "npm:@openclaw/plugin-example@2.0.0",
+          },
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      await writeFile(join(dirname(targetPath), "files", "SOUL.md"), "updated soul\n", "utf8");
+      artifactInstallerMock.applyClawArtifactInstallers.mockImplementationOnce(async () => {
+        await writeFile(join(workspaceRoot, "SOUL.md"), "raced user content\n", "utf8");
+        return {
+          directArtifactKeys: new Set<string>(),
+          createdArtifactKeys: new Set<string>(["plugins:npm:@openclaw/plugin-example@2.0.0"]),
+          installedArtifactKeys: new Set<string>(["plugins:npm:@openclaw/plugin-example@2.0.0"]),
+        };
+      });
+      mocks.runtime.writeJson.mockClear();
+
+      await runCli([
+        "claws",
+        "update",
+        "starter",
+        "--from",
+        targetPath,
+        "--yes",
+        "--workspace",
+        workspaceRoot,
+        "--json",
+      ]);
+
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        error: { code: "workspace_apply_failed" },
+      });
+      expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+      expect(
+        readClawArtifactRefsForArtifactKey("plugins:npm:@openclaw/plugin-example@1.0.0"),
+      ).toMatchObject([{ clawId: "starter", entryId: "example-plugin" }]);
+      expect(
+        readClawArtifactRefsForArtifactKey("plugins:npm:@openclaw/plugin-example@2.0.0"),
+      ).toEqual([]);
+      mocks.runtime.writeJson.mockClear();
+      await runCli(["claws", "status", "starter", "--json"]);
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        records: [{ clawId: "starter", clawVersion: "1.0.0" }],
+      });
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("requires an explicit workspace for mutating Claw updates with workspace entries", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-workspace-"));
+      await runCli(["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot]);
+      const targetPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "2.0.0",
+        entries: [
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      mocks.runtime.writeJson.mockClear();
+
+      await runCli(["claws", "update", "starter", "--from", targetPath, "--yes", "--json"]);
+
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        error: { code: "workspace_required" },
+      });
+      expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+    } finally {
+      closeOpenClawStateDatabaseForTest();
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
+  });
+
+  it("blocks mutating Claw updates when workspace files have local edits", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-"));
+    closeOpenClawStateDatabaseForTest();
+    try {
+      const manifestPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "1.0.0",
+        entries: [
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-cli-update-workspace-"));
+      await runCli(["claws", "apply", manifestPath, "--yes", "--workspace", workspaceRoot]);
+      await writeFile(join(workspaceRoot, "SOUL.md"), "user edit\n", "utf8");
+      const targetPath = await writeManifest({
+        schemaVersion: "openclaw.claw.v1",
+        id: "starter",
+        name: "Starter",
+        version: "2.0.0",
+        entries: [
+          {
+            kind: "workspaceFile",
+            id: "soul",
+            path: "SOUL.md",
+            source: "files/SOUL.md",
+          },
+        ],
+      });
+      await writeFile(join(dirname(targetPath), "files", "SOUL.md"), "updated soul\n", "utf8");
+      mocks.runtime.writeJson.mockClear();
+
+      await runCli([
+        "claws",
+        "update",
+        "starter",
+        "--from",
+        targetPath,
+        "--yes",
+        "--workspace",
+        workspaceRoot,
+        "--json",
+      ]);
+
+      expect(mocks.runtime.writeJson.mock.calls[0][0]).toMatchObject({
+        error: { code: "update_manual_required" },
+        summary: { manual: 1 },
+      });
+      expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+      expect(artifactInstallerMock.applyClawArtifactInstallers).toHaveBeenCalledTimes(1);
+      await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toBe("user edit\n");
     } finally {
       closeOpenClawStateDatabaseForTest();
       if (previousStateDir === undefined) {
