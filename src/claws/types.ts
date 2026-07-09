@@ -3,11 +3,13 @@
 export const CLAW_SCHEMA_VERSION = "openclaw.claw.v1" as const;
 export const CLAW_PLAN_SCHEMA_VERSION = "openclaw.clawPlan.v1" as const;
 export const CLAW_APPLY_PLAN_SCHEMA_VERSION = "openclaw.clawApplyPlan.v1" as const;
+export const CLAW_UPDATE_PLAN_SCHEMA_VERSION = "openclaw.clawUpdatePlan.v1" as const;
 export const CLAW_FEED_SCHEMA_VERSION = "openclaw.clawFeed.v1" as const;
 
 export type ClawSchemaVersion = typeof CLAW_SCHEMA_VERSION;
 export type ClawPlanSchemaVersion = typeof CLAW_PLAN_SCHEMA_VERSION;
 export type ClawApplyPlanSchemaVersion = typeof CLAW_APPLY_PLAN_SCHEMA_VERSION;
+export type ClawUpdatePlanSchemaVersion = typeof CLAW_UPDATE_PLAN_SCHEMA_VERSION;
 export type ClawFeedSchemaVersion = typeof CLAW_FEED_SCHEMA_VERSION;
 
 export type ClawDiagnosticLevel = "error" | "warning";
@@ -259,6 +261,72 @@ export type PersistedClawWorkspaceFileRef = {
   updatedAtMs: number;
 };
 
+export type ClawUpdatePlanEntryPhase = "artifact" | "workspace" | "unsupported" | "claw";
+
+export type ClawUpdatePlanEntryAction =
+  | "add"
+  | "change"
+  | "remove"
+  | "unchanged"
+  | "skipUnsupported"
+  | "manual"
+  | "blocked";
+
+export type ClawUpdatePlanEntry = {
+  id: string;
+  kind: ClawEntryKind | string;
+  required: boolean;
+  phase: ClawUpdatePlanEntryPhase;
+  action: ClawUpdatePlanEntryAction;
+  target?: string;
+  source?: string;
+  current?: {
+    artifactKey?: string;
+    selector?: string;
+    contentSha256?: string;
+    targetPath?: string;
+    version?: string;
+  };
+  desired?: {
+    artifactKey?: string;
+    selector?: string;
+    contentSha256?: string;
+    targetPath?: string;
+    version?: string;
+  };
+  local?: {
+    state: "missing" | "matchesCurrent" | "matchesDesired" | "modified" | "unknown";
+    contentSha256?: string;
+  };
+  blocked: boolean;
+  reason: string;
+};
+
+export type ClawUpdatePlan = {
+  schemaVersion: ClawUpdatePlanSchemaVersion;
+  dryRun: true;
+  mutationAllowed: false;
+  claw: {
+    id: string;
+    currentVersion?: string;
+    targetVersion?: string;
+    currentSourcePath?: string;
+    targetSourcePath?: string;
+  };
+  found: boolean;
+  summary: {
+    totalEntries: number;
+    added: number;
+    changed: number;
+    removed: number;
+    unchanged: number;
+    manual: number;
+    blocked: number;
+    skippedUnsupported: number;
+  };
+  entries: ClawUpdatePlanEntry[];
+  diagnostics: ClawDiagnostic[];
+};
 export type ClawApplyPlan = {
   schemaVersion: ClawApplyPlanSchemaVersion;
   dryRun: true;

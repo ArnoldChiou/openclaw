@@ -11,7 +11,12 @@ import { buildClawApplyPlan } from "../claws/lifecycle.js";
 import { buildClawPlan } from "../claws/plan.js";
 import { persistClawArtifactApplyProvenance } from "../claws/provenance.js";
 import { readClawManifestFile } from "../claws/reader.js";
-import type { ClawApplyPlan, PersistedClawWorkspaceFileRef } from "../claws/types.js";
+import type {
+  ClawApplyPlan,
+  ClawUpdatePlan,
+  PersistedClawWorkspaceFileRef,
+} from "../claws/types.js";
+import { buildClawUpdatePlan } from "../claws/update-plan.js";
 import { applyClawWorkspaceFiles, ClawWorkspaceApplyError } from "../claws/workspace.js";
 import { defaultRuntime, writeRuntimeJson, type RuntimeEnv } from "../runtime.js";
 import type {
@@ -22,6 +27,7 @@ import type {
   ClawsInspectOptions,
   ClawsRemoveOptions,
   ClawsStatusOptions,
+  ClawsUpdateOptions,
 } from "./claws-cli.js";
 
 type DiagnosticLike = { level: string; code: string; path: string; message: string };
@@ -129,6 +135,44 @@ function logClawRemoveResult(
   if (result.summary.errors > 0) {
     runtime.log(`Errors: ${result.summary.errors}`);
   }
+}
+
+function hasErrorDiagnostics(plan: ClawUpdatePlan): boolean {
+  return plan.diagnostics.some((diagnostic) => diagnostic.level === "error");
+}
+
+function logClawUpdatePlanSummary(plan: ClawUpdatePlan, runtime: RuntimeEnv): void {
+  runtime.log("Dry-run: true");
+  runtime.log("Mutation allowed: false");
+  runtime.log(`Claw: ${plan.claw.id}`);
+  runtime.log(`Found: ${plan.found ? "true" : "false"}`);
+  runtime.log(`Added: ${plan.summary.added}`);
+  runtime.log(`Changed: ${plan.summary.changed}`);
+  runtime.log(`Removed: ${plan.summary.removed}`);
+  runtime.log(`Unchanged: ${plan.summary.unchanged}`);
+  runtime.log(`Manual: ${plan.summary.manual}`);
+  if (plan.summary.blocked > 0) {
+    runtime.log(`Blocked: ${plan.summary.blocked}`);
+  }
+}
+
+function failUnsafeUpdate(
+  opts: { dryRun?: boolean; json?: boolean; yes?: boolean },
+  runtime: RuntimeEnv,
+): boolean {
+  if (opts.dryRun) {
+    return false;
+  }
+  const message = opts.yes
+    ? "Claw update apply is not implemented in this OpenClaw build; pass --dry-run to preview the reconcile plan."
+    : "Claw update is read-only in this OpenClaw build; pass --dry-run to preview the reconcile plan.";
+  if (opts.json) {
+    writeRuntimeJson(runtime, { ok: false, error: { code: "update_apply_unsupported", message } });
+  } else {
+    runtime.error(message);
+  }
+  runtime.exit(1);
+  return true;
 }
 
 function logClawExportSummary(
@@ -580,6 +624,80 @@ export async function runClawsRemoveCommand(
     return;
   }
   logClawRemoveResult(result, runtime);
+}
+
+export async function runClawsUpdateCommand(
+  clawId: string,
+  opts: ClawsUpdateOptions,
+  runtime: RuntimeEnv = defaultRuntime,
+): Promise<void> {
+  if (failUnsafeUpdate(opts, runtime)) {
+    return;
+  }
+  if (!opts.from) {
+    const message = "Claw update requires --from <manifest> in this OpenClaw build.";
+    if (opts.json) {
+      writeRuntimeJson(runtime, { ok: false, error: { code: "target_required", message } });
+    } else {
+      runtime.error(message);
+    }
+    runtime.exit(1);
+    return;
+  }
+  const result = await readClawManifestFile(opts.from);
+  if (!result.ok) {
+    if (opts.json) {
+      writeRuntimeJson(runtime, { valid: false, diagnostics: result.diagnostics });
+    } else {
+      runtime.error(formatDiagnostics(result.diagnostics));
+    }
+    runtime.exit(1);
+    return;
+  }
+  const targetSourcePath = resolve(opts.from);
+  const targetPlan = buildClawApplyPlan(
+    buildClawPlan({
+      manifest: result.manifest,
+      diagnostics: result.diagnostics,
+      sourcePath: targetSourcePath,
+    }),
+  );
+  const plan = await buildClawUpdatePlan({
+    clawId,
+    targetPlan,
+    targetSourcePath,
+    workspaceRoot: opts.workspace,
+  });
+  if (!plan.found || plan.summary.blocked > 0 || hasErrorDiagnostics(plan)) {
+    const message = !plan.found
+      ? `No persisted Claw state found for ${JSON.stringify(clawId)}.`
+      : hasErrorDiagnostics(plan)
+        ? "Claw update target has validation diagnostics and cannot produce a valid reconcile plan."
+        : "Claw update is blocked by required unsupported or unsafe entries.";
+    if (opts.json) {
+      writeRuntimeJson(runtime, {
+        ...plan,
+        error: {
+          code: !plan.found
+            ? "claw_not_found"
+            : hasErrorDiagnostics(plan)
+              ? "update_invalid_target"
+              : "update_blocked",
+          message,
+        },
+      });
+    } else {
+      runtime.error(message);
+      logClawUpdatePlanSummary(plan, runtime);
+    }
+    runtime.exit(1);
+    return;
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, plan);
+    return;
+  }
+  logClawUpdatePlanSummary(plan, runtime);
 }
 
 export async function runClawsExportCommand(
