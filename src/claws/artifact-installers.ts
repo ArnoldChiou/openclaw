@@ -8,6 +8,8 @@ import {
 } from "../agents/agent-scope.js";
 import { runPluginInstallCommand } from "../cli/plugins-install-command.js";
 import { getRuntimeConfig, readConfigFileSnapshot } from "../config/config.js";
+import { canonicalizeConfiguredMcpServer } from "../config/mcp-config-normalize.js";
+import { listConfiguredMcpServers, setConfiguredMcpServer } from "../config/mcp-config.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { resolveFileNpmSpecToLocalPath } from "../infra/plugin-install-specs.js";
 import { loadInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-records.js";
@@ -48,6 +50,8 @@ type ClawArtifactInstallerDeps = {
   installSkillFromSource?: typeof installSkillFromSource;
   readClawHubSkillsLockfileStatusSync?: typeof readClawHubSkillsLockfileStatusSync;
   readSkillSourceOrigin?: typeof readSkillSourceOrigin;
+  listConfiguredMcpServers?: typeof listConfiguredMcpServers;
+  setConfiguredMcpServer?: typeof setConfiguredMcpServer;
   resolveClawHubSkillStatusLinkSync?: typeof resolveClawHubSkillStatusLinkSync;
   resolveSkillsWorkspaceDir?: typeof resolveSkillsWorkspaceDir;
 };
@@ -120,12 +124,20 @@ function skillArtifactEntries(plan: ClawApplyPlan): ClawApplyPlanEntry[] {
   return artifactEntries(plan).filter((entry) => entry.artifact?.installSurface === "skills");
 }
 
+function mcpServerArtifactEntries(plan: ClawApplyPlan): ClawApplyPlanEntry[] {
+  return artifactEntries(plan).filter(
+    (entry) =>
+      entry.artifact?.installSurface === "mcpServers" && entry.artifact.source === "inline",
+  );
+}
+
 function unsupportedArtifactEntries(plan: ClawApplyPlan): ClawApplyPlanEntry[] {
   return artifactEntries(plan).filter(
     (entry) =>
       entry.required !== false &&
       entry.artifact?.installSurface !== "plugins" &&
-      entry.artifact?.installSurface !== "skills",
+      entry.artifact?.installSurface !== "skills" &&
+      !(entry.artifact?.installSurface === "mcpServers" && entry.artifact.source === "inline"),
   );
 }
 
@@ -368,6 +380,111 @@ function invalidClawHubSkillSelectorDiagnostic(entry: ClawApplyPlanEntry): ClawD
   };
 }
 
+function invalidMcpServerSelectorDiagnostic(entry: ClawApplyPlanEntry): ClawDiagnostic {
+  return {
+    level: "error",
+    code: "mcp_server_artifact_selector_invalid",
+    path: "$.entries",
+    message: `Claw MCP server artifact ${entry.id} must use an inline JSON object selector.`,
+  };
+}
+
+function parseInlineMcpServerConfig(
+  entry: ClawApplyPlanEntry,
+): Record<string, unknown> | undefined {
+  if (entry.artifact?.source !== "inline") {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(entry.artifact.selector) as unknown;
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .toSorted(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function applyMcpServerArtifact(
+  entry: ClawApplyPlanEntry,
+  deps: ClawArtifactInstallerDeps,
+): Promise<{ created: boolean }> {
+  const server = parseInlineMcpServerConfig(entry);
+  if (!server) {
+    throw new ClawArtifactApplyError([invalidMcpServerSelectorDiagnostic(entry)]);
+  }
+  const name = entry.id;
+  const listMcpServers = deps.listConfiguredMcpServers ?? listConfiguredMcpServers;
+  const setMcpServer = deps.setConfiguredMcpServer ?? setConfiguredMcpServer;
+  const before = await listMcpServers();
+  if (!before.ok) {
+    throw new ClawArtifactApplyError([
+      {
+        level: "error",
+        code: "mcp_server_config_read_failed",
+        path: "$.entries",
+        message: before.error,
+      },
+    ]);
+  }
+  const desired = canonicalizeConfiguredMcpServer(server);
+  const existing = before.mcpServers[name];
+  if (existing) {
+    if (stableJson(canonicalizeConfiguredMcpServer(existing)) === stableJson(desired)) {
+      return { created: false };
+    }
+    throw new ClawArtifactApplyError([
+      {
+        level: "error",
+        code: "mcp_server_config_conflict",
+        path: "$.entries",
+        message: `MCP server artifact ${name} conflicts with an existing OpenClaw-managed MCP server. Rename the Claw entry or remove the existing MCP server before applying.`,
+      },
+    ]);
+  }
+  const result = await setMcpServer({ name, server: desired });
+  if (!result.ok) {
+    throw new ClawArtifactApplyError([
+      {
+        level: "error",
+        code: "mcp_server_config_write_failed",
+        path: "$.entries",
+        message: result.error,
+      },
+    ]);
+  }
+  const after = await listMcpServers();
+  if (
+    !after.ok ||
+    stableJson(canonicalizeConfiguredMcpServer(after.mcpServers[name] ?? {})) !==
+      stableJson(desired)
+  ) {
+    throw new ClawArtifactApplyError([
+      {
+        level: "error",
+        code: "mcp_server_config_record_missing",
+        path: "$.entries",
+        message: `MCP server artifact ${name} was written but could not be verified in config.`,
+      },
+    ]);
+  }
+  return { created: !existing };
+}
+
 function createInstallerRuntime(
   runtime: RuntimeEnv,
   diagnostics: ClawDiagnostic[],
@@ -433,6 +550,7 @@ export async function applyClawArtifactInstallers(
   }
   const pluginEntries = pluginArtifactEntries(plan);
   const skillEntries = skillArtifactEntries(plan);
+  const mcpServerEntries = mcpServerArtifactEntries(plan);
   const sourcePath = options.sourcePath ?? plan.claw.sourcePath;
   let currentRecords = await loadRecords();
   let enabledPluginIds = await readEnabledPluginIds();
@@ -549,6 +667,19 @@ export async function applyClawArtifactInstallers(
       installedArtifactKeys.add(artifactKey);
       createdArtifactKeys.add(artifactKey);
       satisfiedArtifactKeys.add(artifactKey);
+    }
+  }
+
+  for (const entry of mcpServerEntries) {
+    const artifactKey = artifactKeyFor(entry, sourcePath);
+    if (satisfiedArtifactKeys.has(artifactKey)) {
+      continue;
+    }
+    const result = await applyMcpServerArtifact(entry, deps);
+    installedArtifactKeys.add(artifactKey);
+    satisfiedArtifactKeys.add(artifactKey);
+    if (result.created) {
+      createdArtifactKeys.add(artifactKey);
     }
   }
 

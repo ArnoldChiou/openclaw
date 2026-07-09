@@ -80,6 +80,60 @@ describe("persistClawArtifactApplyProvenance", () => {
     });
   });
 
+  it("persists MCP server artifact refs", () => {
+    const result = persistClawArtifactApplyProvenance(
+      applyPlan({
+        entries: [
+          {
+            kind: "mcpServer",
+            id: "docs",
+            selector: JSON.stringify({ command: "uvx", args: ["docs-mcp"] }),
+          },
+        ],
+      }),
+      { env: stateEnv(), nowMs: 1 },
+    );
+
+    expect(result.summary).toMatchObject({
+      recordedArtifactRefs: 1,
+      provenanceRecords: 1,
+    });
+    expect(result.artifacts[0]).toMatchObject({
+      clawId: "starter",
+      entryId: "docs",
+      artifactKey:
+        "mcpServers:inline:docs:inline:sha256:e66355547d6263e05f38367f38b1c2a0f98d20ea19fac5d08b101923f5fd91a6",
+      installSurface: "mcpServers",
+      source: "inline",
+      packageName: "docs",
+      provenanceRecord: "mcpServer.installRecord",
+    });
+  });
+
+  it("does not persist inline MCP secret material in artifact identity fields", () => {
+    const result = persistClawArtifactApplyProvenance(
+      applyPlan({
+        entries: [
+          {
+            kind: "mcpServer",
+            id: "docs",
+            selector: JSON.stringify({
+              url: "https://mcp.example.com/mcp",
+              transport: "streamable-http",
+              headers: { Authorization: "Bearer secret-token" },
+            }),
+          },
+        ],
+      }),
+      { env: stateEnv(), nowMs: 1 },
+    );
+
+    expect(result.artifacts[0].artifactKey).toMatch(/^mcpServers:inline:docs:inline:sha256:/);
+    expect(result.artifacts[0].selector).toMatch(/^inline:sha256:/);
+    expect(JSON.stringify(result.artifacts[0])).not.toContain("secret-token");
+    expect(JSON.stringify(result.artifacts[0])).not.toContain("Authorization");
+  });
+
   it("persists only package-like artifact refs and leaves workspace entries preview-only", () => {
     const result = persistClawArtifactApplyProvenance(applyPlan(), {
       env: stateEnv(),

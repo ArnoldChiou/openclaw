@@ -149,7 +149,14 @@ export type ClawReadResult =
 
 export type ClawPlanEntryDecision = "inspectOnly" | "requiresConsent" | "blockedUnsupported";
 
-export type ClawArtifactSource = "clawhub" | "npm" | "npmPack" | "git" | "path" | "unknown";
+export type ClawArtifactSource =
+  | "clawhub"
+  | "npm"
+  | "npmPack"
+  | "git"
+  | "path"
+  | "inline"
+  | "unknown";
 
 export type ClawArtifactInstallSurface = "skills" | "plugins" | "mcpServers" | "connectors";
 

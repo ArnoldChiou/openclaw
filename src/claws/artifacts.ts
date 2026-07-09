@@ -42,7 +42,34 @@ function isAbsoluteLocalPath(selector: string): boolean {
   );
 }
 
-function parseArtifactSelector(selector: string): ParsedSelector {
+function parseInlineMcpServerSelector(
+  selector: string,
+  entry: ClawPackageEntry,
+): ParsedSelector | undefined {
+  if (entry.kind !== "mcpServer") {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(selector) as unknown;
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return {
+        source: "inline",
+        packageName: entry.id,
+        supported: true,
+      };
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function parseArtifactSelector(entry: ClawPackageEntry): ParsedSelector {
+  const selector = entry.selector;
+  const inlineMcp = parseInlineMcpServerSelector(selector, entry);
+  if (inlineMcp) {
+    return inlineMcp;
+  }
   const clawHub = parseClawHubPluginSpec(selector);
   if (clawHub) {
     return {
@@ -107,7 +134,7 @@ function pinningFor(parsed: ParsedSelector): ClawArtifactPreview["provenance"]["
 }
 
 export function buildClawArtifactPreview(entry: ClawPackageEntry): ClawArtifactPreview {
-  const parsed = parseArtifactSelector(entry.selector);
+  const parsed = parseArtifactSelector(entry);
   return {
     source: parsed.source,
     selector: entry.selector,

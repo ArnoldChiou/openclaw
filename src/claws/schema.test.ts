@@ -264,6 +264,38 @@ describe("parseClawManifest", () => {
 });
 
 describe("buildClawPlan", () => {
+  it("supports inline MCP server config selectors in the artifact preview", () => {
+    const parsed = parseClawManifest({
+      ...baseManifest,
+      entries: [
+        {
+          kind: "mcpServer",
+          id: "docs",
+          selector: JSON.stringify({ command: "uvx", args: ["docs-mcp"] }),
+        },
+      ],
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      throw new Error("expected manifest to parse");
+    }
+
+    const plan = buildClawPlan({ manifest: parsed.manifest });
+
+    expect(plan.summary.unsupportedRequiredEntries).toBe(0);
+    expect(plan.entries[0]).toMatchObject({
+      id: "docs",
+      artifact: {
+        source: "inline",
+        installSurface: "mcpServers",
+        packageName: "docs",
+        provenance: { record: "mcpServer.installRecord" },
+        supported: true,
+      },
+    });
+  });
+
   it("adds package artifact and provenance previews", () => {
     const parsed = parseClawManifest({
       ...baseManifest,

@@ -117,9 +117,9 @@ describe("applyClawArtifactInstallers", () => {
     readConfigFileSnapshotMock.mockRejectedValue(new Error("no config"));
   });
 
-  it("rejects required artifact surfaces until installers exist", async () => {
+  it("rejects required connector surfaces until installers exist", async () => {
     const applyPlan = planWithEntries([
-      { kind: "mcpServer", id: "market-data", selector: "clawhub:market-data@1.0.0" },
+      { kind: "connector", id: "market-data", selector: "clawhub:market-data@1.0.0" },
     ]);
 
     await expect(
@@ -135,7 +135,7 @@ describe("applyClawArtifactInstallers", () => {
         {
           code: "artifact_install_surface_unsupported",
           path: "$.entries[0]",
-          message: expect.stringContaining("install surface mcpServers"),
+          message: expect.stringContaining("install surface connectors"),
         },
       ],
     });
@@ -164,6 +164,179 @@ describe("applyClawArtifactInstallers", () => {
 
     expect(runPluginInstallCommand).toHaveBeenCalledOnce();
     expect([...result.createdArtifactKeys]).toEqual(["plugins:npm:@openclaw/plugin-example@1.0.0"]);
+  });
+
+  it("skips optional non-inline MCP server artifacts until a resolver exists", async () => {
+    const applyPlan = planWithEntries([
+      {
+        kind: "mcpServer",
+        id: "statuspage",
+        selector: "clawhub:statuspage-mcp@1.0.0",
+        required: false,
+      },
+    ]);
+    const listConfiguredMcpServers = vi.fn();
+    const setConfiguredMcpServer = vi.fn();
+
+    const result = await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        listConfiguredMcpServers,
+        setConfiguredMcpServer,
+      },
+    });
+
+    expect(listConfiguredMcpServers).not.toHaveBeenCalled();
+    expect(setConfiguredMcpServer).not.toHaveBeenCalled();
+    expect([...result.installedArtifactKeys]).toEqual([]);
+  });
+
+  it("writes inline MCP server artifacts through the existing config writer", async () => {
+    const applyPlan = planWithEntries([
+      {
+        kind: "mcpServer",
+        id: "docs",
+        selector: JSON.stringify({ command: "uvx", args: ["docs-mcp"], type: "stdio" }),
+      },
+    ]);
+    const servers: Record<string, Record<string, unknown>> = {};
+    const listConfiguredMcpServers = vi.fn(async () => ({
+      ok: true as const,
+      path: "/home/.openclaw/openclaw.json",
+      config: {},
+      mcpServers: servers,
+    }));
+    const setConfiguredMcpServer = vi.fn(async ({ name, server }) => {
+      servers[name] = server;
+      return {
+        ok: true as const,
+        path: "/home/.openclaw/openclaw.json",
+        config: { mcp: { servers } },
+        mcpServers: servers,
+      };
+    });
+
+    const result = await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        listConfiguredMcpServers,
+        setConfiguredMcpServer,
+      },
+    });
+
+    expect(setConfiguredMcpServer).toHaveBeenCalledWith({
+      name: "docs",
+      server: { command: "uvx", args: ["docs-mcp"] },
+    });
+    expect([...result.createdArtifactKeys]).toEqual([
+      "mcpServers:inline:docs:inline:sha256:e66355547d6263e05f38367f38b1c2a0f98d20ea19fac5d08b101923f5fd91a6",
+    ]);
+    expect([...result.installedArtifactKeys]).toEqual([
+      "mcpServers:inline:docs:inline:sha256:e66355547d6263e05f38367f38b1c2a0f98d20ea19fac5d08b101923f5fd91a6",
+    ]);
+  });
+
+  it("skips inline MCP server artifacts when matching config already exists", async () => {
+    const applyPlan = planWithEntries([
+      {
+        kind: "mcpServer",
+        id: "docs",
+        selector: JSON.stringify({ type: "stdio", command: "uvx", args: ["docs-mcp"] }),
+      },
+    ]);
+    const listConfiguredMcpServers = vi.fn(async () => ({
+      ok: true as const,
+      path: "/home/.openclaw/openclaw.json",
+      config: {},
+      mcpServers: { docs: { command: "uvx", args: ["docs-mcp"] } },
+    }));
+    const setConfiguredMcpServer = vi.fn();
+
+    const result = await applyClawArtifactInstallers(applyPlan, {
+      runtime: runtime() as never,
+      deps: {
+        loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+        listConfiguredMcpServers,
+        setConfiguredMcpServer,
+      },
+    });
+
+    expect(setConfiguredMcpServer).not.toHaveBeenCalled();
+    expect([...result.createdArtifactKeys]).toEqual([]);
+    expect([...result.installedArtifactKeys]).toEqual([
+      "mcpServers:inline:docs:inline:sha256:e66355547d6263e05f38367f38b1c2a0f98d20ea19fac5d08b101923f5fd91a6",
+    ]);
+  });
+
+  it("rejects inline MCP server artifacts that would overwrite different existing config", async () => {
+    const applyPlan = planWithEntries([
+      {
+        kind: "mcpServer",
+        id: "docs",
+        selector: JSON.stringify({ command: "uvx", args: ["docs-mcp"] }),
+      },
+    ]);
+    const setConfiguredMcpServer = vi.fn();
+
+    await expect(
+      applyClawArtifactInstallers(applyPlan, {
+        runtime: runtime() as never,
+        deps: {
+          loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+          listConfiguredMcpServers: vi.fn(async () => ({
+            ok: true as const,
+            path: "/home/.openclaw/openclaw.json",
+            config: {},
+            mcpServers: { docs: { command: "node", args: ["other-server.mjs"] } },
+          })),
+          setConfiguredMcpServer,
+        },
+      }),
+    ).rejects.toMatchObject({
+      diagnostics: [
+        {
+          code: "mcp_server_config_conflict",
+          message: expect.stringContaining("conflicts with an existing"),
+        },
+      ],
+    });
+    expect(setConfiguredMcpServer).not.toHaveBeenCalled();
+  });
+
+  it("reports inline MCP server config write failures as Claw diagnostics", async () => {
+    const applyPlan = planWithEntries([
+      { kind: "mcpServer", id: "docs", selector: JSON.stringify({ transport: "stdio" }) },
+    ]);
+
+    await expect(
+      applyClawArtifactInstallers(applyPlan, {
+        runtime: runtime() as never,
+        deps: {
+          loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
+          listConfiguredMcpServers: vi.fn(async () => ({
+            ok: true as const,
+            path: "/home/.openclaw/openclaw.json",
+            config: {},
+            mcpServers: {},
+          })),
+          setConfiguredMcpServer: vi.fn(async () => ({
+            ok: false as const,
+            path: "/home/.openclaw/openclaw.json",
+            error:
+              'Config invalid after MCP set ($.mcp.servers.docs.transport: "stdio" transport requires a non-empty command).',
+          })),
+        },
+      }),
+    ).rejects.toMatchObject({
+      diagnostics: [
+        {
+          code: "mcp_server_config_write_failed",
+          message: expect.stringContaining("requires a non-empty command"),
+        },
+      ],
+    });
   });
 
   it("delegates missing ClawHub skills to the existing skill installer", async () => {

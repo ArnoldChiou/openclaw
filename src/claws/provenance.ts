@@ -1,6 +1,8 @@
 // Persists Claw-owned artifact provenance and reference accounting in shared state.
+import { createHash } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { canonicalizeConfiguredMcpServer } from "../config/mcp-config-normalize.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { isExactSemverVersion } from "../infra/npm-registry-spec.js";
 import {
@@ -185,6 +187,39 @@ function canonicalPackageSelector(artifact: NonNullable<ClawApplyPlanEntry["arti
   return artifact.selector.trim();
 }
 
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .toSorted(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalInlineArtifactSelector(selector: string): string {
+  try {
+    const parsed = JSON.parse(selector) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return stableJson(canonicalizeConfiguredMcpServer(parsed as Record<string, unknown>));
+    }
+    return stableJson(parsed);
+  } catch {
+    return selector.trim();
+  }
+}
+
+function inlineArtifactSelectorDigest(selector: string): string {
+  return createHash("sha256").update(canonicalInlineArtifactSelector(selector)).digest("hex");
+}
+
+function inlineArtifactSelectorLabel(selector: string): string {
+  return `inline:sha256:${inlineArtifactSelectorDigest(selector)}`;
+}
+
 function resolveLocalGitArtifactIdentity(selector: string, sourcePath?: string): string {
   const trimmed = selector.trim();
   if (!trimmed.toLowerCase().startsWith("git:")) {
@@ -211,6 +246,9 @@ export function artifactKeyFor(entry: ClawApplyPlanEntry, sourcePath?: string): 
   }
   if (artifact?.source === "git") {
     return `${surface}:${resolveLocalGitArtifactIdentity(selector, sourcePath)}`;
+  }
+  if (artifact?.source === "inline") {
+    return `${surface}:inline:${entry.id}:${inlineArtifactSelectorLabel(selector)}`;
   }
   return `${surface}:${artifact ? canonicalPackageSelector(artifact) : selector}`;
 }
@@ -272,7 +310,10 @@ function buildPersistedRef(params: {
     entryId: params.entry.id,
     kind: params.entry.kind,
     artifactKey,
-    selector: artifact?.selector ?? params.entry.target ?? params.entry.id,
+    selector:
+      artifact?.source === "inline"
+        ? inlineArtifactSelectorLabel(artifact.selector)
+        : (artifact?.selector ?? params.entry.target ?? params.entry.id),
     installSurface: artifact?.installSurface ?? params.entry.kind,
     source: artifact?.source ?? "unknown",
     ...(artifact?.packageName ? { packageName: artifact.packageName } : {}),
@@ -562,7 +603,8 @@ export function persistClawArtifactApplyProvenance(
       entry.phase !== "artifact" ||
       entry.action !== "installArtifact" ||
       (entry.artifact?.installSurface !== "plugins" &&
-        entry.artifact?.installSurface !== "skills")
+        entry.artifact?.installSurface !== "skills" &&
+        entry.artifact?.installSurface !== "mcpServers")
     ) {
       return false;
     }
