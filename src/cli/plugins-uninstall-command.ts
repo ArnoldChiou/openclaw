@@ -89,13 +89,11 @@ export async function runPluginUninstallCommand(
     if (refs.length === 0) {
       return;
     }
-    const clawList = refs
-      .map((ref) => ref.clawId)
-      .toSorted()
-      .join(", ");
+    const clawIds = [...new Set(refs.map((ref) => ref.clawId))].toSorted();
+    const clawList = clawIds.join(", ");
     runtime.log(
       theme.warn(
-        `Warning: plugin "${params.pluginId}" is referenced by Claw${refs.length === 1 ? "" : "s"}: ${clawList}.`,
+        `Warning: plugin "${params.pluginId}" is referenced by Claw${clawIds.length === 1 ? "" : "s"}: ${clawList}.`,
       ),
     );
     runtime.log(

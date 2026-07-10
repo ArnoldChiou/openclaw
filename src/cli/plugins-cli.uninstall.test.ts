@@ -33,19 +33,18 @@ const CLI_STATE_ROOT = "/tmp/openclaw-state";
 const ALPHA_INSTALL_PATH = installedPluginRoot(CLI_STATE_ROOT, "alpha");
 const ORIGINAL_OPENCLAW_NIX_MODE = process.env.OPENCLAW_NIX_MODE;
 
-function clawPluginPlan(selector = "npm:@openclaw/plugin-alpha@1.0.0") {
+function clawPluginPlan(selector: string | string[] = "npm:@openclaw/plugin-alpha@1.0.0") {
+  const selectors = Array.isArray(selector) ? selector : [selector];
   const parsed = parseClawManifest({
     schemaVersion: "openclaw.claw.v1",
     id: "starter",
     name: "Starter",
     version: "1.0.0",
-    entries: [
-      {
-        kind: "plugin",
-        id: "alpha-plugin",
-        selector,
-      },
-    ],
+    entries: selectors.map((currentSelector, index) => ({
+      kind: "plugin",
+      id: `alpha-plugin-${index + 1}`,
+      selector: currentSelector,
+    })),
   });
   expect(parsed.ok).toBe(true);
   if (!parsed.ok) {
@@ -220,7 +219,10 @@ describe("plugins cli uninstall", () => {
         },
         directoryRemoval: null,
       });
-      persistClawArtifactApplyProvenance(clawPluginPlan(), { nowMs: 1 });
+      persistClawArtifactApplyProvenance(
+        clawPluginPlan(["npm:@openclaw/plugin-alpha@1.0.0", "npm:@openclaw/plugin-alpha@1.0.0"]),
+        { nowMs: 1 },
+      );
 
       await runPluginsCommand(["plugins", "uninstall", "alpha", "--force", "--keep-files"]);
 
