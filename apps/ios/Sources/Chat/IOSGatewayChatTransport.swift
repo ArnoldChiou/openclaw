@@ -233,12 +233,24 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         unread: Bool? = nil) throws -> String
     {
         var params: [String: Any] = ["key": key]
-        if let agentId { params["agentId"] = agentId }
-        if let label { params["label"] = label ?? NSNull() }
-        if let category { params["category"] = category ?? NSNull() }
-        if let pinned { params["pinned"] = pinned }
-        if let archived { params["archived"] = archived }
-        if let unread { params["unread"] = unread }
+        if let agentId {
+            params["agentId"] = agentId
+        }
+        if let label {
+            params["label"] = label ?? NSNull()
+        }
+        if let category {
+            params["category"] = category ?? NSNull()
+        }
+        if let pinned {
+            params["pinned"] = pinned
+        }
+        if let archived {
+            params["archived"] = archived
+        }
+        if let unread {
+            params["unread"] = unread
+        }
         return try self.encodeJSONObject(params)
     }
 
@@ -449,7 +461,7 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
             label: label,
             parentSessionKey: parentTarget?.sessionKey,
             worktree: worktree)
-        let res = try await self.gateway.request(method: "sessions.create", paramsJSON: json, timeoutSeconds: 15)
+        let res = try await gateway.request(method: "sessions.create", paramsJSON: json, timeoutSeconds: 15)
         return try JSONDecoder().decode(OpenClawChatCreateSessionResponse.self, from: res)
     }
 
@@ -468,12 +480,12 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         archived: Bool) async throws -> OpenClawChatSessionsListResponse
     {
         let json = try Self.makeListSessionsParamsJSON(limit: limit, search: search, archived: archived)
-        let res = try await self.gateway.request(method: "sessions.list", paramsJSON: json, timeoutSeconds: 15)
+        let res = try await gateway.request(method: "sessions.list", paramsJSON: json, timeoutSeconds: 15)
         return try JSONDecoder().decode(OpenClawChatSessionsListResponse.self, from: res)
     }
 
     func listModels() async throws -> [OpenClawChatModelChoice] {
-        let response = try await self.gateway.request(
+        let response = try await gateway.request(
             method: "models.list",
             paramsJSON: nil,
             timeoutSeconds: 15)
@@ -520,10 +532,11 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
 
     func forkSession(parentKey: String) async throws -> String {
         let target = self.sessionTarget(for: parentKey)
+        let childAgentID = target.agentID ?? Self.agentID(fromSessionKey: target.sessionKey)
         let json = try Self.makeForkSessionParamsJSON(
             parentKey: target.sessionKey,
-            agentId: target.agentID)
-        let response = try await self.requestSessionMutation(
+            agentId: childAgentID)
+        let response = try await requestSessionMutation(
             method: "sessions.create",
             paramsJSON: json,
             timeoutSeconds: 15)
@@ -777,7 +790,9 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
             let task = Task {
                 let stream = await self.gateway.subscribeServerEvents()
                 for await evt in stream {
-                    if Task.isCancelled { return }
+                    if Task.isCancelled {
+                        return
+                    }
                     if let mapped = Self.mapEventFrame(evt) {
                         continuation.yield(mapped)
                     }
