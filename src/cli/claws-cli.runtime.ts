@@ -187,11 +187,16 @@ function combineApplyResult(
 async function applyArtifacts(
   plan: ClawApplyPlan,
   sourcePath: string,
-  opts: { json?: boolean },
+  opts: { json?: boolean; workspace?: string },
   runtime: RuntimeEnv,
 ): Promise<Awaited<ReturnType<typeof applyClawArtifactInstallers>> | null> {
   try {
-    return await applyClawArtifactInstallers(plan, { sourcePath, runtime, quiet: opts.json });
+    return await applyClawArtifactInstallers(plan, {
+      sourcePath,
+      workspaceRoot: opts.workspace,
+      runtime,
+      quiet: opts.json,
+    });
   } catch (error) {
     if (!(error instanceof ClawArtifactApplyError)) {
       throw error;
@@ -608,7 +613,10 @@ export async function runClawsExportCommand(
   if (!result.outputPath && (result.summary.workspaceFiles > 0 || result.summary.personas > 0)) {
     const message = "Claw export requires --out when exporting workspace or persona files.";
     if (opts.json) {
-      writeRuntimeJson(runtime, { ...result, error: { code: "claw_export_out_required", message } });
+      writeRuntimeJson(runtime, {
+        ...result,
+        error: { code: "claw_export_out_required", message },
+      });
     } else {
       runtime.error(message);
     }

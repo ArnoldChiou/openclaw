@@ -186,11 +186,14 @@ async function readEnabledPluginIds(): Promise<EnabledPluginMatcher | undefined>
   }
 }
 
-function resolveSkillsWorkspaceDir(): {
+function resolveSkillsWorkspaceDir(workspaceRoot?: string): {
   config: ReturnType<typeof getRuntimeConfig>;
   workspaceDir: string;
 } {
   const config = getRuntimeConfig();
+  if (workspaceRoot) {
+    return { config, workspaceDir: resolve(workspaceRoot) };
+  }
   const agentId =
     resolveAgentIdByWorkspacePath(config, process.cwd()) ?? resolveDefaultAgentId(config);
   return {
@@ -403,6 +406,7 @@ export async function applyClawArtifactInstallers(
   plan: ClawApplyPlan,
   options: {
     sourcePath?: string;
+    workspaceRoot?: string;
     runtime?: RuntimeEnv;
     deps?: ClawArtifactInstallerDeps;
     quiet?: boolean;
@@ -451,7 +455,9 @@ export async function applyClawArtifactInstallers(
     if (unsupportedSkillDiagnostics.length > 0) {
       throw new ClawArtifactApplyError(unsupportedSkillDiagnostics, partialResult());
     }
-    const { config, workspaceDir } = (deps.resolveSkillsWorkspaceDir ?? resolveSkillsWorkspaceDir)();
+    const { config, workspaceDir } = (deps.resolveSkillsWorkspaceDir ?? resolveSkillsWorkspaceDir)(
+      options.workspaceRoot,
+    );
     for (const entry of skillEntries) {
       const artifactKey = artifactKeyFor(entry, sourcePath);
       if (satisfiedArtifactKeys.has(artifactKey)) {

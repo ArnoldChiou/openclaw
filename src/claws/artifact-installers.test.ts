@@ -322,23 +322,29 @@ describe("applyClawArtifactInstallers", () => {
       targetDir: "/workspace/.agents/skills/sec-filings",
       source: "path" as const,
     }));
+    const resolveSkillsWorkspaceDir = vi.fn(() => ({
+      config: {},
+      workspaceDir: "/selected-workspace",
+    }));
 
     const result = await applyClawArtifactInstallers(applyPlan, {
+      workspaceRoot: "/selected-workspace",
       runtime: runtime() as never,
       deps: {
         loadInstalledPluginIndexInstallRecords: vi.fn(async () => ({})),
         installSkillFromSource,
-        resolveSkillsWorkspaceDir: () => ({ config: {}, workspaceDir: "/workspace" }),
+        resolveSkillsWorkspaceDir,
       },
     });
 
     expect(installSkillFromSource).toHaveBeenCalledWith(
       expect.objectContaining({
-        workspaceDir: "/workspace",
+        workspaceDir: "/selected-workspace",
         spec: "/repo/claws/skills/sec-filings",
         slug: "sec-filings",
       }),
     );
+    expect(resolveSkillsWorkspaceDir).toHaveBeenCalledWith("/selected-workspace");
     expect([...result.createdArtifactKeys]).toEqual(["skills:path:/repo/claws/skills/sec-filings"]);
   });
 
