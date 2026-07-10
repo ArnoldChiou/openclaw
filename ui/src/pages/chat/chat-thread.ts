@@ -352,14 +352,14 @@ function mergeToolCallResultPair(callItem: ChatItem, resultItem: ChatItem): Chat
         if (!record || !isToolResultContentType(record.type)) {
           return block;
         }
-        return {
-          ...record,
-          id: resolveToolUseId(record) ?? resultCard.callId,
-          name: typeof record.name === "string" && record.name.trim() ? record.name : resultName,
-          ...(record.details === undefined && resultMessage.details !== undefined
-            ? { details: resultMessage.details }
-            : {}),
-        };
+        const stamped: Record<string, unknown> = Object.assign({}, record);
+        stamped.id = resolveToolUseId(record) ?? resultCard.callId;
+        stamped.name =
+          typeof record.name === "string" && record.name.trim() ? record.name : resultName;
+        if (record.details === undefined && resultMessage.details !== undefined) {
+          stamped.details = resultMessage.details;
+        }
+        return stamped;
       })
     : [
         {

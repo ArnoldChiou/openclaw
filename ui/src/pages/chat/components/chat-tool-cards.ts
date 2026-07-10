@@ -782,8 +782,17 @@ export function renderExpandedToolCardContent(
       `
     : nothing;
 
-  // Command calls render terminal-style: `$ command` + raw output.
+  // Command calls render terminal-style: `$ command` + raw output. Remaining
+  // args (workdir, timeout, env…) stay visible as key-value rows so identical
+  // commands in different contexts remain distinguishable in the audit trail.
   if (view.kind === "command" && view.command && !card.preview) {
+    const argsRecord =
+      card.args && typeof card.args === "object" && !Array.isArray(card.args)
+        ? (card.args as Record<string, unknown>)
+        : null;
+    const extraArgs = Object.fromEntries(
+      Object.entries(argsRecord ?? {}).filter(([key]) => key !== "command"),
+    );
     return html`
       <div class="chat-tool-card chat-tool-card--flush ${isError ? "chat-tool-card--error" : ""}">
         ${sidebarAction}
@@ -792,6 +801,7 @@ export function renderExpandedToolCardContent(
           card.outputText ?? (isError ? "No output — tool failed." : undefined),
           isError,
         )}
+        ${Object.keys(extraArgs).length > 0 ? renderArgsKeyValueList(extraArgs) : nothing}
       </div>
     `;
   }
