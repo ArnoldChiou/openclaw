@@ -1969,6 +1969,14 @@ describe("session accessor seam", () => {
     });
 
     await shouldAppendEntered;
+    let unrelatedWriteError: unknown;
+    try {
+      appendSqliteTrajectoryRuntimeEvents({ sessionId: scope.sessionId, storePath }, [
+        createTestTrajectoryEvent(scope.sessionId),
+      ]);
+    } catch (error) {
+      unrelatedWriteError = error;
+    }
     const queuedAppendPromise = appendTranscriptMessage(scope, {
       cwd: tempDir,
       message: {
@@ -1988,6 +1996,7 @@ describe("session accessor seam", () => {
     ]);
     expect(completed).toBe(true);
     await results;
+    expect(unrelatedWriteError).toBeUndefined();
   });
 
   it("persists expected-session SQLite transcript turns without reentering the writer queue", async () => {
@@ -2075,6 +2084,63 @@ describe("session accessor seam", () => {
       appendedCount: 0,
       rejectedReason: "session-rebound",
     });
+    await expect(loadTranscriptEvents(scope)).resolves.toEqual([]);
+  });
+
+  it("rejects an expected-session transcript turn rebound during predicate preparation", async () => {
+    const scope = {
+      agentId: "main",
+      sessionId: "session-predicate-original",
+      sessionKey: "agent:main:predicate-rebind",
+      storePath,
+    };
+    await upsertSessionEntry(scope, {
+      lifecycleRevision: "predicate-revision",
+      sessionId: scope.sessionId,
+      updatedAt: 10,
+    });
+    let releasePredicate!: () => void;
+    let markPredicateStarted!: () => void;
+    const predicateStarted = new Promise<void>((resolve) => {
+      markPredicateStarted = resolve;
+    });
+    const predicateGate = new Promise<void>((resolve) => {
+      releasePredicate = resolve;
+    });
+    const pendingTurn = persistSessionTranscriptTurn(scope, {
+      expectedLifecycleRevision: "predicate-revision",
+      expectedSessionId: scope.sessionId,
+      messages: [
+        {
+          message: { role: "assistant", content: "late reply", timestamp: 100 },
+          shouldAppend: async () => {
+            markPredicateStarted();
+            await predicateGate;
+            return true;
+          },
+        },
+      ],
+      touchSessionEntry: true,
+      updateMode: "file-only",
+    });
+
+    await predicateStarted;
+    let replacementError: unknown;
+    try {
+      replaceSqliteSessionEntrySync(scope, {
+        lifecycleRevision: "replacement-revision",
+        sessionId: "session-predicate-replacement",
+        updatedAt: 20,
+      });
+    } catch (error) {
+      replacementError = error;
+    } finally {
+      releasePredicate();
+    }
+    const result = await pendingTurn;
+
+    expect(replacementError).toBeUndefined();
+    expect(result).toMatchObject({ appendedCount: 0, rejectedReason: "session-rebound" });
     await expect(loadTranscriptEvents(scope)).resolves.toEqual([]);
   });
 

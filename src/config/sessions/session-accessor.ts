@@ -294,7 +294,7 @@ export type TranscriptMessageAppendOptions<TMessage> = {
   /** Working directory recorded in a newly created transcript header. */
   cwd?: string;
   /** How duplicate message idempotency keys are detected before append. */
-  idempotencyLookup?: "scan" | "caller-checked";
+  idempotencyLookup?: "scan" | "scan-assistant" | "caller-checked";
   /** Provider/channel message payload to persist. */
   message: TMessage;
   /** Testable timestamp override for the generated transcript entry. */
@@ -349,9 +349,9 @@ export type SessionTranscriptTurnUpdateMode = "inline" | "file-only" | "none";
 
 export type SessionTranscriptTurnMessageAppend = TranscriptMessageAppendOptions<unknown> & {
   /**
-   * Runs inside the file-backed write lock before this message is appended.
-   * SQLite evaluates duplicate/skip decisions inside the same queued write as
-   * the transcript row append because predicates may perform async reads.
+   * Runs inside the session writer queue before the SQLite transaction begins.
+   * The commit phase revalidates session ownership and database idempotency
+   * after asynchronous predicate work finishes.
    */
   shouldAppend?: (context: SessionTranscriptTurnWriteContext) => Promise<boolean> | boolean;
 };

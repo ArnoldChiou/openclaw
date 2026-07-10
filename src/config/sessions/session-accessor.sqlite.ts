@@ -31,7 +31,6 @@ import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-age
 import {
   openOpenClawAgentDatabase,
   resolveOpenClawAgentSqlitePath,
-  runOpenClawAgentWriteTransactionAsync,
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabase,
   type OpenClawAgentDatabaseOptions,
@@ -1598,79 +1597,95 @@ export async function appendSqliteExpectedSessionTranscriptTurn(
     sessionId: options.expectedSessionId,
   });
   return await runExclusiveSqliteSessionWrite(resolved, async () => {
-    return await runOpenClawAgentWriteTransactionAsync(
-      async (transactionDb) => {
-        const fresh = readSessionEntryRow(transactionDb, resolved.sessionKey);
-        if (
-          !fresh ||
-          fresh.entry.sessionId !== options.expectedSessionId ||
-          (options.expectedLifecycleRevision !== undefined &&
-            fresh.entry.lifecycleRevision !== options.expectedLifecycleRevision)
-        ) {
-          return {
-            appendedMessages: [],
-            rejectedReason: "session-rebound",
-            sessionEntry: fresh?.entry,
-            sessionFile: options.sessionFile,
-          };
-        }
-        const messages = await selectAppendableSqliteTranscriptTurnMessages(
-          {
-            agentId: resolved.agentId,
-            sessionFile: options.sessionFile,
-            sessionId: options.expectedSessionId,
-            sessionKey: resolved.sessionKey,
-            ...(scope.storePath ? { storePath: scope.storePath } : {}),
-          },
-          options.messages,
-        );
-
-        const appendedMessages: TranscriptMessageAppendResult<unknown>[] = [];
-        for (const append of messages) {
-          const { shouldAppend: _shouldAppend, ...appendOptions } = append;
-          const appended = appendSqliteTranscriptMessageInTransaction(transactionDb, resolved, {
-            ...appendOptions,
-            ...((append.cwd ?? options.cwd) ? { cwd: append.cwd ?? options.cwd } : {}),
-            ...((append.config ?? options.config)
-              ? { config: append.config ?? options.config }
-              : {}),
-          });
-          if (appended) {
-            appendedMessages.push(appended);
-          }
-        }
-
-        const appendedCount = appendedMessages.filter((message) => message.appended).length;
-        const touchUpdatedAt =
-          options.touchSessionEntry === true && appendedCount > 0 ? Date.now() : undefined;
-        const sessionPatch: Partial<SessionEntry> = {
-          ...(fresh.entry.sessionFile === options.sessionFile
-            ? {}
-            : { sessionFile: options.sessionFile }),
-          ...(touchUpdatedAt !== undefined
-            ? { updatedAt: Math.max(fresh.entry.updatedAt ?? 0, touchUpdatedAt) }
-            : {}),
-        };
-        const next =
-          Object.keys(sessionPatch).length > 0
-            ? mergeSessionEntry(fresh.entry, sessionPatch)
-            : fresh.entry;
-        if (next !== fresh.entry) {
-          writeSessionEntry(transactionDb, resolved.sessionKey, next);
-          deleteLegacySessionEntryRows(transactionDb, fresh.legacyKeys, resolved.sessionKey);
-        }
-        return {
-          appendedMessages,
-          sessionEntry: cloneSessionEntry(next),
-          sessionFile: options.sessionFile,
-        };
-      },
-      toDatabaseOptions(resolved),
+    const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
+    const preparedEntry = readSessionEntryRow(database, resolved.sessionKey);
+    if (!sqliteSessionMatchesExpectedTranscriptTurn(preparedEntry, options)) {
+      return sqliteSessionTranscriptTurnRebound(preparedEntry, options.sessionFile);
+    }
+    const messages = await selectAppendableSqliteTranscriptTurnMessages(
       {
-        operationLabel: "session-transcript.append-expected-turn",
+        agentId: resolved.agentId,
+        sessionFile: options.sessionFile,
+        sessionId: options.expectedSessionId,
+        sessionKey: resolved.sessionKey,
+        ...(scope.storePath ? { storePath: scope.storePath } : {}),
       },
+      options.messages,
     );
+    let result: SqliteExpectedSessionTranscriptTurnResult = sqliteSessionTranscriptTurnRebound(
+      preparedEntry,
+      options.sessionFile,
+    );
+    runOpenClawAgentWriteTransaction((transactionDb) => {
+      const fresh = readSessionEntryRow(transactionDb, resolved.sessionKey);
+      if (!sqliteSessionMatchesExpectedTranscriptTurn(fresh, options)) {
+        result = sqliteSessionTranscriptTurnRebound(fresh, options.sessionFile);
+        return;
+      }
+      const appendedMessages: TranscriptMessageAppendResult<unknown>[] = [];
+      for (const append of messages) {
+        const { shouldAppend: _shouldAppend, ...appendOptions } = append;
+        const appended = appendSqliteTranscriptMessageInTransaction(transactionDb, resolved, {
+          ...appendOptions,
+          ...((append.cwd ?? options.cwd) ? { cwd: append.cwd ?? options.cwd } : {}),
+          ...((append.config ?? options.config) ? { config: append.config ?? options.config } : {}),
+        });
+        if (appended) {
+          appendedMessages.push(appended);
+        }
+      }
+
+      const appendedCount = appendedMessages.filter((message) => message.appended).length;
+      const touchUpdatedAt =
+        options.touchSessionEntry === true && appendedCount > 0 ? Date.now() : undefined;
+      const sessionPatch: Partial<SessionEntry> = {
+        ...(fresh.entry.sessionFile === options.sessionFile
+          ? {}
+          : { sessionFile: options.sessionFile }),
+        ...(touchUpdatedAt !== undefined
+          ? { updatedAt: Math.max(fresh.entry.updatedAt ?? 0, touchUpdatedAt) }
+          : {}),
+      };
+      const next =
+        Object.keys(sessionPatch).length > 0
+          ? mergeSessionEntry(fresh.entry, sessionPatch)
+          : fresh.entry;
+      if (next !== fresh.entry) {
+        writeSessionEntry(transactionDb, resolved.sessionKey, next);
+        deleteLegacySessionEntryRows(transactionDb, fresh.legacyKeys, resolved.sessionKey);
+      }
+      result = {
+        appendedMessages,
+        sessionEntry: cloneSessionEntry(next),
+        sessionFile: options.sessionFile,
+      };
+    }, toDatabaseOptions(resolved));
+    return result;
   });
+}
+
+function sqliteSessionMatchesExpectedTranscriptTurn(
+  selected: ResolvedSessionEntryRow | undefined,
+  expected: { expectedLifecycleRevision?: string; expectedSessionId: string },
+): selected is ResolvedSessionEntryRow {
+  return Boolean(
+    selected &&
+    selected.entry.sessionId === expected.expectedSessionId &&
+    (expected.expectedLifecycleRevision === undefined ||
+      selected.entry.lifecycleRevision === expected.expectedLifecycleRevision),
+  );
+}
+
+function sqliteSessionTranscriptTurnRebound(
+  selected: ResolvedSessionEntryRow | undefined,
+  sessionFile: string,
+): SqliteExpectedSessionTranscriptTurnResult {
+  return {
+    appendedMessages: [],
+    rejectedReason: "session-rebound",
+    sessionEntry: selected?.entry,
+    sessionFile,
+  };
 }
 
 async function selectAppendableSqliteTranscriptTurnMessages(
@@ -1761,8 +1776,13 @@ function appendSqliteTranscriptMessageInTransaction<TMessage>(
   options: TranscriptMessageAppendOptions<TMessage>,
 ): TranscriptMessageAppendResult<TMessage> | undefined {
   const idempotencyKey = readMessageIdempotencyKey(options.message);
-  if (idempotencyKey && options.idempotencyLookup === "scan") {
-    const existing = readTranscriptMessageByIdempotencyKey(database, resolved, idempotencyKey);
+  if (idempotencyKey && options.idempotencyLookup !== "caller-checked") {
+    const existing = readTranscriptMessageByScopedIdempotencyKey(
+      database,
+      resolved,
+      idempotencyKey,
+      options.idempotencyLookup,
+    );
     if (existing) {
       return {
         appended: false,
@@ -1795,10 +1815,17 @@ function appendSqliteTranscriptMessageInTransaction<TMessage>(
     message: finalMessage,
   };
   const appended = appendTranscriptEventInTransaction(database, resolved, event, {
-    dedupeByMessageIdempotency: options.idempotencyLookup !== "caller-checked",
+    dedupeByMessageIdempotency:
+      options.idempotencyLookup !== "caller-checked" &&
+      options.idempotencyLookup !== "scan-assistant",
   });
   if (!appended && idempotencyKey && options.idempotencyLookup !== "caller-checked") {
-    const existing = readTranscriptMessageByIdempotencyKey(database, resolved, idempotencyKey);
+    const existing = readTranscriptMessageByScopedIdempotencyKey(
+      database,
+      resolved,
+      idempotencyKey,
+      options.idempotencyLookup,
+    );
     if (existing) {
       return {
         appended: false,
@@ -4889,6 +4916,32 @@ function readTranscriptMessageByIdempotencyKey(
   return readTranscriptMessageByIdentity(database, scope, identity);
 }
 
+function readTranscriptMessageByScopedIdempotencyKey(
+  database: OpenClawAgentDatabase,
+  scope: ResolvedTranscriptScope,
+  idempotencyKey: string,
+  lookup: TranscriptMessageAppendOptions<unknown>["idempotencyLookup"],
+): { messageId: string; message: unknown } | undefined {
+  if (lookup !== "scan-assistant") {
+    return readTranscriptMessageByIdempotencyKey(database, scope, idempotencyKey);
+  }
+  const found = findSqliteTranscriptEventInDatabase(database, scope.sessionId, (event) => {
+    const message = readTranscriptEventMessage(event);
+    return message?.role === "assistant" && message.idempotencyKey === idempotencyKey;
+  });
+  if (!found) {
+    return undefined;
+  }
+  const message = readTranscriptEventMessage(found);
+  if (!message) {
+    return undefined;
+  }
+  return {
+    messageId: readTranscriptEventId(found) ?? idempotencyKey,
+    message,
+  };
+}
+
 function readTranscriptMessageByEventId(
   database: OpenClawAgentDatabase,
   scope: ResolvedTranscriptScope,
@@ -5006,26 +5059,53 @@ export function findSqliteTranscriptEvent(
 ): { event: TranscriptEvent } | undefined {
   const resolved = resolveSqliteTranscriptReadScope(scope);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
+  const event = findSqliteTranscriptEventInDatabase(database, resolved.sessionId, match);
+  return event ? { event } : undefined;
+}
+
+function findSqliteTranscriptEventInDatabase(
+  database: OpenClawAgentDatabase,
+  sessionId: string,
+  match: (event: TranscriptEvent) => boolean,
+): TranscriptEvent | undefined {
   const db = getSessionKysely(database.db);
   const rows = executeSqliteQuerySync(
     database.db,
     db
       .selectFrom("transcript_events")
       .select(["event_json"])
-      .where("session_id", "=", resolved.sessionId)
+      .where("session_id", "=", sessionId)
       .orderBy("seq", "desc"),
   ).rows;
   for (const row of rows) {
     try {
       const event = JSON.parse(row.event_json) as TranscriptEvent;
       if (match(event)) {
-        return { event };
+        return event;
       }
     } catch {
-      // Malformed rows are skipped, matching file-era transcript index tolerance.
+      // Malformed rows are skipped, matching transcript index tolerance.
     }
   }
   return undefined;
+}
+
+function readTranscriptEventMessage(event: TranscriptEvent): Record<string, unknown> | undefined {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    return undefined;
+  }
+  const message = (event as { message?: unknown }).message;
+  return message && typeof message === "object" && !Array.isArray(message)
+    ? (message as Record<string, unknown>)
+    : undefined;
+}
+
+function readTranscriptEventId(event: TranscriptEvent): string | undefined {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    return undefined;
+  }
+  const id = (event as { id?: unknown }).id;
+  return typeof id === "string" && id.trim() ? id : undefined;
 }
 
 /** Records inbound session metadata without refreshing activity timestamps. */

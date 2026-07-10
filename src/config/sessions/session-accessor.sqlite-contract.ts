@@ -70,7 +70,7 @@ export type SessionTranscriptStats = {
 export type TranscriptMessageAppendOptions<TMessage> = {
   config?: OpenClawConfig;
   cwd?: string;
-  idempotencyLookup?: "scan" | "caller-checked";
+  idempotencyLookup?: "scan" | "scan-assistant" | "caller-checked";
   message: TMessage;
   now?: number;
   eventId?: string;
