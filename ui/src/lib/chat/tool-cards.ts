@@ -301,11 +301,15 @@ export function extractToolCards(message: unknown, prefix = "tool"): ToolCard[] 
       const text = extractToolText(item);
       const preview = extractToolPreview(text, name);
       const isError = readToolErrorFlag(item) ?? messageIsError;
+      const details = item.details ?? m.details;
       if (existing) {
         fallbackMatchedCards.add(existing);
         existing.callId ??= callId;
         existing.outputText = text;
         existing.preview = preview;
+        if (details !== undefined) {
+          existing.details = details;
+        }
         if (isError !== undefined) {
           existing.isError = isError;
         }
@@ -316,6 +320,7 @@ export function extractToolCards(message: unknown, prefix = "tool"): ToolCard[] 
         ...(callId ? { callId } : {}),
         name,
         outputText: text,
+        ...(details !== undefined ? { details } : {}),
         messageId: transcriptMessageId,
         ...(isError !== undefined ? { isError } : {}),
         preview,
@@ -343,6 +348,7 @@ export function extractToolCards(message: unknown, prefix = "tool"): ToolCard[] 
       ...(callId ? { callId } : {}),
       name,
       outputText: text,
+      ...(m.details !== undefined ? { details: m.details } : {}),
       messageId: transcriptMessageId,
       ...(messageIsError !== undefined ? { isError: messageIsError } : {}),
       preview: extractToolPreview(text, name),

@@ -38,6 +38,9 @@ export type ToolStreamEntry = {
   name: string;
   args?: unknown;
   output?: string;
+  /** Structured result details (e.g. edit diff) captured from the result event. */
+  details?: unknown;
+  isError?: boolean;
   startedAt: number;
   updatedAt: number;
   message: Record<string, unknown>;
@@ -253,6 +256,8 @@ function buildToolStreamMessage(entry: ToolStreamEntry): Record<string, unknown>
       type: "toolresult",
       name: entry.name,
       text: entry.output,
+      ...(entry.details !== undefined ? { details: entry.details } : {}),
+      ...(entry.isError !== undefined ? { isError: entry.isError } : {}),
     });
   }
   return {
@@ -710,6 +715,9 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
       : phase === "result"
         ? formatToolOutput(data.result)
         : undefined;
+  const resultDetails = phase === "result" ? readRecord(data.result)?.details : undefined;
+  const resultIsError =
+    phase === "result" && typeof data.isError === "boolean" ? data.isError : undefined;
   if (name === "session_status" && phase === "result") {
     syncSessionStatusModelOverride(host, data);
   }
@@ -739,6 +747,8 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
       name,
       args,
       output: output || undefined,
+      ...(resultDetails !== undefined ? { details: resultDetails } : {}),
+      ...(resultIsError !== undefined ? { isError: resultIsError } : {}),
       startedAt: typeof payload.ts === "number" ? payload.ts : now,
       updatedAt: now,
       message: {},
@@ -752,6 +762,12 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
     }
     if (output !== undefined) {
       entry.output = output || undefined;
+    }
+    if (resultDetails !== undefined) {
+      entry.details = resultDetails;
+    }
+    if (resultIsError !== undefined) {
+      entry.isError = resultIsError;
     }
     entry.updatedAt = now;
   }

@@ -88,6 +88,7 @@ import {
 } from "./run-lifecycle.ts";
 import { scheduleChatScroll } from "./scroll.ts";
 import { clearChatMessagesFromCache } from "./session-message-cache.ts";
+import { configureToolTitleFetcher } from "./tool-titles.ts";
 
 type ChatPageContext = ApplicationContext;
 type PaneSessionChangeOptions = { replace?: boolean };
@@ -978,6 +979,14 @@ class ChatPane extends OpenClawLightDomElement {
     if (!state) {
       return html`<main class="app-shell app-shell--booting" aria-busy="true"></main>`;
     }
+    // Tool rows consult the global title store while rendering; point its
+    // fetcher at this pane's connection. Last-rendered pane wins, which is
+    // fine: titles are keyed by tool call content, not by session.
+    configureToolTitleFetcher({
+      client: state.connected ? state.client : null,
+      sessionKey: state.sessionKey || null,
+      onTitlesChanged: () => state.requestUpdate?.(),
+    });
     const currentAgentId = resolveChatAgentId(state);
     const agentDefaultModel = this.context.agents.state.agentsList?.agents.find(
       (agent) => agent.id === currentAgentId,

@@ -2,6 +2,7 @@
 import {
   isToolCallContentType,
   isToolResultContentType,
+  resolveToolUseId,
 } from "../../../../src/chat/tool-content.js";
 import type {
   ChatItem,
@@ -341,14 +342,32 @@ function mergeToolCallResultPair(callItem: ChatItem, resultItem: ChatItem): Chat
   const preservedResultContent = resultOnlyContent.filter(
     (block) => asRecord(block)?.type !== "text",
   );
+  // Raw transcript result blocks usually carry the call id and tool name on the
+  // message, not the block. Stamp both onto the merged blocks (plus message-level
+  // details) so card extraction pairs them with the call instead of rendering a
+  // second bare "Tool" card.
   const resultContent = hasToolResultBlock
-    ? resultOnlyContent
+    ? resultOnlyContent.map((block) => {
+        const record = asRecord(block);
+        if (!record || !isToolResultContentType(record.type)) {
+          return block;
+        }
+        return {
+          ...record,
+          id: resolveToolUseId(record) ?? resultCard.callId,
+          name: typeof record.name === "string" && record.name.trim() ? record.name : resultName,
+          ...(record.details === undefined && resultMessage.details !== undefined
+            ? { details: resultMessage.details }
+            : {}),
+        };
+      })
     : [
         {
           type: "tool_result",
           id: resultCard.callId,
           name: resultName,
           text: resultCard.outputText ?? "",
+          ...(resultCard.details !== undefined ? { details: resultCard.details } : {}),
           ...(resultCard.isError !== undefined ? { isError: resultCard.isError } : {}),
         },
         ...preservedResultContent,

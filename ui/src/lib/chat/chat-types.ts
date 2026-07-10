@@ -136,6 +136,8 @@ export type ToolCard = {
   args?: unknown;
   inputText?: string;
   outputText?: string;
+  /** Structured tool result details (e.g. the edit tool's precomputed diff). */
+  details?: unknown;
   isError?: boolean;
   messageId?: string;
   preview?: {

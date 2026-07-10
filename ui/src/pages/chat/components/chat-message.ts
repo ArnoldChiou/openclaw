@@ -28,6 +28,7 @@ import {
   normalizeMessage,
 } from "../../../lib/chat/message-normalizer.ts";
 import { normalizeRoleForGrouping } from "../../../lib/chat/message-normalizer.ts";
+import { summarizeToolGroup } from "../../../lib/chat/tool-call-grouping.ts";
 import {
   extractToolCardsCached,
   formatDistinctCollapsedToolSummaryText,
@@ -47,11 +48,13 @@ import { getSafeLocalStorage } from "../../../local-storage.ts";
 import { renderChatAvatar } from "../chat-avatar.ts";
 import type { SidebarContent } from "./chat-sidebar.ts";
 import {
+  isRunningToolCard,
   renderExpandedToolCardContent,
   renderRawOutputToggle,
   renderToolCard,
   renderToolPreview,
   resolveCollapsedToolDetail,
+  resolveToolRowText,
   shouldToggleSelectableDisclosure,
 } from "./chat-tool-cards.ts";
 
@@ -618,6 +621,7 @@ type RenderMessageGroupOptions = {
   agentId?: string;
   showReasoning: boolean;
   showToolCalls?: boolean;
+  runActive?: boolean;
   autoExpandToolCalls?: boolean;
   isToolMessageExpanded?: (messageId: string) => boolean | undefined;
   onToggleToolMessageExpanded?: (messageId: string, expanded?: boolean) => void;
@@ -654,6 +658,7 @@ function buildGroupedMessageRenderOptions(
     duplicateCount: item.duplicateCount ?? 1,
     showReasoning: opts.showReasoning,
     showToolCalls: opts.showToolCalls ?? true,
+    runActive: opts.runActive,
     turnSucceeded: group.turnSucceeded,
     autoExpandToolCalls: opts.autoExpandToolCalls ?? false,
     isToolMessageExpanded: opts.isToolMessageExpanded,
@@ -707,6 +712,20 @@ export function renderMessageGroup(group: MessageGroup, opts: RenderMessageGroup
     const cards = group.messages.flatMap((item) => extractToolCardsCached(item.message, item.key));
     const toolCount = cards.length || group.messages.length;
     const hasError = cards.some(isToolCardError) && group.turnSucceeded !== true;
+    // While a run is live, the newest still-running call names the group so
+    // the collapsed header reads like a status line; afterwards it aggregates.
+    const runningCard = opts.runActive
+      ? cards.findLast((card) => isRunningToolCard(card, opts.runActive))
+      : undefined;
+    const groupSummaryLabel = runningCard
+      ? `${resolveToolRowText(runningCard)}…`
+      : summarizeToolGroup(
+          cards.map((card) => ({
+            name: card.name,
+            args: card.args,
+            isError: isToolCardError(card) && group.turnSucceeded !== true,
+          })),
+        );
     const activityDisclosureId = `activity:${group.key}`;
     const activityExpanded = opts.isToolMessageExpanded?.(activityDisclosureId) ?? hasError;
 
@@ -743,8 +762,10 @@ export function renderMessageGroup(group: MessageGroup, opts: RenderMessageGroup
               }}
             >
               <span class="chat-activity-group__icon">${hasError ? icons.x : icons.activity}</span>
-              <span class="chat-activity-group__label"
-                >Activity: ${toolCount} tool${toolCount === 1 ? "" : "s"}</span
+              <span
+                class="chat-activity-group__label"
+                title=${`${toolCount} tool call${toolCount === 1 ? "" : "s"}`}
+                >${groupSummaryLabel}</span
               >
               <span
                 class="collapse-chevron ${activityExpanded ? "" : "collapse-chevron--collapsed"}"
@@ -1782,6 +1803,7 @@ function renderInlineToolCards(
     isToolExpanded?: (toolCardId: string) => boolean;
     onToggleToolExpanded?: (toolCardId: string) => void;
     turnSucceeded?: boolean;
+    runActive?: boolean;
     canvasPluginSurfaceUrl?: string | null;
     embedSandboxMode?: EmbedSandboxMode;
     allowExternalEmbedUrls?: boolean;
@@ -1793,6 +1815,7 @@ function renderInlineToolCards(
         renderToolCard(card, {
           expanded: opts.isToolExpanded?.(`${opts.messageKey}:toolcard:${index}`) ?? false,
           turnSucceeded: opts.turnSucceeded,
+          runActive: opts.runActive,
           onToggleExpanded: opts.onToggleToolExpanded
             ? () => opts.onToggleToolExpanded?.(`${opts.messageKey}:toolcard:${index}`)
             : () => undefined,
@@ -1978,6 +2001,7 @@ function renderGroupedMessage(
     duplicateCount?: number;
     showReasoning: boolean;
     showToolCalls?: boolean;
+    runActive?: boolean;
     turnSucceeded?: boolean;
     autoExpandToolCalls?: boolean;
     isToolMessageExpanded?: (messageId: string) => boolean | undefined;
@@ -2120,6 +2144,51 @@ function renderGroupedMessage(
 
   const duplicateCount = Math.max(1, Math.floor(opts.duplicateCount ?? 1));
 
+  // Pure tool messages (no text/images/attachments) skip the "Tool output"
+  // shell and render as flat kind-aware rows, one disclosure level deep.
+  const onlyToolCards =
+    isStandaloneToolMessage &&
+    hasToolCards &&
+    !markdown &&
+    !hasImages &&
+    !hasPairingQrExpiryNotices &&
+    visibleAttachments.length === 0 &&
+    assistantViewBlocks.length === 0 &&
+    !reasoningMarkdown;
+
+  if (onlyToolCards) {
+    return html`
+      <div
+        class="${bubbleClasses}"
+        data-message-id=${messageKey}
+        data-message-text=${extractedText || nothing}
+      >
+        ${renderReplyPill(normalizedMessage.replyTarget)}
+        ${renderInlineToolCards(toolCards, {
+          messageKey,
+          sessionKey: opts.sessionKey,
+          agentId: opts.agentId,
+          onOpenSidebar,
+          isToolExpanded: opts.isToolExpanded,
+          onToggleToolExpanded: opts.onToggleToolExpanded,
+          turnSucceeded: opts.turnSucceeded,
+          runActive: opts.runActive,
+          canvasPluginSurfaceUrl: opts.canvasPluginSurfaceUrl,
+          embedSandboxMode: opts.embedSandboxMode ?? "scripts",
+          allowExternalEmbedUrls: opts.allowExternalEmbedUrls ?? false,
+        })}
+        ${duplicateCount > 1
+          ? html`<div
+              class="chat-duplicate-count"
+              aria-label=${`${duplicateCount} consecutive identical messages collapsed`}
+            >
+              ×${duplicateCount}
+            </div>`
+          : nothing}
+      </div>
+    `;
+  }
+
   return html`
     <div
       class="${bubbleClasses}"
@@ -2207,6 +2276,7 @@ function renderGroupedMessage(
                               isToolExpanded: opts.isToolExpanded,
                               onToggleToolExpanded: opts.onToggleToolExpanded,
                               turnSucceeded: opts.turnSucceeded,
+                              runActive: opts.runActive,
                               canvasPluginSurfaceUrl: opts.canvasPluginSurfaceUrl,
                               embedSandboxMode: opts.embedSandboxMode ?? "scripts",
                               allowExternalEmbedUrls: opts.allowExternalEmbedUrls ?? false,
@@ -2254,6 +2324,7 @@ function renderGroupedMessage(
                   isToolExpanded: opts.isToolExpanded,
                   onToggleToolExpanded: opts.onToggleToolExpanded,
                   turnSucceeded: opts.turnSucceeded,
+                  runActive: opts.runActive,
                   canvasPluginSurfaceUrl: opts.canvasPluginSurfaceUrl,
                   embedSandboxMode: opts.embedSandboxMode ?? "scripts",
                   allowExternalEmbedUrls: opts.allowExternalEmbedUrls ?? false,
