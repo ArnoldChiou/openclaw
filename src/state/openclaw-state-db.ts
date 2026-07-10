@@ -32,9 +32,8 @@ import { OPENCLAW_STATE_SCHEMA_SQL } from "./openclaw-state-schema.generated.js"
  * migrations/backups that operate on local state.
  */
 export const OPENCLAW_STATE_SCHEMA_VERSION = 1;
-/** Per SQLite call busy wait cap; transactions enforce a separate cumulative cap. */
+/** Maximum time one synchronous SQLite call may wait for a lock. */
 export const OPENCLAW_SQLITE_BUSY_TIMEOUT_MS = 5_000;
-export const OPENCLAW_SQLITE_TRANSACTION_BUSY_WAIT_MS = 30_000;
 const OPENCLAW_STATE_DIR_MODE = 0o700;
 const OPENCLAW_STATE_FILE_MODE = 0o600;
 
@@ -294,7 +293,7 @@ export function repairOpenClawStateDatabaseSchema(options: OpenClawStateDatabase
       {
         busyTimeoutMs: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
         databaseLabel: pathname,
-        maxBusyWaitMs: OPENCLAW_SQLITE_TRANSACTION_BUSY_WAIT_MS,
+        operationLabel: "state.schema.repair-agent-registry",
       },
     );
     return repaired
@@ -938,7 +937,7 @@ function ensureAdditiveStateColumns(db: DatabaseSync, pathname: string): void {
     {
       busyTimeoutMs: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
       databaseLabel: pathname,
-      maxBusyWaitMs: OPENCLAW_SQLITE_TRANSACTION_BUSY_WAIT_MS,
+      operationLabel: "state.schema.ensure-columns",
     },
   );
   ensureColumn(db, "subagent_runs", "task_name TEXT");
@@ -1035,7 +1034,7 @@ export function runOpenClawStateWriteTransaction<T>(
   const result = runSqliteImmediateTransactionSync(database.db, () => operation(database), {
     busyTimeoutMs: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
     databaseLabel: database.path,
-    maxBusyWaitMs: OPENCLAW_SQLITE_TRANSACTION_BUSY_WAIT_MS,
+    operationLabel: "state.write",
   });
   try {
     ensureOpenClawStatePermissions(database.path, options.env ?? process.env);

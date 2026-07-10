@@ -1,9 +1,15 @@
 // Covers synchronous SQLite transaction helpers.
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { requireNodeSqlite } from "./node-sqlite.js";
 import { runSqliteImmediateTransactionSync } from "./sqlite-transaction.js";
 
 const openDatabases: Array<import("node:sqlite").DatabaseSync> = [];
+const openChildren: ChildProcessWithoutNullStreams[] = [];
+const tempDirs: string[] = [];
 
 function createDatabase(): import("node:sqlite").DatabaseSync {
   const { DatabaseSync } = requireNodeSqlite();
@@ -20,9 +26,73 @@ function readEntries(db: import("node:sqlite").DatabaseSync): string[] {
     .map((row) => (row as { id: string }).id);
 }
 
+function startWriterLockChild(
+  databasePath: string,
+  holdMs: number,
+): ChildProcessWithoutNullStreams {
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+        import { DatabaseSync } from "node:sqlite";
+        const db = new DatabaseSync(process.argv[1]);
+        db.exec("PRAGMA busy_timeout = 1000; BEGIN IMMEDIATE;");
+        process.stdout.write("ready\\n");
+        setTimeout(() => {
+          db.exec("COMMIT");
+          db.close();
+        }, Number(process.argv[2]));
+      `,
+      databasePath,
+      String(holdMs),
+    ],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  openChildren.push(child);
+  return child;
+}
+
+async function waitForChildReady(child: ChildProcessWithoutNullStreams): Promise<void> {
+  let output = "";
+  for await (const chunk of child.stdout) {
+    output += chunk.toString();
+    if (output.includes("ready")) {
+      return;
+    }
+  }
+  throw new Error(`writer-lock child exited before ready: ${output}`);
+}
+
+async function waitForChildExit(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null) {
+    expect(child.exitCode).toBe(0);
+    return;
+  }
+  const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.once("exit", (code) => resolve({ code, stderr }));
+  });
+  expect(result).toEqual({ code: 0, stderr: "" });
+}
+
 afterEach(() => {
+  for (const child of openChildren.splice(0)) {
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+    }
+  }
   for (const db of openDatabases.splice(0)) {
-    db.close();
+    if (db.isOpen) {
+      db.close();
+    }
+  }
+  for (const tempDir of tempDirs.splice(0)) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
   vi.restoreAllMocks();
 });
@@ -74,34 +144,12 @@ describe("runSqliteImmediateTransactionSync", () => {
     expect(readEntries(db)).toEqual(["after"]);
   });
 
-  it("retries retryable commit failures without rolling back successful writes", () => {
+  it("does not retry commit failures and rolls back the transaction", () => {
     const execCalls: string[] = [];
-    let commitAttempts = 0;
     const db = {
       exec(sql: string) {
         execCalls.push(sql);
         if (sql === "COMMIT") {
-          commitAttempts += 1;
-          if (commitAttempts === 1) {
-            throw Object.assign(new Error("database is busy"), { code: "SQLITE_BUSY" });
-          }
-        }
-      },
-    } as import("node:sqlite").DatabaseSync;
-
-    const result = runSqliteImmediateTransactionSync(db, () => "committed");
-
-    expect(result).toBe("committed");
-    expect(execCalls).toEqual(["BEGIN IMMEDIATE", "COMMIT", "COMMIT"]);
-  });
-
-  it("rolls back and clears depth after exhausted retryable commit failures", () => {
-    const execCalls: string[] = [];
-    let failCommits = true;
-    const db = {
-      exec(sql: string) {
-        execCalls.push(sql);
-        if (failCommits && sql === "COMMIT") {
           throw Object.assign(new Error("database is busy"), { code: "SQLITE_BUSY" });
         }
       },
@@ -111,60 +159,21 @@ describe("runSqliteImmediateTransactionSync", () => {
     expect(() => runSqliteImmediateTransactionSync(db, () => "not committed")).toThrow(
       "database is busy",
     );
-
-    expect(execCalls.filter((sql) => sql === "COMMIT")).toHaveLength(8);
-    expect(execCalls.at(-1)).toBe("ROLLBACK");
-
-    execCalls.length = 0;
-    failCommits = false;
-    const result = runSqliteImmediateTransactionSync(db, () => "committed later");
-
-    expect(result).toBe("committed later");
-    expect(execCalls).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+    expect(execCalls).toEqual(["BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"]);
   });
 
-  it("wraps begin busy timeouts with actionable wait context", () => {
-    const logger = { warn: vi.fn() };
-    const db = {
-      exec(sql: string) {
-        if (sql === "BEGIN IMMEDIATE") {
-          throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
-        }
-      },
-    } as import("node:sqlite").DatabaseSync;
-
-    expect(() =>
-      runSqliteImmediateTransactionSync(db, () => "blocked", {
-        busyTimeoutMs: 5_000,
-        databaseLabel: "agent.sqlite",
-        logger,
-      }),
-    ).toThrow(/begin for agent\.sqlite timed out.*busy_timeout=5000ms.*database is locked/);
-    expect(logger.warn).toHaveBeenCalledWith(
-      "SQLite transaction lock wait failed",
-      expect.objectContaining({
-        busyTimeoutMs: 5_000,
-        code: "SQLITE_BUSY",
-        database: "agent.sqlite",
-        step: "begin",
-      }),
-    );
-  });
-
-  it("retries begin waits until the cumulative transaction cap", () => {
+  it("logs one structured warning for a terminal lock failure", () => {
     const execCalls: string[] = [];
     const logger = { warn: vi.fn() };
-    let now = 0;
-    vi.spyOn(Date, "now").mockImplementation(() => {
-      const value = now;
-      now += 2_000;
-      return value;
+    const lockError = Object.assign(new Error("database is locked"), {
+      code: "ERR_SQLITE_ERROR",
+      errcode: 5,
     });
     const db = {
       exec(sql: string) {
         execCalls.push(sql);
         if (sql === "BEGIN IMMEDIATE") {
-          throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+          throw lockError;
         }
       },
     } as import("node:sqlite").DatabaseSync;
@@ -174,11 +183,26 @@ describe("runSqliteImmediateTransactionSync", () => {
         busyTimeoutMs: 5_000,
         databaseLabel: "agent.sqlite",
         logger,
-        maxBusyWaitMs: 3_000,
+        operationLabel: "session.patch",
       }),
-    ).toThrow(/begin for agent\.sqlite timed out after waiting 4000ms across 2 attempt/);
-
-    expect(execCalls).toEqual(["BEGIN IMMEDIATE", "BEGIN IMMEDIATE"]);
+    ).toThrow(lockError);
+    expect(execCalls).toEqual(["BEGIN IMMEDIATE"]);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "SQLite transaction lock wait failed",
+      expect.objectContaining({
+        async: false,
+        busyTimeoutMs: 5_000,
+        code: "ERR_SQLITE_ERROR",
+        database: "agent.sqlite",
+        failureKind: "lock-contention",
+        operation: "session.patch",
+        pid: process.pid,
+        sqliteErrcode: 5,
+        sqlitePrimaryCode: 5,
+        step: "begin",
+      }),
+    );
   });
 
   it("logs slow successful transaction lock waits", () => {
@@ -203,16 +227,20 @@ describe("runSqliteImmediateTransactionSync", () => {
     expect(logger.warn).toHaveBeenCalledWith(
       "slow SQLite transaction lock wait",
       expect.objectContaining({
+        async: false,
         database: "agent.sqlite",
         elapsedMs: 1_500,
+        pid: process.pid,
         step: "begin",
       }),
     );
     expect(logger.warn).toHaveBeenCalledWith(
       "slow SQLite transaction lock wait",
       expect.objectContaining({
+        async: false,
         database: "agent.sqlite",
         elapsedMs: 1_500,
+        pid: process.pid,
         step: "commit",
       }),
     );
@@ -221,39 +249,97 @@ describe("runSqliteImmediateTransactionSync", () => {
       expect.objectContaining({
         async: false,
         database: "agent.sqlite",
+        pid: process.pid,
       }),
     );
   });
 
-  it("stops retrying commits when cumulative busy wait reaches the transaction cap", () => {
-    const execCalls: string[] = [];
-    const logger = { warn: vi.fn() };
-    let now = 0;
-    vi.spyOn(Date, "now").mockImplementation(() => {
-      const value = now;
-      now += 2_000;
-      return value;
+  it("waits for a separate writer and exposes the synchronous event-loop cost", async () => {
+    const holdMs = 200;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sqlite-contention-"));
+    tempDirs.push(tempDir);
+    const databasePath = path.join(tempDir, "contention.sqlite");
+    const { DatabaseSync } = requireNodeSqlite();
+    const db = new DatabaseSync(databasePath);
+    openDatabases.push(db);
+    db.exec(
+      "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 1000; CREATE TABLE entries (id TEXT PRIMARY KEY);",
+    );
+    const child = startWriterLockChild(databasePath, holdMs);
+    await waitForChildReady(child);
+
+    let timerFiredAt: number | undefined;
+    const timerStartedAt = Date.now();
+    setTimeout(() => {
+      timerFiredAt = Date.now();
+    }, 0);
+    const transactionStartedAt = Date.now();
+    runSqliteImmediateTransactionSync(
+      db,
+      () => db.prepare("INSERT INTO entries(id) VALUES (?)").run("parent"),
+      { busyTimeoutMs: 1_000 },
+    );
+    const elapsedMs = Date.now() - transactionStartedAt;
+
+    expect(elapsedMs).toBeGreaterThanOrEqual(Math.floor(holdMs / 2));
+    expect(timerFiredAt).toBeUndefined();
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
     });
-    const db = {
-      exec(sql: string) {
-        execCalls.push(sql);
-        if (sql === "COMMIT") {
-          throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
-        }
-      },
-      close() {},
-    } as import("node:sqlite").DatabaseSync;
+    expect((timerFiredAt ?? 0) - timerStartedAt).toBeGreaterThanOrEqual(Math.floor(holdMs / 2));
+    await waitForChildExit(child);
+    expect(db.prepare("SELECT id FROM entries").all()).toEqual([{ id: "parent" }]);
+  });
 
-    expect(() =>
-      runSqliteImmediateTransactionSync(db, () => "blocked", {
-        busyTimeoutMs: 5_000,
-        databaseLabel: "agent.sqlite",
+  it("fails a real separate-writer wait after the single SQLite busy timeout", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sqlite-timeout-"));
+    tempDirs.push(tempDir);
+    const databasePath = path.join(tempDir, "contention.sqlite");
+    const { DatabaseSync } = requireNodeSqlite();
+    const db = new DatabaseSync(databasePath);
+    openDatabases.push(db);
+    db.exec(
+      "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 20; CREATE TABLE entries (id TEXT PRIMARY KEY);",
+    );
+    const child = startWriterLockChild(databasePath, 250);
+    await waitForChildReady(child);
+
+    const logger = { warn: vi.fn() };
+    const startedAt = Date.now();
+    let thrown: unknown;
+    try {
+      runSqliteImmediateTransactionSync(db, () => undefined, {
+        busyTimeoutMs: 20,
+        databaseLabel: databasePath,
         logger,
-        maxBusyWaitMs: 3_000,
+        operationLabel: "contention-proof",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    const elapsedMs = Date.now() - startedAt;
+    expect(thrown).toMatchObject({ code: "ERR_SQLITE_ERROR", errcode: 5 });
+    expect(elapsedMs).toBeGreaterThanOrEqual(15);
+    expect(elapsedMs).toBeLessThan(200);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "SQLite transaction lock wait failed",
+      expect.objectContaining({
+        busyTimeoutMs: 20,
+        code: "ERR_SQLITE_ERROR",
+        failureKind: "lock-contention",
+        operation: "contention-proof",
+        sqliteErrcode: 5,
+        sqlitePrimaryCode: 5,
+        step: "begin",
       }),
-    ).toThrow(/commit for agent\.sqlite timed out after waiting 4000ms across 2 attempt/);
+    );
 
-    expect(execCalls.filter((sql) => sql === "COMMIT")).toHaveLength(2);
-    expect(execCalls.at(-1)).toBe("ROLLBACK");
+    await waitForChildExit(child);
+    expect(() =>
+      runSqliteImmediateTransactionSync(db, () => {
+        db.prepare("INSERT INTO entries(id) VALUES (?)").run("after-timeout");
+      }),
+    ).not.toThrow();
   });
 });

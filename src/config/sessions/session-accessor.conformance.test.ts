@@ -2,6 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  readPersistedAuthProfileStateRaw,
+  writePersistedAuthProfileStateRaw,
+} from "../../agents/auth-profiles/sqlite.js";
 import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import { onSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
@@ -837,6 +841,66 @@ describe.each([publicAccessorAdapter, sqliteAdapter])(
 
       await expect(pendingPatch).resolves.toMatchObject({ model: "patched" });
       expect(unrelatedWriteError).toBeUndefined();
+    });
+
+    it("allows auth and trajectory writers while a session updater is preparing", async () => {
+      if (adapter !== sqliteAdapter) {
+        return;
+      }
+      const agentDir = path.join(paths.tempDir, "agents", "main", "agent");
+      const conventionalStorePath = path.join(
+        paths.tempDir,
+        "agents",
+        "main",
+        "sessions",
+        "sessions.json",
+      );
+      const scope = {
+        agentId: "main",
+        sessionKey: "agent:main:shared-writers",
+        storePath: conventionalStorePath,
+      };
+      await replaceSqliteSessionEntry(scope, {
+        model: "base",
+        sessionId: "shared-writers",
+        updatedAt: 10,
+      });
+
+      let releaseUpdater!: () => void;
+      let markUpdaterStarted!: () => void;
+      const updaterStarted = new Promise<void>((resolve) => {
+        markUpdaterStarted = resolve;
+      });
+      const updaterGate = new Promise<void>((resolve) => {
+        releaseUpdater = resolve;
+      });
+      const pendingPatch = patchSqliteSessionEntry(scope, async () => {
+        markUpdaterStarted();
+        await updaterGate;
+        return { model: "patched" };
+      });
+
+      await updaterStarted;
+      writePersistedAuthProfileStateRaw({ selectedProfile: "test" }, agentDir);
+      appendSqliteTrajectoryRuntimeEvents(
+        { sessionId: "shared-writers", storePath: conventionalStorePath },
+        [
+          {
+            traceSchema: "openclaw-trajectory",
+            schemaVersion: 1,
+            traceId: "shared-writers",
+            source: "runtime",
+            type: "test.shared-writers",
+            ts: "2026-07-09T00:00:00.000Z",
+            seq: 1,
+            sessionId: "shared-writers",
+          },
+        ],
+      );
+      releaseUpdater();
+
+      await expect(pendingPatch).resolves.toMatchObject({ model: "patched" });
+      expect(readPersistedAuthProfileStateRaw(agentDir)).toEqual({ selectedProfile: "test" });
     });
 
     it("rejects a prepared SQLite entry patch when its source row changes", async () => {

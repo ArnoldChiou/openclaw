@@ -27,7 +27,6 @@ import { OPENCLAW_AGENT_SCHEMA_SQL } from "./openclaw-agent-schema.generated.js"
 import type { DB as OpenClawStateKyselyDatabase } from "./openclaw-state-db.generated.js";
 import {
   OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
-  OPENCLAW_SQLITE_TRANSACTION_BUSY_WAIT_MS,
   runOpenClawStateWriteTransaction,
   type OpenClawStateDatabaseOptions,
 } from "./openclaw-state-db.js";
@@ -637,8 +636,8 @@ export function runOpenClawAgentWriteTransaction<T>(
   const result = runSqliteImmediateTransactionSync(database.db, () => operation(database), {
     busyTimeoutMs: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
     databaseLabel: database.path,
-    maxBusyWaitMs: OPENCLAW_SQLITE_TRANSACTION_BUSY_WAIT_MS,
     ...transactionOptions,
+    operationLabel: transactionOptions.operationLabel ?? "agent.write",
   });
   ensureOpenClawAgentDatabasePermissions(database.path, options);
   return result;

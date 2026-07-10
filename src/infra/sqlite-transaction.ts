@@ -4,9 +4,12 @@ import { createSubsystemLogger, type SubsystemLogger } from "../logging/subsyste
 
 const transactionDepthByDatabase = new WeakMap<DatabaseSync, number>();
 
-const RETRYABLE_SQLITE_LOCK_ERROR_CODES = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"]);
-const MAX_TRANSACTION_LOCK_ATTEMPTS = 8;
-const DEFAULT_MAX_BUSY_WAIT_MS = 30_000;
+const SQLITE_LOCK_ERROR_CODES = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"]);
+// Node reports SQLite failures with a generic string code and the extended
+// SQLite result in `errcode`; the low byte identifies BUSY or LOCKED.
+const SQLITE_BUSY_RESULT_CODE = 5;
+const SQLITE_LOCKED_RESULT_CODE = 6;
+const SQLITE_PRIMARY_RESULT_CODE_MASK = 0xff;
 const DEFAULT_SLOW_BUSY_WAIT_MS = 1_000;
 const DEFAULT_SLOW_TRANSACTION_HOLD_MS = 1_000;
 
@@ -17,17 +20,11 @@ export type SqliteTransactionOptions = {
   busyTimeoutMs?: number;
   databaseLabel?: string;
   logger?: Pick<SubsystemLogger, "warn">;
-  maxBusyWaitMs?: number;
   operationLabel?: string;
   slowTransactionHoldMs?: number;
 };
 
 type SqliteTransactionStep = "begin" | "commit";
-
-type TimedSqliteError = Error & {
-  code?: string;
-  sqliteElapsedMs?: number;
-};
 
 function nextSavepointName(): string {
   nextSavepointId += 1;
@@ -51,28 +48,24 @@ function sqliteErrorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
-function isRetryableTransactionLockError(error: unknown): boolean {
+function sqliteExtendedResultCode(error: unknown): number | undefined {
+  const errcode =
+    error && typeof error === "object" ? (error as { errcode?: unknown }).errcode : undefined;
+  return typeof errcode === "number" && Number.isInteger(errcode) ? errcode : undefined;
+}
+
+function sqlitePrimaryResultCode(error: unknown): number | undefined {
+  const errcode = sqliteExtendedResultCode(error);
+  return errcode === undefined ? undefined : errcode & SQLITE_PRIMARY_RESULT_CODE_MASK;
+}
+
+function isTransactionLockError(error: unknown): boolean {
   const code = sqliteErrorCode(error);
-  return code !== undefined && RETRYABLE_SQLITE_LOCK_ERROR_CODES.has(code);
-}
-
-function transactionElapsedMs(error: unknown): number {
-  const elapsedMs =
-    error && typeof error === "object"
-      ? (error as { sqliteElapsedMs?: unknown }).sqliteElapsedMs
-      : undefined;
-  return typeof elapsedMs === "number" && Number.isFinite(elapsedMs) ? elapsedMs : 0;
-}
-
-function withTimedSqliteError(error: unknown, elapsedMs: number): TimedSqliteError {
-  if (error instanceof Error) {
-    return Object.assign(error, { sqliteElapsedMs: elapsedMs });
+  if (code !== undefined && SQLITE_LOCK_ERROR_CODES.has(code)) {
+    return true;
   }
-  return Object.assign(new Error(String(error)), { sqliteElapsedMs: elapsedMs });
-}
-
-function effectiveMaxBusyWaitMs(options: SqliteTransactionOptions | undefined): number {
-  return options?.maxBusyWaitMs ?? DEFAULT_MAX_BUSY_WAIT_MS;
+  const primaryCode = sqlitePrimaryResultCode(error);
+  return primaryCode === SQLITE_BUSY_RESULT_CODE || primaryCode === SQLITE_LOCKED_RESULT_CODE;
 }
 
 function slowBusyWaitThresholdMs(options: SqliteTransactionOptions | undefined): number {
@@ -104,12 +97,12 @@ function logSlowTransactionHold(params: {
     ...(params.options?.databaseLabel ? { database: params.options.databaseLabel } : {}),
     elapsedMs: params.elapsedMs,
     ...(params.options?.operationLabel ? { operation: params.options.operationLabel } : {}),
+    pid: process.pid,
     thresholdMs: slowTransactionHoldThresholdMs(params.options),
   });
 }
 
 function logSlowTransactionStep(params: {
-  attempt?: number;
   elapsedMs: number;
   options?: SqliteTransactionOptions;
   step: SqliteTransactionStep;
@@ -118,19 +111,19 @@ function logSlowTransactionStep(params: {
     return;
   }
   transactionLogger(params.options).warn("slow SQLite transaction lock wait", {
-    ...(params.attempt !== undefined ? { attempt: params.attempt } : {}),
+    async: false,
     ...(params.options?.busyTimeoutMs !== undefined
       ? { busyTimeoutMs: params.options.busyTimeoutMs }
       : {}),
     ...(params.options?.databaseLabel ? { database: params.options.databaseLabel } : {}),
     elapsedMs: params.elapsedMs,
-    maxBusyWaitMs: effectiveMaxBusyWaitMs(params.options),
+    ...(params.options?.operationLabel ? { operation: params.options.operationLabel } : {}),
+    pid: process.pid,
     step: params.step,
   });
 }
 
 function execTimedTransactionStep(params: {
-  attempt?: number;
   db: DatabaseSync;
   options?: SqliteTransactionOptions;
   sql: string;
@@ -141,7 +134,6 @@ function execTimedTransactionStep(params: {
     params.db.exec(params.sql);
     const elapsedMs = Date.now() - startedAt;
     logSlowTransactionStep({
-      attempt: params.attempt,
       elapsedMs,
       options: params.options,
       step: params.step,
@@ -149,46 +141,34 @@ function execTimedTransactionStep(params: {
     return elapsedMs;
   } catch (error) {
     const elapsedMs = Date.now() - startedAt;
-    if (isRetryableTransactionLockError(error)) {
+    if (isTransactionLockError(error)) {
+      const sqliteErrcode = sqliteExtendedResultCode(error);
+      const sqlitePrimaryCode = sqlitePrimaryResultCode(error);
       transactionLogger(params.options).warn("SQLite transaction lock wait failed", {
-        ...(params.attempt !== undefined ? { attempt: params.attempt } : {}),
+        async: false,
         ...(params.options?.busyTimeoutMs !== undefined
           ? { busyTimeoutMs: params.options.busyTimeoutMs }
           : {}),
         ...(params.options?.databaseLabel ? { database: params.options.databaseLabel } : {}),
         code: sqliteErrorCode(error),
         elapsedMs,
-        maxBusyWaitMs: effectiveMaxBusyWaitMs(params.options),
+        failureKind: "lock-contention",
+        ...(params.options?.operationLabel ? { operation: params.options.operationLabel } : {}),
+        pid: process.pid,
+        ...(sqliteErrcode !== undefined ? { sqliteErrcode } : {}),
+        ...(sqlitePrimaryCode !== undefined ? { sqlitePrimaryCode } : {}),
         step: params.step,
       });
     }
-    throw withTimedSqliteError(error, elapsedMs);
+    throw error;
   }
-}
-
-function sqliteBusyTimeoutError(params: {
-  attempts: number;
-  cause: unknown;
-  options?: SqliteTransactionOptions;
-  step: SqliteTransactionStep;
-  waitMs: number;
-}): TimedSqliteError {
-  const code = sqliteErrorCode(params.cause);
-  const label = params.options?.databaseLabel ? ` for ${params.options.databaseLabel}` : "";
-  const timeout = params.options?.busyTimeoutMs;
-  const timeoutLabel = timeout === undefined ? "" : `; busy_timeout=${timeout}ms`;
-  const message = `SQLite transaction ${params.step}${label} timed out after waiting ${params.waitMs}ms across ${params.attempts} attempt(s)${timeoutLabel}: ${String(params.cause)}`;
-  return Object.assign(new Error(message, { cause: params.cause }), {
-    ...(code ? { code } : {}),
-    sqliteElapsedMs: params.waitMs,
-  });
 }
 
 function beginImmediateTransaction(
   db: DatabaseSync,
   options: SqliteTransactionOptions | undefined,
 ): void {
-  runRetryableTransactionLockStep({
+  execTimedTransactionStep({
     db,
     options,
     sql: "BEGIN IMMEDIATE",
@@ -200,46 +180,12 @@ function commitImmediateTransaction(
   db: DatabaseSync,
   options: SqliteTransactionOptions | undefined,
 ): void {
-  runRetryableTransactionLockStep({
+  execTimedTransactionStep({
     db,
     options,
     sql: "COMMIT",
     step: "commit",
   });
-}
-
-function runRetryableTransactionLockStep(params: {
-  db: DatabaseSync;
-  options: SqliteTransactionOptions | undefined;
-  sql: string;
-  step: SqliteTransactionStep;
-}): void {
-  let busyWaitMs = 0;
-  for (const attempt of Array.from(
-    { length: MAX_TRANSACTION_LOCK_ATTEMPTS },
-    (_, index) => index + 1,
-  )) {
-    try {
-      execTimedTransactionStep({ attempt, ...params });
-      return;
-    } catch (error) {
-      busyWaitMs += transactionElapsedMs(error);
-      const exhaustedAttempts = attempt >= MAX_TRANSACTION_LOCK_ATTEMPTS;
-      const exhaustedWait = busyWaitMs >= effectiveMaxBusyWaitMs(params.options);
-      if (!isRetryableTransactionLockError(error)) {
-        throw error;
-      }
-      if (exhaustedAttempts || exhaustedWait) {
-        throw sqliteBusyTimeoutError({
-          attempts: attempt,
-          cause: error,
-          options: params.options,
-          step: params.step,
-          waitMs: busyWaitMs,
-        });
-      }
-    }
-  }
 }
 
 function abortImmediateTransaction(db: DatabaseSync): void {
