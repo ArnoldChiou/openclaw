@@ -3816,6 +3816,65 @@ describe("update-cli", () => {
     processOffSpy.mockRestore();
   });
 
+  it("waits for a stopped loaded service to quiesce before package replacement", async () => {
+    mockPackageInstallStatus(createCaseDir("openclaw-update-stopped-service"));
+    serviceReadCommand.mockResolvedValue({
+      programArguments: ["openclaw", "gateway", "run"],
+      environment: {
+        OPENCLAW_SERVICE_MARKER: "openclaw",
+        OPENCLAW_SERVICE_KIND: "gateway",
+      },
+    });
+    serviceLoaded.mockResolvedValue(true);
+    serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+
+    let releaseStop: (() => void) | undefined;
+    serviceStop.mockImplementationOnce(
+      async () =>
+        await new Promise<void>((resolve) => {
+          releaseStop = resolve;
+        }),
+    );
+
+    const updatePromise = updateCommand({ yes: true });
+
+    await vi.waitFor(() => expect(serviceStop).toHaveBeenCalledTimes(1));
+    expect(packageInstallCommandCall()).toBeUndefined();
+    if (!releaseStop) {
+      throw new Error("expected managed service stop to be pending");
+    }
+    releaseStop();
+    await updatePromise;
+
+    const installCallIndex = commandCalls().findIndex(
+      ([argv]) => argv[0] === "npm" && argv[1] === "i" && argv[2] === "-g",
+    );
+    const installOrder = requireValue(
+      vi.mocked(runCommandWithTimeout).mock.invocationCallOrder[installCallIndex],
+      "package install call order",
+    );
+    const stopOrder = requireValue(
+      serviceStop.mock.invocationCallOrder[0],
+      "managed service stop call order",
+    );
+    expect(stopOrder).toBeLessThan(installOrder);
+    expect(runRestartScript).toHaveBeenCalledWith("/tmp/openclaw-restart-test.sh");
+  });
+
+  it("does not stop an unloaded idle service before package replacement", async () => {
+    mockPackageInstallStatus(createCaseDir("openclaw-update-unloaded-service"));
+    serviceReadCommand.mockResolvedValue({
+      programArguments: ["openclaw", "gateway", "run"],
+    });
+    serviceLoaded.mockResolvedValue(false);
+    serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+
+    await updateCommand({ yes: true });
+
+    expect(serviceStop).not.toHaveBeenCalled();
+    expect(packageInstallCommandCall()).toBeDefined();
+  });
+
   it("restores Windows Scheduled Task autostart when service stop fails", async () => {
     const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     mockPackageInstallStatus(createCaseDir("openclaw-update-stop-failure"));

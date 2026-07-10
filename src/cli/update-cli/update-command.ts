@@ -1209,7 +1209,8 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     };
   }
 
-  if (!serviceState.running) {
+  const stoppedServiceMayRespawn = serviceState.loaded && serviceMatchesMutationRoot !== false;
+  if (!serviceState.running && !stoppedServiceMayRespawn) {
     const windowsTaskAutoStartRecovery = await maybeSuspendWindowsTaskAutoStartForPackageUpdate({
       updateInstallKind: params.updateInstallKind,
       serviceEnv: serviceState.env,
@@ -1225,6 +1226,8 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     };
   }
 
+  // A loaded supervisor can be between process exit and automatic respawn.
+  // Quiesce the job before mutation even when its runtime snapshot is stopped.
   const blockMessage = gatewayAncestryBlockMessage(serviceState.runtime?.pid);
   if (blockMessage) {
     return {
@@ -1299,7 +1302,7 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     stopped: true,
     inspected: true,
     runtimeInspected: true,
-    running: true,
+    running: serviceState.running,
     ...serviceOwnership,
     serviceEnv: serviceState.env,
     ...(windowsTaskAutoStartRecovery ? { windowsTaskAutoStartRecovery } : {}),
