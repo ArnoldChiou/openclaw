@@ -21,12 +21,17 @@ const titlesByKey = new Map<string, string>();
 const pendingKeys = new Set<string>();
 const failedKeys = new Set<string>();
 
+// Everything a flush needs is captured at schedule time: split panes
+// reconfigure the module globals on every render, so flush-time globals can
+// belong to a different pane than the one that queued the item.
 type PendingItem = {
   key: string;
   name: string;
   input: string;
   sessionKey: string;
   agentId: string | null;
+  client: GatewayBrowserClient;
+  notify: (() => void) | null;
 };
 type ToolTitlesResult = { titles?: Record<string, string> };
 
@@ -133,16 +138,14 @@ function scheduleTitleRequest(name: string, request: { key: string; input: strin
   ) {
     return;
   }
-  // Capture the session at schedule time: split panes reconfigure the fetcher
-  // on every render, so flush-time session state can belong to another pane.
-  // Sending pane A's args under pane B's session would resolve the wrong agent
-  // and could bypass the gateway's provider egress gate.
   queue.set(request.key, {
     key: request.key,
     name,
     input: request.input,
     sessionKey: activeSessionKey,
     agentId: activeAgentId,
+    client: activeClient,
+    notify: notifyUpdate,
   });
   flushTimer ??= setTimeout(() => {
     flushTimer = null;
@@ -151,13 +154,8 @@ function scheduleTitleRequest(name: string, request: { key: string; input: strin
 }
 
 async function flushTitleQueue(): Promise<void> {
-  const client = activeClient;
-  if (!client || queue.size === 0) {
-    queue = new Map();
-    return;
-  }
-  // One request per captured session + agent; other panes' items stay queued
-  // for the follow-up flush.
+  // One request per scheduling pane (client + session + agent); other panes'
+  // items stay queued for the follow-up flush.
   const head = queue.values().next().value;
   if (!head) {
     queue = new Map();
@@ -166,6 +164,7 @@ async function flushTitleQueue(): Promise<void> {
   const batch: PendingItem[] = [];
   for (const item of queue.values()) {
     if (
+      item.client === head.client &&
       item.sessionKey === head.sessionKey &&
       item.agentId === head.agentId &&
       batch.length < MAX_ITEMS_PER_REQUEST
@@ -179,7 +178,7 @@ async function flushTitleQueue(): Promise<void> {
   }
   const hasBacklog = queue.size > 0;
   try {
-    const result = await client.request<ToolTitlesResult>("chat.toolTitles", {
+    const result = await head.client.request<ToolTitlesResult>("chat.toolTitles", {
       sessionKey: head.sessionKey,
       ...(head.agentId ? { agentId: head.agentId } : {}),
       items: batch.map((item) => ({ id: item.key, name: item.name, input: item.input })),
@@ -196,7 +195,7 @@ async function flushTitleQueue(): Promise<void> {
       }
     }
     if (changed) {
-      notifyUpdate?.();
+      head.notify?.();
     }
   } catch {
     // Gateway without the method, no usable cheap model, transient errors:
