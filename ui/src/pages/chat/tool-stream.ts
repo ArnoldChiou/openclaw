@@ -270,10 +270,12 @@ function buildToolStreamMessage(entry: ToolStreamEntry): Record<string, unknown>
     runId: entry.runId,
     content,
     timestamp: entry.startedAt,
-    // Running-state marker: only live tool-stream cards may show a spinner.
-    // Transcript messages never carry this, so historical output-less calls
-    // (aborted runs) stay inert when a later run is active.
+    // Running-state markers: only live tool-stream cards may show a spinner,
+    // and completion comes from the result event — partial `update` output
+    // must not end the running state. Transcript messages never carry these,
+    // so historical output-less calls (aborted runs) stay inert.
     __openclawToolStreamLive: true,
+    __openclawToolStreamResultReceived: entry.resultReceived === true,
   };
 }
 

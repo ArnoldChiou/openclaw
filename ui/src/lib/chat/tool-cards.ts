@@ -289,7 +289,9 @@ export function extractToolCards(message: unknown, prefix = "tool"): ToolCard[] 
         name: resolveToolName(item, m),
         args,
         inputText: serializeToolInput(args),
-        ...(isLiveToolStream ? { live: true } : {}),
+        ...(isLiveToolStream
+          ? { live: true, completed: m["__openclawToolStreamResultReceived"] === true }
+          : {}),
         messageId: transcriptMessageId,
       });
       continue;

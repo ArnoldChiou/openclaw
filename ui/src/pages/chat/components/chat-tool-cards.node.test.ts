@@ -529,28 +529,40 @@ describe("tool-card canvas URLs", () => {
 });
 
 describe("isRunningToolCard", () => {
-  it("marks only live output-less cards as running while a run is active", async () => {
+  it("marks only live uncompleted cards as running while a run is active", async () => {
     const { isRunningToolCard } = await import("./chat-tool-cards.ts");
     const liveCard = { id: "t:1", name: "bash", live: true } as const;
     const historicalCard = { id: "t:2", name: "bash" } as const;
 
     expect(isRunningToolCard(liveCard, true)).toBe(true);
+    // Partial streamed output must not end the running state; only the final
+    // result event does.
+    expect(isRunningToolCard({ ...liveCard, outputText: "partial…" }, true)).toBe(true);
+    expect(isRunningToolCard({ ...liveCard, completed: true, outputText: "" }, true)).toBe(false);
     // Historical transcript calls without results (e.g. aborted runs) must
     // stay inert when a later run is active in the same session.
     expect(isRunningToolCard(historicalCard, true)).toBe(false);
     expect(isRunningToolCard(liveCard, false)).toBe(false);
-    expect(isRunningToolCard({ ...liveCard, outputText: "" }, true)).toBe(false);
   });
 
-  it("threads the live marker from tool-stream messages into cards", () => {
-    const cards = extractToolCards({
+  it("threads live and completion markers from tool-stream messages into cards", () => {
+    const running = extractToolCards({
       role: "assistant",
       toolCallId: "call-live",
       __openclawToolStreamLive: true,
+      __openclawToolStreamResultReceived: false,
       content: [{ type: "toolcall", name: "bash", arguments: { command: "sleep 5" } }],
     });
+    expect(running).toHaveLength(1);
+    expect(running[0]).toMatchObject({ live: true, completed: false });
 
-    expect(cards).toHaveLength(1);
-    expect(cards[0].live).toBe(true);
+    const finished = extractToolCards({
+      role: "assistant",
+      toolCallId: "call-live",
+      __openclawToolStreamLive: true,
+      __openclawToolStreamResultReceived: true,
+      content: [{ type: "toolcall", name: "bash", arguments: { command: "sleep 5" } }],
+    });
+    expect(finished[0]).toMatchObject({ live: true, completed: true });
   });
 });

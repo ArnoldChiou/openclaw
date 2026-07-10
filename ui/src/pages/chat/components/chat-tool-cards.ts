@@ -641,12 +641,10 @@ function resolveCollapsedToolSummaryParts(params: {
 
 export function isRunningToolCard(card: ToolCard, runActive: boolean | undefined): boolean {
   // Only live tool-stream cards can be running; historical transcript calls
-  // without results (aborted runs) must stay inert during later runs.
+  // without results (aborted runs) must stay inert during later runs. The
+  // result event ends the running state — partial streamed output does not.
   return (
-    runActive === true &&
-    card.live === true &&
-    card.outputText === undefined &&
-    !isToolCardError(card)
+    runActive === true && card.live === true && card.completed !== true && !isToolCardError(card)
   );
 }
 
