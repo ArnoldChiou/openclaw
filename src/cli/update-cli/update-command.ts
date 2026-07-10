@@ -1285,20 +1285,6 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     if (err instanceof UpdateCommandAbort) {
       throw err;
     }
-    if (quiesceLaunchAgent) {
-      try {
-        await service.restart({
-          env: serviceState.env,
-          stdout: serviceControlStdoutForMode(params.jsonMode),
-        });
-      } catch (restartErr) {
-        throw createAggregateErrorWithCause(
-          [err, restartErr],
-          `Failed to quiesce the managed gateway (${String(err)}) and restore its LaunchAgent (${String(restartErr)})`,
-          err,
-        );
-      }
-    }
     if (windowsTaskAutoStartRecovery) {
       try {
         await windowsTaskAutoStartRecovery.restore();
@@ -4201,7 +4187,8 @@ async function updateCommandInternal(
           preManagedServiceStop.blockMessage ||
           shouldBlockMutableUpdateFromGatewayServiceEnv({ preManagedServiceStop }) ||
           !preManagedServiceStop.inspected ||
-          !preManagedServiceStop.running ||
+          (preManagedServiceStop.serviceMatchesMutationRoot !== false &&
+            !preManagedServiceStop.running) ||
           !shouldRestart
         ) {
           break;

@@ -1663,6 +1663,25 @@ describe("launchd install", () => {
     expect(state.serviceRunning).toBe(true);
   });
 
+  it("preserves an initially disabled stopped LaunchAgent after failed quiescence", async () => {
+    const env = createDefaultLaunchdEnv();
+    state.disabledOverride = "disabled";
+    state.serviceRunning = false;
+    state.bootoutKeepsLoadedRemaining = 3;
+
+    await expect(
+      runStopLaunchAgentWithFakeTimers({ env, stdout: new PassThrough(), quiesce: true }),
+    ).rejects.toThrow("LaunchAgent remained loaded after bootout: state=stopped");
+
+    expect(launchctlCommandNames().filter((command) => command === "bootout")).toHaveLength(3);
+    expect(launchctlCommandNames()).not.toContain("enable");
+    expect(launchctlCommandNames()).not.toContain("bootstrap");
+    expect(launchctlCommandNames()).not.toContain("kickstart");
+    expect(state.disabledOverride).toBe("disabled");
+    expect(state.serviceLoaded).toBe(true);
+    expect(state.serviceRunning).toBe(false);
+  });
+
   it("does not load an initially unloaded LaunchAgent when quiescence fails", async () => {
     const env = {
       ...createDefaultLaunchdEnv(),

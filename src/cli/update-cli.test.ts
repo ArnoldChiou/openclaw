@@ -3877,7 +3877,7 @@ describe("update-cli", () => {
     },
   );
 
-  it("restores a Darwin LaunchAgent when update quiescence fails", async () => {
+  it("leaves Darwin quiescence rollback to the LaunchAgent owner", async () => {
     const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
     mockPackageInstallStatus(createCaseDir("openclaw-update-quiesce-failure"));
     serviceReadCommand.mockResolvedValue({
@@ -3896,14 +3896,9 @@ describe("update-cli", () => {
     }
 
     expect(serviceStop).toHaveBeenCalledWith(expect.objectContaining({ quiesce: true }));
-    expect(serviceRestart).toHaveBeenCalledTimes(1);
+    expect(serviceRestart).not.toHaveBeenCalled();
     expect(packageInstallCommandCall()).toBeUndefined();
     expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
-    expect(
-      requireValue(serviceStop.mock.invocationCallOrder[0], "service stop order"),
-    ).toBeLessThan(
-      requireValue(serviceRestart.mock.invocationCallOrder[0], "service restart order"),
-    );
   });
 
   it.each(["linux", "win32"] as const)(
@@ -4332,6 +4327,52 @@ describe("update-cli", () => {
     const updateCall = vi.mocked(runGatewayUpdate).mock.calls[0]?.[0];
     expect(updateCall?.cwd).toBe(gitRoot);
     expect(updateCall?.beforeGitMutation).toEqual(expect.any(Function));
+  });
+
+  it("continues scanning roots for a stopped Darwin gateway rooted at the git checkout", async () => {
+    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const packageRoot = createCaseDir("openclaw-update-package-root");
+    const gitRoot = await createTrackedTempDir("openclaw-update-git-service-root-");
+    const serviceEntrypoint = path.join(gitRoot, "dist", "index.js");
+    await fs.mkdir(path.join(gitRoot, ".git"), { recursive: true });
+    await fs.mkdir(path.dirname(serviceEntrypoint), { recursive: true });
+    await fs.writeFile(
+      path.join(gitRoot, "package.json"),
+      JSON.stringify({ name: "openclaw", version: "2026.4.21" }),
+      "utf-8",
+    );
+    await fs.writeFile(serviceEntrypoint, "export {};\n", "utf-8");
+    mockPackageInstallStatus(packageRoot);
+    pathExists.mockImplementation(async (candidate: string) => candidate === gitRoot);
+    serviceReadCommand.mockResolvedValue({
+      programArguments: ["node", serviceEntrypoint, "gateway", "run"],
+      environment: {
+        OPENCLAW_SERVICE_MARKER: "openclaw",
+        OPENCLAW_SERVICE_KIND: "gateway",
+      },
+    });
+    serviceLoaded.mockResolvedValue(true);
+    serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+    const preparations = mockGitUpdateAfterMutation(
+      makeOkUpdateResult({
+        mode: "git",
+        root: gitRoot,
+      }),
+    );
+
+    try {
+      await withEnvAsync({ OPENCLAW_GIT_DIR: gitRoot }, async () => {
+        await updateCommand({ channel: "dev", yes: true });
+      });
+    } finally {
+      platformSpy.mockRestore();
+    }
+
+    expect(serviceStop).toHaveBeenCalledOnce();
+    expect(serviceStop).toHaveBeenCalledWith(expect.objectContaining({ quiesce: true }));
+    expect(preparations).toEqual([
+      { allowGatewayServiceRepair: true, allowGatewayActivation: true },
+    ]);
   });
 
   it("stops a managed gateway rooted at the package install when switching package installs to dev", async () => {
