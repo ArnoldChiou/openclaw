@@ -250,7 +250,9 @@ describe("claws cli", () => {
       outputPath: outPath,
       summary: { plugins: 1, workspaceFiles: 0, personas: 1, excluded: 1 },
     });
-    await expect(readFile(outPath, "utf8")).resolves.toContain('"schemaVersion": "openclaw.claw.v1"');
+    await expect(readFile(outPath, "utf8")).resolves.toContain(
+      '"schemaVersion": "openclaw.claw.v1"',
+    );
     const written = JSON.parse(await readFile(outPath, "utf8"));
     expect(written.entries).toEqual([
       expect.objectContaining({ id: "plugin-terminal" }),
@@ -487,6 +489,40 @@ describe("claws cli", () => {
       ],
     });
   });
+
+  it.runIf(process.platform !== "win32")(
+    "does not follow output sidecar symlinks outside the export directory",
+    async () => {
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-workspace-"));
+      const outputRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-output-"));
+      const outsideRoot = await mkdtemp(join(tmpdir(), "openclaw-claws-export-outside-"));
+      const outsidePath = join(outsideRoot, "outside.md");
+      await writeFile(join(workspaceRoot, "SOUL.md"), "exported soul\n", "utf8");
+      await writeFile(outsidePath, "outside\n", "utf8");
+      await mkdir(join(outputRoot, "files"), { recursive: true });
+      await symlink(outsidePath, join(outputRoot, "files", "SOUL.md"));
+
+      await expect(
+        runCli([
+          "claws",
+          "export",
+          "--id",
+          "starter",
+          "--name",
+          "Starter",
+          "--include",
+          "workspace",
+          "--workspace",
+          workspaceRoot,
+          "--workspace-file",
+          "SOUL.md",
+          "--out",
+          join(outputRoot, "starter.claw.json"),
+        ]),
+      ).rejects.toThrow();
+      await expect(readFile(outsidePath, "utf8")).resolves.toBe("outside\n");
+    },
+  );
 
   it("prints only manifest JSON when export has no output path", async () => {
     await runCli([

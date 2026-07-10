@@ -1,7 +1,8 @@
 // Builds Claw manifests from local OpenClaw state and explicit workspace selections.
-import { copyFile, mkdir, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
+import { root as fsSafeRoot } from "../infra/fs-safe.js";
 import { loadInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-records.js";
 import { CLAW_SCHEMA_VERSION, type ClawEntry, type ClawManifest } from "./types.js";
 import { MAX_CLAW_WORKSPACE_FILE_BYTES } from "./workspace.js";
@@ -57,11 +58,7 @@ function parseIncludeKinds(values: string[] | undefined): Set<ClawExportIncludeK
   for (const value of raw) {
     if (value === "plugin" || value === "plugins") {
       kinds.add("plugins");
-    } else if (
-      value === "workspace" ||
-      value === "workspaceFile" ||
-      value === "workspaceFiles"
-    ) {
+    } else if (value === "workspace" || value === "workspaceFile" || value === "workspaceFiles") {
       kinds.add("workspace");
     } else if (value === "persona" || value === "personas") {
       kinds.add("persona");
@@ -159,7 +156,9 @@ function workspaceRelativePath(workspaceRoot: string, absolutePath: string): str
 }
 
 function sourcePathForManifest(params: { outPath?: string; targetPath: string }): string {
-  return params.outPath ? normalizeRelativePath(join("files", params.targetPath)) : params.targetPath;
+  return params.outPath
+    ? normalizeRelativePath(join("files", params.targetPath))
+    : params.targetPath;
 }
 
 async function copyFileSourceForManifest(params: {
@@ -170,9 +169,18 @@ async function copyFileSourceForManifest(params: {
   if (!params.outPath) {
     return;
   }
-  const destination = resolve(dirname(resolve(params.outPath)), "files", params.targetPath);
-  await mkdir(dirname(destination), { recursive: true });
-  await copyFile(params.absolutePath, destination);
+  const outputRoot = dirname(resolve(params.outPath));
+  await mkdir(outputRoot, { recursive: true });
+  const output = await fsSafeRoot(outputRoot, {
+    hardlinks: "reject",
+    maxBytes: MAX_CLAW_WORKSPACE_FILE_BYTES,
+    symlinks: "reject",
+  });
+  await output.copyIn(join("files", params.targetPath), params.absolutePath, {
+    maxBytes: MAX_CLAW_WORKSPACE_FILE_BYTES,
+    mkdir: true,
+    sourceHardlinks: "reject",
+  });
 }
 
 function pluginSelectorFromRecord(record: PluginInstallRecord): string | undefined {
