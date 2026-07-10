@@ -77,6 +77,36 @@ export async function runPluginUninstallCommand(
   const extensionsDir = path.join(resolveStateDir(process.env, os.homedir), "extensions");
   const keepFiles = Boolean(opts.keepFiles || opts.keepConfig);
 
+  const warnClawPluginReferences = async (params: {
+    pluginId: string;
+    installRecord?: import("../config/types.plugins.js").PluginInstallRecord;
+  }): Promise<void> => {
+    if (!params.installRecord || params.installRecord.source !== "clawhub") {
+      return;
+    }
+    const installRecord = params.installRecord;
+    const { clawPackageRefMatchesPluginInstall } = await import("../claws/packages.js");
+    const { readClawPackageRefs } = await import("../claws/provenance.js");
+    const refs = readClawPackageRefs({ kind: "plugin", source: "clawhub" }).filter((ref) =>
+      clawPackageRefMatchesPluginInstall(ref, params.pluginId, installRecord),
+    );
+    if (refs.length === 0) {
+      return;
+    }
+    const clawIds = [...new Set(refs.map((ref) => ref.clawName))].toSorted();
+    const clawList = clawIds.join(", ");
+    runtime.log(
+      theme.warn(
+        `Warning: plugin "${params.pluginId}" is referenced by Claw${clawIds.length === 1 ? "" : "s"}: ${clawList}.`,
+      ),
+    );
+    runtime.log(
+      theme.warn(
+        "Uninstalling it may break those Claws until the plugin is reinstalled or the Claws are updated.",
+      ),
+    );
+  };
+
   if (opts.keepConfig) {
     runtime.log(theme.warn("`--keep-config` is deprecated, use `--keep-files`."));
   }
@@ -106,7 +136,6 @@ export async function runPluginUninstallCommand(
     return;
   }
   const hasInstall = pluginId in (cfg.plugins?.installs ?? {});
-
   const preview: string[] = [];
   if (plan.actions.entry) {
     preview.push(UNINSTALL_ACTION_LABELS.entry);
@@ -152,6 +181,13 @@ export async function runPluginUninstallCommand(
   if (opts.dryRun) {
     runtime.log(theme.muted("Dry run, no changes made."));
     return;
+  }
+
+  if (hasInstall) {
+    await warnClawPluginReferences({
+      pluginId,
+      installRecord: cfg.plugins?.installs?.[pluginId],
+    });
   }
 
   if (!opts.force) {

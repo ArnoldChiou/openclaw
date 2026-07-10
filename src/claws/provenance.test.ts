@@ -5,9 +5,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
-import { applyClawAddPlan, ClawAddMutationError } from "./add.js";
+import { applyClawAddPlan } from "./add.js";
 import { buildClawAddPlan } from "./lifecycle.js";
-import { persistClawInstallRecord, readClawInstallRecord } from "./provenance.js";
+import { ClawPackageInstallError } from "./packages.js";
+import {
+  persistClawInstallRecord,
+  persistClawPackageRef,
+  readClawInstallRecord,
+  readClawPackageRefs,
+} from "./provenance.js";
 import { parseClawManifest } from "./schema.js";
 import type { ClawSourceIdentity } from "./types.js";
 
@@ -65,6 +71,34 @@ describe("Claw root install provenance", () => {
 
     expect(() => persistClawInstallRecord(plan, { env: stateEnv(root), nowMs: 2 })).toThrow();
     expect(readClawInstallRecord("worker", { env: stateEnv(root) })?.addedAtMs).toBe(1);
+  });
+
+  it("records package references independently of shared package ownership", async () => {
+    const { root, plan } = await makePlan();
+    const pkg = {
+      kind: "plugin" as const,
+      source: "clawhub" as const,
+      ref: "@acme/audit",
+      version: "2.3.4",
+    };
+
+    const record = persistClawPackageRef(plan, pkg, { env: stateEnv(root), nowMs: 43 });
+
+    expect(record).toMatchObject({
+      schemaVersion: "openclaw.clawPackageRef.v1",
+      agentId: "worker",
+      clawName: "@acme/worker",
+      ...pkg,
+    });
+    expect(
+      readClawPackageRefs({
+        env: stateEnv(root),
+        kind: "plugin",
+        source: "clawhub",
+        ref: "@acme/audit",
+        version: "2.3.4",
+      }),
+    ).toEqual([record]);
   });
 });
 
@@ -129,17 +163,73 @@ describe("applyClawAddPlan", () => {
     await expect(access(plan.agent.workspace)).rejects.toThrow();
   });
 
-  it("blocks declared components that this lifecycle slice cannot yet create", async () => {
+  it("installs declared packages after workspace creation", async () => {
     const { plan } = await makePlan({
       schemaVersion: 1,
       agent: { id: "worker" },
       packages: [{ kind: "skill", source: "clawhub", ref: "demo", version: "1.0.0" }],
     });
+    let config: OpenClawConfig = {};
+    const installPackages = async () => [
+      {
+        schemaVersion: "openclaw.clawPackageRef.v1" as const,
+        agentId: "worker",
+        clawName: "@acme/worker",
+        kind: "skill" as const,
+        source: "clawhub" as const,
+        ref: "demo",
+        version: "1.0.0",
+        installedAtMs: 1,
+      },
+    ];
 
-    await expect(applyClawAddPlan(plan)).rejects.toEqual(
-      expect.objectContaining<Partial<ClawAddMutationError>>({ code: "unsupported_components" }),
-    );
-    await expect(access(plan.agent.workspace)).rejects.toThrow();
+    const result = await applyClawAddPlan(plan, {
+      commitConfig: async (transform) => {
+        config = transform(config);
+      },
+      installPackages,
+    });
+
+    expect(result).toMatchObject({ status: "complete", packages: [{ ref: "demo" }] });
+    expect(config.agents?.list?.[0]?.id).toBe("worker");
+    await expect(access(plan.agent.workspace)).resolves.toBeUndefined();
+  });
+
+  it("returns partial state and successful refs when a later package fails", async () => {
+    const { root, plan } = await makePlan({
+      schemaVersion: 1,
+      agent: { id: "worker" },
+      packages: [{ kind: "skill", source: "clawhub", ref: "demo", version: "1.0.0" }],
+    });
+    const installed = {
+      schemaVersion: "openclaw.clawPackageRef.v1" as const,
+      agentId: "worker",
+      clawName: "@acme/worker",
+      kind: "skill" as const,
+      source: "clawhub" as const,
+      ref: "prior",
+      version: "1.0.0",
+      installedAtMs: 1,
+    };
+
+    const result = await applyClawAddPlan(plan, {
+      env: stateEnv(root),
+      commitConfig: async (transform) => {
+        transform({});
+      },
+      installPackages: async () => {
+        throw new ClawPackageInstallError("package_install_failed", "registry unavailable", [
+          installed,
+        ]);
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "partial",
+      packages: [installed],
+      installRecord: { status: "partial" },
+      error: { code: "package_install_failed", message: "registry unavailable" },
+    });
   });
 
   it("reports a partial add when provenance persistence fails after config commit", async () => {

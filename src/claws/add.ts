@@ -5,7 +5,9 @@ import { transformConfigFileWithRetry } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
 import { resolveUserPath } from "../utils.js";
+import { ClawPackageInstallError, installClawPackages } from "./packages.js";
 import { persistClawInstallRecord, type PersistedClawInstall } from "./provenance.js";
+import type { PersistedClawPackageRef } from "./provenance.js";
 import { CLAW_OUTPUT_STABILITY, type ClawAddPlan } from "./types.js";
 import {
   ClawWorkspaceWriteError,
@@ -38,6 +40,7 @@ export type ClawAddResult = {
   workspaceCreated: boolean;
   configCommitted: boolean;
   workspaceFiles: PersistedClawWorkspaceFile[];
+  packages: PersistedClawPackageRef[];
   installRecord?: PersistedClawInstall;
   error?: {
     code: string;
@@ -48,7 +51,7 @@ export type ClawAddResult = {
 
 function hasUnsupportedMutationActions(plan: ClawAddPlan): boolean {
   return plan.actions.some(
-    (action) => !["agent", "workspace", "workspaceFile"].includes(action.kind),
+    (action) => !["agent", "workspace", "workspaceFile", "package"].includes(action.kind),
   );
 }
 
@@ -66,6 +69,7 @@ export async function applyClawAddPlan(
     commitConfig?: ConfigCommit;
     persistRecord?: typeof persistClawInstallRecord;
     createWorkspaceFiles?: typeof createClawWorkspaceFiles;
+    installPackages?: typeof installClawPackages;
     nowMs?: number;
   } = {},
 ): Promise<ClawAddResult> {
@@ -75,7 +79,7 @@ export async function applyClawAddPlan(
   if (hasUnsupportedMutationActions(plan)) {
     throw new ClawAddMutationError(
       "unsupported_components",
-      "This build can add agent settings and workspace files; declared packages, MCP servers, or cron jobs require later lifecycle slices.",
+      "This build can add agent settings, workspace files, and packages; declared MCP servers or cron jobs require later lifecycle slices.",
     );
   }
 
@@ -164,6 +168,7 @@ export async function applyClawAddPlan(
       workspaceCreated: true,
       configCommitted: true,
       workspaceFiles: workspaceError.createdFiles,
+      packages: [],
       ...(installRecord ? { installRecord } : {}),
       error: {
         code: "workspace_files_failed",
@@ -171,6 +176,49 @@ export async function applyClawAddPlan(
           ? `${workspaceError.message}; root provenance also failed: ${provenanceError}`
           : workspaceError.message,
         diagnostics: workspaceError.diagnostics,
+      },
+    };
+  }
+
+  const installPackages = options.installPackages ?? installClawPackages;
+  let packages: PersistedClawPackageRef[] = [];
+  try {
+    packages = await installPackages(plan, options);
+  } catch (error) {
+    const packageError =
+      error instanceof ClawPackageInstallError
+        ? error
+        : new ClawPackageInstallError(
+            "package_install_failed",
+            error instanceof Error ? error.message : String(error),
+            packages,
+          );
+    const persistRecord = options.persistRecord ?? persistClawInstallRecord;
+    let installRecord: PersistedClawInstall | undefined;
+    let provenanceError: string | undefined;
+    try {
+      installRecord = persistRecord(plan, { ...options, status: "partial" });
+    } catch (recordError) {
+      provenanceError = recordError instanceof Error ? recordError.message : String(recordError);
+    }
+    return {
+      schemaVersion: CLAW_ADD_RESULT_SCHEMA_VERSION,
+      stability: CLAW_OUTPUT_STABILITY,
+      dryRun: false,
+      mutationAllowed: true,
+      status: "partial",
+      claw: plan.claw,
+      agent: plan.agent,
+      workspaceCreated: true,
+      configCommitted: true,
+      workspaceFiles,
+      packages: packageError.installedPackages,
+      ...(installRecord ? { installRecord } : {}),
+      error: {
+        code: packageError.code,
+        message: provenanceError
+          ? `${packageError.message}; root provenance also failed: ${provenanceError}`
+          : packageError.message,
       },
     };
   }
@@ -189,6 +237,7 @@ export async function applyClawAddPlan(
       workspaceCreated: true,
       configCommitted: true,
       workspaceFiles,
+      packages,
       installRecord,
     };
   } catch (error) {
@@ -203,6 +252,7 @@ export async function applyClawAddPlan(
       workspaceCreated: true,
       configCommitted: true,
       workspaceFiles,
+      packages,
       error: { code: "provenance_failed", message: (error as Error).message },
     };
   }
