@@ -468,6 +468,23 @@ describe("ci workflow guards", () => {
     );
   });
 
+  it("runs the SQLite transaction ratchet in the session boundary check", () => {
+    const workflow = readCiWorkflow();
+    const additionalJob = workflow.jobs["check-additional-shard"];
+    const matrixRows = additionalJob.strategy.matrix.include;
+    expect(matrixRows).toContainEqual({
+      check_name: "check-session-accessor-boundary",
+      group: "session-accessor-boundary",
+      runner: "blacksmith-4vcpu-ubuntu-2404",
+    });
+
+    const runStep = additionalJob.steps.find((step) => step.name === "Run additional check shard");
+    expect(runStep.run).toContain("session-accessor-boundary)");
+    expect(runStep.run).toContain(
+      'run_check "lint:tmp:sqlite-transaction-boundary" pnpm run lint:tmp:sqlite-transaction-boundary',
+    );
+  });
+
   it("kills timed manual checkout fetches after the grace period", () => {
     const workflowPaths = [
       [".github/workflows/ci.yml", "120s"],

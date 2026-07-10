@@ -1687,6 +1687,7 @@
     "lint:tmp:session-accessor-boundary": "node scripts/check-session-accessor-boundary.mjs",
     "lint:tmp:session-accessor-boundary:gen": "node scripts/check-session-accessor-boundary.mjs --update-debt-baseline",
     "lint:tmp:session-transcript-reader-boundary": "node scripts/check-session-transcript-reader-boundary.mjs",
+    "lint:tmp:sqlite-transaction-boundary": "node scripts/check-sqlite-transaction-boundary.mjs",
     "lint:tmp:tsgo-core-boundary": "node scripts/check-tsgo-core-boundary.mjs",
     "lint:ui:no-raw-window-open": "node scripts/check-no-raw-window-open.mjs",
     "lint:web-fetch-provider-boundaries": "node scripts/check-web-fetch-provider-boundaries.mjs",
