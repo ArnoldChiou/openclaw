@@ -177,6 +177,16 @@ describe("session accessor seam", () => {
     expect(found).toEqual({ event: newer });
     expect(seen).toEqual([newer]);
 
+    await replaceSqliteTranscriptEvents(
+      { agentId: "main", sessionId: "session-falsy", sessionKey: "agent:main:falsy", storePath },
+      [false],
+    );
+    const falsy = await findTranscriptEvent(
+      { sessionId: "session-falsy", sessionKey: "agent:main:falsy", storePath },
+      () => true,
+    );
+    expect(falsy).toEqual({ event: false });
+
     const missing = await findTranscriptEvent(
       { sessionId: "session-absent", sessionKey: "agent:main:main", storePath },
       () => true,

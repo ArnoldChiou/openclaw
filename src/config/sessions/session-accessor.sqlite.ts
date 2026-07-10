@@ -4932,12 +4932,12 @@ function readTranscriptMessageByScopedIdempotencyKey(
   if (!found) {
     return undefined;
   }
-  const message = readTranscriptEventMessage(found);
+  const message = readTranscriptEventMessage(found.event);
   if (!message) {
     return undefined;
   }
   return {
-    messageId: readTranscriptEventId(found) ?? idempotencyKey,
+    messageId: readTranscriptEventId(found.event) ?? idempotencyKey,
     message,
   };
 }
@@ -5059,15 +5059,14 @@ export function findSqliteTranscriptEvent(
 ): { event: TranscriptEvent } | undefined {
   const resolved = resolveSqliteTranscriptReadScope(scope);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
-  const event = findSqliteTranscriptEventInDatabase(database, resolved.sessionId, match);
-  return event ? { event } : undefined;
+  return findSqliteTranscriptEventInDatabase(database, resolved.sessionId, match);
 }
 
 function findSqliteTranscriptEventInDatabase(
   database: OpenClawAgentDatabase,
   sessionId: string,
   match: (event: TranscriptEvent) => boolean,
-): TranscriptEvent | undefined {
+): { event: TranscriptEvent } | undefined {
   const db = getSessionKysely(database.db);
   const rows = executeSqliteQuerySync(
     database.db,
@@ -5081,7 +5080,7 @@ function findSqliteTranscriptEventInDatabase(
     try {
       const event = JSON.parse(row.event_json) as TranscriptEvent;
       if (match(event)) {
-        return event;
+        return { event };
       }
     } catch {
       // Malformed rows are skipped, matching transcript index tolerance.
