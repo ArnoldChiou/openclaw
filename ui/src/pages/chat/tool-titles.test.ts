@@ -88,24 +88,37 @@ describe("title fetch batching", () => {
     vi.useRealTimers();
   });
 
-  it("sends queued items with the session captured at schedule time", async () => {
+  it("sends queued items with the session and agent captured at schedule time", async () => {
     vi.useFakeTimers();
-    const requests: Array<{ sessionKey: string }> = [];
+    const requests: Array<{ sessionKey: string; agentId?: string }> = [];
     const client = {
       request: vi.fn(async (_method: string, params: unknown) => {
-        requests.push(params as { sessionKey: string });
+        requests.push(params as { sessionKey: string; agentId?: string });
         return { titles: {} };
       }),
     } as unknown as GatewayBrowserClient;
 
     // Pane A schedules, then pane B re-renders (and reconfigures) before the
-    // debounce fires; the request must keep pane A's session.
-    configureToolTitleFetcher({ client, sessionKey: "agent:a:main", onTitlesChanged: null });
+    // debounce fires; the request must keep pane A's session and agent.
+    configureToolTitleFetcher({
+      client,
+      sessionKey: "global",
+      agentId: "alice",
+      onTitlesChanged: null,
+    });
     getToolCallTitle("bash", { command: "pnpm run build --filter ui" });
-    configureToolTitleFetcher({ client, sessionKey: "agent:b:main", onTitlesChanged: null });
+    configureToolTitleFetcher({
+      client,
+      sessionKey: "agent:b:main",
+      agentId: "b",
+      onTitlesChanged: null,
+    });
     getToolCallTitle("bash", { command: "pnpm test ui/src/pages/chat" });
     await vi.advanceTimersByTimeAsync(1_000);
 
-    expect(requests.map((request) => request.sessionKey)).toEqual(["agent:a:main", "agent:b:main"]);
+    expect(requests).toEqual([
+      expect.objectContaining({ sessionKey: "global", agentId: "alice" }),
+      expect.objectContaining({ sessionKey: "agent:b:main", agentId: "b" }),
+    ]);
   });
 });

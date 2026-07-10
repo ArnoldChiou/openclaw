@@ -979,15 +979,16 @@ class ChatPane extends OpenClawLightDomElement {
     if (!state) {
       return html`<main class="app-shell app-shell--booting" aria-busy="true"></main>`;
     }
+    const currentAgentId = resolveChatAgentId(state);
     // Tool rows consult the global title store while rendering; point its
-    // fetcher at this pane's connection. Last-rendered pane wins, which is
-    // fine: titles are keyed by tool call content, not by session.
+    // fetcher at this pane's connection. Requests capture session + agent at
+    // schedule time, so later renders of other panes cannot re-route them.
     configureToolTitleFetcher({
       client: state.connected ? state.client : null,
       sessionKey: state.sessionKey || null,
+      agentId: currentAgentId || null,
       onTitlesChanged: () => state.requestUpdate?.(),
     });
-    const currentAgentId = resolveChatAgentId(state);
     const agentDefaultModel = this.context.agents.state.agentsList?.agents.find(
       (agent) => agent.id === currentAgentId,
     )?.model?.primary;

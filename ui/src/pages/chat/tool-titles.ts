@@ -21,13 +21,20 @@ const titlesByKey = new Map<string, string>();
 const pendingKeys = new Set<string>();
 const failedKeys = new Set<string>();
 
-type PendingItem = { key: string; name: string; input: string; sessionKey: string };
+type PendingItem = {
+  key: string;
+  name: string;
+  input: string;
+  sessionKey: string;
+  agentId: string | null;
+};
 type ToolTitlesResult = { titles?: Record<string, string> };
 
 let queue = new Map<string, PendingItem>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let activeClient: GatewayBrowserClient | null = null;
 let activeSessionKey: string | null = null;
+let activeAgentId: string | null = null;
 let notifyUpdate: (() => void) | null = null;
 
 /** FNV-1a over name + serialized args; stable across renders of one call. */
@@ -105,10 +112,13 @@ export function getToolCallTitle(name: string, args: unknown): string | undefine
 export function configureToolTitleFetcher(params: {
   client: GatewayBrowserClient | null;
   sessionKey: string | null;
+  /** Selected agent; required for global-session keys where the gateway would otherwise resolve the default agent. */
+  agentId?: string | null;
   onTitlesChanged: (() => void) | null;
 }): void {
   activeClient = params.client;
   activeSessionKey = params.sessionKey;
+  activeAgentId = params.agentId ?? null;
   notifyUpdate = params.onTitlesChanged;
 }
 
@@ -132,6 +142,7 @@ function scheduleTitleRequest(name: string, request: { key: string; input: strin
     name,
     input: request.input,
     sessionKey: activeSessionKey,
+    agentId: activeAgentId,
   });
   flushTimer ??= setTimeout(() => {
     flushTimer = null;
@@ -145,16 +156,20 @@ async function flushTitleQueue(): Promise<void> {
     queue = new Map();
     return;
   }
-  // One request per captured session; other sessions' items stay queued for
-  // the follow-up flush.
-  const sessionKey = queue.values().next().value?.sessionKey;
-  if (!sessionKey) {
+  // One request per captured session + agent; other panes' items stay queued
+  // for the follow-up flush.
+  const head = queue.values().next().value;
+  if (!head) {
     queue = new Map();
     return;
   }
   const batch: PendingItem[] = [];
   for (const item of queue.values()) {
-    if (item.sessionKey === sessionKey && batch.length < MAX_ITEMS_PER_REQUEST) {
+    if (
+      item.sessionKey === head.sessionKey &&
+      item.agentId === head.agentId &&
+      batch.length < MAX_ITEMS_PER_REQUEST
+    ) {
       batch.push(item);
     }
   }
@@ -165,7 +180,8 @@ async function flushTitleQueue(): Promise<void> {
   const hasBacklog = queue.size > 0;
   try {
     const result = await client.request<ToolTitlesResult>("chat.toolTitles", {
-      sessionKey,
+      sessionKey: head.sessionKey,
+      ...(head.agentId ? { agentId: head.agentId } : {}),
       items: batch.map((item) => ({ id: item.key, name: item.name, input: item.input })),
     });
     const titles = result?.titles ?? {};

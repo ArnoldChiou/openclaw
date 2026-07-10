@@ -41,6 +41,8 @@ export type ToolStreamEntry = {
   /** Structured result details (e.g. edit diff) captured from the result event. */
   details?: unknown;
   isError?: boolean;
+  /** True once a result event landed, even when the output text is empty. */
+  resultReceived?: boolean;
   startedAt: number;
   updatedAt: number;
   message: Record<string, unknown>;
@@ -251,11 +253,13 @@ function buildToolStreamMessage(entry: ToolStreamEntry): Record<string, unknown>
     name: entry.name,
     arguments: entry.args ?? {},
   });
-  if (entry.output) {
+  // Emit the result block whenever a result landed, even with empty output;
+  // otherwise a completed no-stdout command keeps its running state in the UI.
+  if (entry.output || entry.resultReceived) {
     content.push({
       type: "toolresult",
       name: entry.name,
-      text: entry.output,
+      text: entry.output ?? "",
       ...(entry.details !== undefined ? { details: entry.details } : {}),
       ...(entry.isError !== undefined ? { isError: entry.isError } : {}),
     });
@@ -749,6 +753,7 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
       output: output || undefined,
       ...(resultDetails !== undefined ? { details: resultDetails } : {}),
       ...(resultIsError !== undefined ? { isError: resultIsError } : {}),
+      ...(phase === "result" ? { resultReceived: true } : {}),
       startedAt: typeof payload.ts === "number" ? payload.ts : now,
       updatedAt: now,
       message: {},
@@ -768,6 +773,9 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
     }
     if (resultIsError !== undefined) {
       entry.isError = resultIsError;
+    }
+    if (phase === "result") {
+      entry.resultReceived = true;
     }
     entry.updatedAt = now;
   }
