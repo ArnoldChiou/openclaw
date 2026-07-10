@@ -17,14 +17,18 @@
     "newSession.worktree",
     "newSession.worktreeName",
     "newSession.worktreeNameInvalid",
-    "newSession.worktreeUnavailable"
+    "newSession.worktreeUnavailable",
+    "sessionsView.deletePreservedWorktreeConfirm",
+    "worktrees.newWorktree",
+    "worktrees.owner",
+    "worktrees.ownerManual"
   ],
-  "generatedAt": "2026-07-10T08:26:04.621Z",
+  "generatedAt": "2026-07-10T08:37:22.598Z",
   "locale": "ru",
   "model": "gpt-5.5",
   "provider": "openai",
-  "sourceHash": "f5f578a2cc80ca22d6b2cbce832cc122ee18fe733ab91d738f7577ed398c4ea5",
-  "totalKeys": 1801,
-  "translatedKeys": 1783,
+  "sourceHash": "d24fb070fb1648f80852a30d69d4d51b81ca018518a0188967b4d441ec23961d",
+  "totalKeys": 1807,
+  "translatedKeys": 1785,
   "workflow": 1
 }
