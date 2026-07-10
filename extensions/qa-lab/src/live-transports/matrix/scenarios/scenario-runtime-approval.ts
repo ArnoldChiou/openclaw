@@ -384,7 +384,7 @@ async function requestPluginApproval(params: { context: MatrixQaScenarioContext;
     {
       agentId: "qa",
       description: `Matrix plugin approval QA request ${params.token}`,
-      pluginId: "qa-matrix-plugin",
+      pluginId: "matrix-qa-plugin",
       severity: "warning",
       timeoutMs: MATRIX_QA_APPROVAL_DECISION_TIMEOUT_MS,
       title: "Matrix plugin approval QA",
@@ -626,7 +626,7 @@ export async function runApprovalPluginMetadataSingleEventScenario(
   });
   const approvalMetadata = approval.event.approval;
   if (
-    approvalMetadata?.pluginId !== "qa-matrix-plugin" ||
+    approvalMetadata?.pluginId !== "matrix-qa-plugin" ||
     approvalMetadata.toolName !== "matrix_qa_tool" ||
     approvalMetadata.severity !== "warning" ||
     approvalMetadata.agentId !== "qa"
