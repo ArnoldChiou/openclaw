@@ -1221,15 +1221,14 @@ async function waitForLaunchAgentStopped(serviceTarget: string): Promise<LaunchA
 
 async function waitForLaunchAgentRunning(serviceTarget: string): Promise<LaunchAgentProbeResult> {
   const deadline = Date.now() + LAUNCH_AGENT_QUIESCE_TIMEOUT_MS;
-  let lastState: LaunchAgentProbeResult = { state: "unknown", detail: "not probed" };
   while (true) {
-    lastState = await probeLaunchAgentState(serviceTarget);
-    if (lastState.state === "running") {
-      return lastState;
+    const state = await probeLaunchAgentState(serviceTarget);
+    if (state.state === "running") {
+      return state;
     }
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
-      return lastState;
+      return state;
     }
     await sleep(Math.min(LAUNCH_AGENT_STOP_PORT_RELEASE_POLL_MS, remainingMs));
   }
