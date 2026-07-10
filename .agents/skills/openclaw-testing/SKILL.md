@@ -150,7 +150,7 @@ commands.
   tools to require an IMDSv2 token, prove the IAM credentials endpoint returns
   404, and compare remote `git rev-parse HEAD` with the full reviewed head SHA.
   Unset all `CRABBOX_TAILSCALE*` overrides, pass `--network public
-  --tailscale=false`, clear exit-node/LAN flags, then require `crabbox inspect`
+--tailscale=false`, clear exit-node/LAN flags, then require `crabbox inspect`
   to report `network=public` and no Tailscale state before uploading any script.
   Upload trusted `scripts/crabbox-untrusted-bootstrap.sh` with `--fresh-pr`; it
   bootstraps Node 24 and repository-pinned pnpm before executing PR code and
@@ -448,18 +448,14 @@ fails.
 `pnpm openclaw qa matrix` defaults to `--profile all`. Do not assume the CLI
 default is the fast release path. Use explicit profiles:
 
-- `--profile fast`: release-critical Matrix transport contract; add
-  `--fail-fast` only when the target CLI supports it
-- `--profile transport|media|e2ee-smoke|e2ee-deep|e2ee-cli`: sharded full
-  Matrix proof
-- `OPENCLAW_QA_MATRIX_NO_REPLY_WINDOW_MS=3000`: CI-friendly no-reply quiet
-  window when paired with fast or sharded gates
+- `--profile fast|release`: focused release-critical scenarios
+- `--profile transport|all`: broad Matrix proof
+- repeated `--scenario <id>` flags: explicit scenario selection
 
-`QA-Lab - All Lanes` uses explicit fast Matrix on scheduled runs; manual
-dispatch keeps `matrix_profile=all` as the default and always shards that full
-Matrix selection. `OpenClaw Release Checks` uses explicit fast Matrix; run the
-all-lanes workflow when release investigation needs full Matrix media/E2EE
-inventory.
+`QA-Lab - All Lanes` and `OpenClaw Release Checks` use the same QA Lab selector
+and standard artifacts. Manual dispatch keeps `matrix_profile=all` as the
+default and fans it across the transport, media, and E2EE profiles; focused
+dispatches select `fast`, `release`, or `transport`.
 
 ### Reusable Live/E2E Checks
 
