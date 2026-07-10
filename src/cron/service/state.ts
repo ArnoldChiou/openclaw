@@ -203,6 +203,8 @@ export type CronServiceState = {
   timer: NodeJS.Timeout | null;
   running: boolean;
   stopped: boolean;
+  schedulingPaused: boolean;
+  schedulerStarted: boolean;
   restartRecoveryPending: boolean;
   /** Prevents maintenance reads from advancing deferred startup catch-up slots.
    * Entries are removed when the deferred job runs or becomes irrelevant. */
@@ -230,6 +232,8 @@ export function createCronServiceState(deps: CronServiceDeps): CronServiceState 
     timer: null,
     running: false,
     stopped: false,
+    schedulingPaused: false,
+    schedulerStarted: false,
     restartRecoveryPending: false,
     pendingCatchupDeferralJobIds: new Set<string>(),
     activeManualRunJobIds: new Set<string>(),

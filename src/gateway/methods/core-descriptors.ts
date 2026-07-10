@@ -273,6 +273,15 @@ export const CORE_GATEWAY_METHOD_SPECS: readonly CoreGatewayMethodSpec[] = [
   { name: "agents.workspace.list", scope: "operator.read" },
   { name: "agents.workspace.get", scope: "operator.read" },
   { name: "tts.speak", scope: "operator.write" },
+  {
+    name: "gateway.suspend.prepare",
+    scope: "operator.admin",
+    startup: true,
+    controlPlaneWrite: true,
+  },
+  { name: "gateway.suspend.status", scope: "operator.read" },
+  // Resume is the safety escape hatch and must not sit behind write-rate limiting.
+  { name: "gateway.suspend.resume", scope: "operator.admin" },
 ] as const;
 
 const CORE_GATEWAY_METHOD_SPEC_BY_NAME: ReadonlyMap<string, CoreGatewayMethodSpec> = new Map(

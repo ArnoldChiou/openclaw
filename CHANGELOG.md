@@ -6,6 +6,7 @@ Docs: https://docs.openclaw.ai
 
 ### Changes
 
+- **Gateway host suspension:** add an operator-scoped prepare/status/resume handshake that fences new user work, reports active blockers, pauses cron scheduling, and automatically resumes expired leases for snapshot and freeze controllers. (#86876)
 - **OpenAI GPT-5.6 defaults:** use `openai/gpt-5.6` (Sol alias) for fresh API-key setup and exact `openai/gpt-5.6-sol` for fresh Codex/OAuth setup, while preserving existing primaries, fallbacks, aliases, and explicit GPT-5.5 selections. (#103234)
 - **Meta provider:** add bundled `muse-spark-1.1` model support with Responses API streaming, tool calls, encrypted reasoning replay, onboarding, and standalone npm/ClawHub distribution. (#102873) Thanks @HamidShojanazeri.
 - **Android chat agent selector:** switch the active agent directly from the live chat screen while keeping chat, Talk mode, and home canvas on the same canonical session. (#80422) Thanks @bcperry.

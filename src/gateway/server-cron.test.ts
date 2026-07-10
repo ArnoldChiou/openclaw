@@ -6,6 +6,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CliDeps } from "../cli/deps.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { SsrFBlockedError } from "../infra/net/ssrf.js";
+import {
+  getActiveGatewayRootWorkCount,
+  resetGatewayWorkAdmission,
+} from "../process/gateway-work-admission.js";
 
 type RunCronIsolatedAgentTurnMock = (params: {
   abortSignal?: AbortSignal;
@@ -250,6 +254,14 @@ function lastMockCall(mock: { mock: { calls: Array<Array<unknown>> } }, label: s
   return call;
 }
 
+function createVoidDeferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve = () => {};
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 function expectHookContext(callIndex: number, fields: { config?: unknown; hasGetCron?: boolean }) {
   const context = requireRecord(
     callArg(runCronChangedMock, callIndex, 1, "cron_changed context"),
@@ -423,6 +435,39 @@ describe("buildGatewayCronService", () => {
       expectHookContext(0, { config: cfg, hasGetCron: true });
     } finally {
       state.cron.stop();
+    }
+  });
+
+  it("keeps detached cron_changed hooks root-admitted until they settle", async () => {
+    resetGatewayWorkAdmission();
+    const deferred = createVoidDeferred();
+    runCronChangedMock.mockImplementationOnce(async () => await deferred.promise);
+    const cfg = createCronConfig("server-cron-hook-admission");
+    loadConfigMock.mockReturnValue(cfg);
+    const state = buildGatewayCronService({
+      cfg,
+      deps: {} as CliDeps,
+      broadcast: () => {},
+    });
+
+    try {
+      await state.cron.add({
+        name: "held hook",
+        enabled: true,
+        schedule: { kind: "every", everyMs: 60_000 },
+        sessionTarget: "main",
+        wakeMode: "next-heartbeat",
+        payload: { kind: "systemEvent", text: "hello" },
+      });
+      await vi.waitFor(() => expect(runCronChangedMock).toHaveBeenCalledTimes(1));
+      expect(getActiveGatewayRootWorkCount()).toBe(1);
+
+      deferred.resolve();
+      await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
+    } finally {
+      deferred.resolve();
+      state.cron.stop();
+      resetGatewayWorkAdmission();
     }
   });
 
