@@ -916,6 +916,7 @@ type PreManagedServiceStop = {
   serviceMatchesMutationRoot?: boolean;
   blockMessage?: string;
   serviceEnv?: NodeJS.ProcessEnv;
+  restoreAfterUpdateFailure?: () => Promise<void>;
   windowsTaskAutoStartRecovery?: WindowsTaskAutoStartRecovery;
 };
 
@@ -1272,12 +1273,14 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     serviceEnv: serviceState.env,
   });
   const quiesceLaunchAgent = process.platform === "darwin";
+  let restoreAfterUpdateFailure: (() => Promise<void>) | undefined;
   try {
-    await service.stop({
+    const stopResult = await service.stop({
       env: serviceState.env,
       stdout: serviceControlStdoutForMode(params.jsonMode),
       ...(quiesceLaunchAgent ? { quiesce: true } : {}),
     });
+    restoreAfterUpdateFailure = stopResult?.restoreAfterUpdateFailure;
     if (windowsTaskAutoStartRecovery) {
       await abortWindowsTaskUpdateIfInterrupted(windowsTaskAutoStartRecovery);
     }
@@ -1310,27 +1313,34 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     running: serviceState.running,
     ...serviceOwnership,
     serviceEnv: serviceState.env,
+    ...(restoreAfterUpdateFailure ? { restoreAfterUpdateFailure } : {}),
     ...(windowsTaskAutoStartRecovery ? { windowsTaskAutoStartRecovery } : {}),
   };
 }
 
-async function maybeRestartServiceAfterFailedMutableUpdate(params: {
+async function maybeRestoreServiceAfterFailedMutableUpdate(params: {
   preManagedServiceStop: PreManagedServiceStop | undefined;
   jsonMode: boolean;
 }): Promise<void> {
   if (!params.preManagedServiceStop?.stopped || !params.preManagedServiceStop.serviceEnv) {
     return;
   }
+  const exactRestore = params.preManagedServiceStop.restoreAfterUpdateFailure;
   try {
-    await resolveGatewayService().restart({
-      env: params.preManagedServiceStop.serviceEnv,
-      stdout: serviceControlStdoutForMode(params.jsonMode),
-    });
+    if (exactRestore) {
+      await exactRestore();
+    } else {
+      await resolveGatewayService().restart({
+        env: params.preManagedServiceStop.serviceEnv,
+        stdout: serviceControlStdoutForMode(params.jsonMode),
+      });
+    }
     if (!params.jsonMode) {
-      defaultRuntime.log(theme.muted("Restarted managed gateway service after failed update."));
+      const action = exactRestore ? "Restored" : "Restarted";
+      defaultRuntime.log(theme.muted(`${action} managed gateway service after failed update.`));
     }
   } catch (err) {
-    const message = `Failed to restart managed gateway service after failed update: ${String(err)}`;
+    const message = `Failed to restore managed gateway service after failed update: ${String(err)}`;
     if (params.jsonMode) {
       defaultRuntime.error(message);
     } else {
@@ -4311,7 +4321,7 @@ async function updateCommandInternal(
         err,
       );
     }
-    await maybeRestartServiceAfterFailedMutableUpdate({
+    await maybeRestoreServiceAfterFailedMutableUpdate({
       preManagedServiceStop,
       jsonMode: Boolean(opts.json),
     });
@@ -4332,7 +4342,7 @@ async function updateCommandInternal(
       result,
       jsonMode: Boolean(opts.json),
     });
-    await maybeRestartServiceAfterFailedMutableUpdate({
+    await maybeRestoreServiceAfterFailedMutableUpdate({
       preManagedServiceStop,
       jsonMode: Boolean(opts.json),
     });
@@ -4349,7 +4359,7 @@ async function updateCommandInternal(
       result,
       jsonMode: Boolean(opts.json),
     });
-    await maybeRestartServiceAfterFailedMutableUpdate({
+    await maybeRestoreServiceAfterFailedMutableUpdate({
       preManagedServiceStop,
       jsonMode: Boolean(opts.json),
     });

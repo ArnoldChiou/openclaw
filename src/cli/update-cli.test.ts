@@ -3901,6 +3901,41 @@ describe("update-cli", () => {
     expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
   });
 
+  it("uses the LaunchAgent rollback when package mutation fails after quiescence", async () => {
+    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const restoreAfterUpdateFailure = vi.fn(async () => {});
+    mockPackageInstallStatus(createCaseDir("openclaw-update-post-quiescence-failure"));
+    serviceReadCommand.mockResolvedValue({
+      programArguments: ["openclaw", "gateway", "run"],
+    });
+    serviceLoaded.mockResolvedValue(true);
+    serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+    serviceStop.mockResolvedValueOnce({ restoreAfterUpdateFailure });
+    vi.mocked(runCommandWithTimeout).mockImplementation(async (argv) => {
+      if (argv[0] === "npm" && argv[1] === "i" && argv[2] === "-g") {
+        throw new Error("package mutation failed");
+      }
+      return {
+        stdout: "",
+        stderr: "",
+        code: 0,
+        signal: null,
+        killed: false,
+        termination: "exit",
+      };
+    });
+
+    try {
+      await expect(updateCommand({ yes: true })).rejects.toThrow("package mutation failed");
+    } finally {
+      platformSpy.mockRestore();
+    }
+
+    expect(serviceStop).toHaveBeenCalledWith(expect.objectContaining({ quiesce: true }));
+    expect(restoreAfterUpdateFailure).toHaveBeenCalledOnce();
+    expect(serviceRestart).not.toHaveBeenCalled();
+  });
+
   it.each(["linux", "win32"] as const)(
     "does not quiesce or recovery-restart a stopped loaded %s service outside a managed-update handoff",
     async (platform) => {

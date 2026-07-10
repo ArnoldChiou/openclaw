@@ -36,6 +36,12 @@ export type GatewayServiceControlArgs = {
   warn?: (message: string) => void;
 };
 
+export type GatewayServiceStopResult = {
+  // Quiescence can temporarily change persistent supervisor state. The owner
+  // returns its exact rollback so a later update failure does not guess with restart.
+  restoreAfterUpdateFailure?: () => Promise<void>;
+};
+
 export type GatewayServiceRestartResult = { outcome: "completed" } | { outcome: "scheduled" };
 
 export type GatewayServiceEnvArgs = {

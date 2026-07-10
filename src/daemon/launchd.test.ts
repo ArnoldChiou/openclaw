@@ -32,12 +32,14 @@ const state = vi.hoisted(() => ({
   listOutput: "",
   printOutput: "",
   printNotLoadedRemaining: 0,
+  printStoppedRemaining: 0,
   printError: "",
   printCode: 1,
   printFailuresRemaining: 0,
   bootstrapError: "",
   bootstrapCode: 1,
   bootstrapLoadsServiceOnFailure: false,
+  bootstrapStartsService: true,
   kickstartError: "",
   kickstartCode: 1,
   kickstartFailuresRemaining: 0,
@@ -180,13 +182,14 @@ async function runStopLaunchAgentWithFakeTimers(args: Parameters<typeof stopLaun
   vi.useFakeTimers();
   try {
     const stopPromise = stopLaunchAgent(args)
-      .then(() => ({ ok: true as const }))
+      .then((value) => ({ ok: true as const, value }))
       .catch((error: unknown) => ({ ok: false as const, error }));
     await vi.runAllTimersAsync();
     const result = await stopPromise;
     if (!result.ok) {
       throw result.error;
     }
+    return result.value;
   } finally {
     vi.useRealTimers();
   }
@@ -260,6 +263,10 @@ vi.mock("./exec-file.js", () => ({
       if (state.printOutput) {
         return { stdout: state.printOutput, stderr: "", code: 0 };
       }
+      if (state.printStoppedRemaining > 0) {
+        state.printStoppedRemaining -= 1;
+        return { stdout: ["state = waiting", "pid = 0"].join("\n"), stderr: "", code: 0 };
+      }
       if (!state.serviceRunning) {
         return { stdout: ["state = waiting", "pid = 0"].join("\n"), stderr: "", code: 0 };
       }
@@ -318,7 +325,7 @@ vi.mock("./exec-file.js", () => ({
         return { stdout: "", stderr: state.bootstrapError, code: state.bootstrapCode };
       }
       state.serviceLoaded = true;
-      state.serviceRunning = true;
+      state.serviceRunning = state.bootstrapStartsService;
       return { stdout: "", stderr: "", code: 0 };
     }
     if (call[0] === "kickstart") {
@@ -418,12 +425,14 @@ beforeEach(() => {
   state.listOutput = "";
   state.printOutput = "";
   state.printNotLoadedRemaining = 0;
+  state.printStoppedRemaining = 0;
   state.printError = "";
   state.printCode = 1;
   state.printFailuresRemaining = 0;
   state.bootstrapError = "";
   state.bootstrapCode = 1;
   state.bootstrapLoadsServiceOnFailure = false;
+  state.bootstrapStartsService = true;
   state.kickstartError = "";
   state.kickstartCode = 1;
   state.kickstartFailuresRemaining = 0;
@@ -1622,6 +1631,7 @@ describe("launchd install", () => {
       ["print", serviceId],
       ["enable", serviceId],
       ["bootstrap", domain, resolveLaunchAgentPlistPath(env)],
+      ["print", serviceId],
     ]);
     expect(state.serviceLoaded).toBe(true);
     expect(state.serviceRunning).toBe(true);
@@ -1657,10 +1667,99 @@ describe("launchd install", () => {
       ["enable", serviceId],
       ["bootstrap", domain, resolveLaunchAgentPlistPath(env)],
       ["disable", serviceId],
+      ["print", serviceId],
     ]);
     expect(state.disabledOverride).toBe("disabled");
     expect(state.serviceLoaded).toBe(true);
     expect(state.serviceRunning).toBe(true);
+  });
+
+  it("restores an initially disabled stopped LaunchAgent after later update failure", async () => {
+    const env = createDefaultLaunchdEnv();
+    state.disabledOverride = "disabled";
+    state.serviceRunning = false;
+
+    const stopResult = await runStopLaunchAgentWithFakeTimers({
+      env,
+      stdout: new PassThrough(),
+      quiesce: true,
+    });
+    const restore = stopResult?.restoreAfterUpdateFailure;
+    if (!restore) {
+      throw new Error("expected launchd quiescence rollback");
+    }
+    expect(state.serviceLoaded).toBe(false);
+    expect(state.disabledOverride).toBe("disabled");
+
+    await restore();
+
+    expect(launchctlCommandNames().slice(-7)).toEqual([
+      "print",
+      "enable",
+      "bootstrap",
+      "disable",
+      "print",
+      "stop",
+      "print",
+    ]);
+    expect(state.disabledOverride).toBe("disabled");
+    expect(state.serviceLoaded).toBe(true);
+    expect(state.serviceRunning).toBe(false);
+    const restoredCallCount = state.launchctlCalls.length;
+    await restore();
+    expect(state.launchctlCalls).toHaveLength(restoredCallCount);
+  });
+
+  it("waits for an initially running LaunchAgent to finish restoring", async () => {
+    const stopResult = await runStopLaunchAgentWithFakeTimers({
+      env: createDefaultLaunchdEnv(),
+      stdout: new PassThrough(),
+      quiesce: true,
+    });
+    const restore = stopResult?.restoreAfterUpdateFailure;
+    if (!restore) {
+      throw new Error("expected launchd quiescence rollback");
+    }
+    state.printStoppedRemaining = 2;
+
+    await restore();
+
+    expect(state.printStoppedRemaining).toBe(0);
+    expect(state.serviceLoaded).toBe(true);
+    expect(state.serviceRunning).toBe(true);
+  });
+
+  it("rejects restoration when an initially running LaunchAgent stays stopped", async () => {
+    const stopResult = await runStopLaunchAgentWithFakeTimers({
+      env: createDefaultLaunchdEnv(),
+      stdout: new PassThrough(),
+      quiesce: true,
+    });
+    const restore = stopResult?.restoreAfterUpdateFailure;
+    if (!restore) {
+      throw new Error("expected launchd quiescence rollback");
+    }
+    state.bootstrapStartsService = false;
+
+    let failure: unknown;
+    vi.useFakeTimers();
+    try {
+      const restorePromise = restore().catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      failure = await restorePromise;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure).toMatchObject({
+      errors: [
+        expect.objectContaining({
+          message: "launchctl rollback did not restore the running LaunchAgent",
+        }),
+      ],
+    });
+    expect(state.serviceLoaded).toBe(true);
+    expect(state.serviceRunning).toBe(false);
   });
 
   it("preserves an initially disabled stopped LaunchAgent after failed quiescence", async () => {
