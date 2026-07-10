@@ -139,6 +139,8 @@ export type ToolCard = {
   /** Structured tool result details (e.g. the edit tool's precomputed diff). */
   details?: unknown;
   isError?: boolean;
+  /** True when the card comes from the live tool stream of the current run. */
+  live?: boolean;
   messageId?: string;
   preview?: {
     kind: "canvas";

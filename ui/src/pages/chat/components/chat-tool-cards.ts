@@ -640,7 +640,14 @@ function resolveCollapsedToolSummaryParts(params: {
 }
 
 export function isRunningToolCard(card: ToolCard, runActive: boolean | undefined): boolean {
-  return runActive === true && card.outputText === undefined && !isToolCardError(card);
+  // Only live tool-stream cards can be running; historical transcript calls
+  // without results (aborted runs) must stay inert during later runs.
+  return (
+    runActive === true &&
+    card.live === true &&
+    card.outputText === undefined &&
+    !isToolCardError(card)
+  );
 }
 
 /** Plain-text row label, e.g. for the group header while a tool is running. */

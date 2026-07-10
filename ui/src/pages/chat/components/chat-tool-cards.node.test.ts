@@ -527,3 +527,30 @@ describe("tool-card canvas URLs", () => {
     );
   });
 });
+
+describe("isRunningToolCard", () => {
+  it("marks only live output-less cards as running while a run is active", async () => {
+    const { isRunningToolCard } = await import("./chat-tool-cards.ts");
+    const liveCard = { id: "t:1", name: "bash", live: true } as const;
+    const historicalCard = { id: "t:2", name: "bash" } as const;
+
+    expect(isRunningToolCard(liveCard, true)).toBe(true);
+    // Historical transcript calls without results (e.g. aborted runs) must
+    // stay inert when a later run is active in the same session.
+    expect(isRunningToolCard(historicalCard, true)).toBe(false);
+    expect(isRunningToolCard(liveCard, false)).toBe(false);
+    expect(isRunningToolCard({ ...liveCard, outputText: "" }, true)).toBe(false);
+  });
+
+  it("threads the live marker from tool-stream messages into cards", () => {
+    const cards = extractToolCards({
+      role: "assistant",
+      toolCallId: "call-live",
+      __openclawToolStreamLive: true,
+      content: [{ type: "toolcall", name: "bash", arguments: { command: "sleep 5" } }],
+    });
+
+    expect(cards).toHaveLength(1);
+    expect(cards[0].live).toBe(true);
+  });
+});

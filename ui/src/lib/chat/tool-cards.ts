@@ -269,6 +269,7 @@ export function extractToolCards(message: unknown, prefix = "tool"): ToolCard[] 
   const m = message as Record<string, unknown>;
   const content = normalizeContent(m.content);
   const messageIsError = readToolErrorFlag(m);
+  const isLiveToolStream = m["__openclawToolStreamLive"] === true;
   const cards: ToolCard[] = [];
   const fallbackMatchedCards = new WeakSet<ToolCard>();
   const transcriptMessageId = resolveTranscriptMessageId(m);
@@ -288,6 +289,7 @@ export function extractToolCards(message: unknown, prefix = "tool"): ToolCard[] 
         name: resolveToolName(item, m),
         args,
         inputText: serializeToolInput(args),
+        ...(isLiveToolStream ? { live: true } : {}),
         messageId: transcriptMessageId,
       });
       continue;
