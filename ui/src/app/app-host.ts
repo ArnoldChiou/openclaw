@@ -25,6 +25,7 @@ import {
   type CommandPalette,
   type CommandPaletteTargetDetail,
 } from "../components/command-palette.ts";
+import "../components/new-session-dialog.ts";
 import { renderSettingsSidebar } from "../components/settings-sidebar.ts";
 import type { ThemeModeChangeDetail } from "../components/theme-mode-toggle.ts";
 import { t } from "../i18n/index.ts";
@@ -363,6 +364,7 @@ class OpenClawShell extends OpenClawLightDomElement {
   @property({ attribute: false }) onboarding = false;
 
   @state() private navDrawerOpen = false;
+  @state() private newSessionDraft: { agentId: string } | null = null;
   @state() private activeSessionKey = "";
   @state() private settingsSearchQuery = "";
   @state() private routeState: ShellRouteState = {};
@@ -801,6 +803,18 @@ class OpenClawShell extends OpenClawLightDomElement {
         }}
         .onSlashCommand=${this.handleCommandPaletteSlashCommand}
       ></openclaw-command-palette>
+      <openclaw-new-session-dialog
+        .open=${this.newSessionDraft !== null}
+        .initialAgentId=${this.newSessionDraft?.agentId ?? ""}
+        .onClose=${() => {
+          this.newSessionDraft = null;
+        }}
+        .onCreated=${(sessionKey: string) => {
+          this.newSessionDraft = null;
+          context.gateway.setSessionKey(sessionKey);
+          this.navigate("chat", { search: searchForSession(sessionKey) });
+        }}
+      ></openclaw-new-session-dialog>
       <div
         class="shell ${activeRoute === "chat" ? "shell--chat" : ""} ${navCollapsed
           ? "shell--nav-collapsed"
@@ -881,6 +895,10 @@ class OpenClawShell extends OpenClawLightDomElement {
                 .gatewayVersion=${context.config.current.serverVersion ??
                 gatewaySnapshot.hello?.server?.version ??
                 null}
+                .onOpenNewSession=${(agentId: string) => {
+                  this.newSessionDraft = { agentId };
+                }}
+                .draftSessionAgentId=${this.newSessionDraft?.agentId ?? ""}
                 .onToggleMore=${() =>
                   context.navigation.update({
                     sidebarMoreExpanded: !context.navigation.snapshot.sidebarMoreExpanded,
