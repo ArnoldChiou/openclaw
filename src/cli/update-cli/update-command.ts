@@ -1321,11 +1321,17 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
 async function maybeRestoreServiceAfterFailedMutableUpdate(params: {
   preManagedServiceStop: PreManagedServiceStop | undefined;
   jsonMode: boolean;
+  exactStateOnly?: boolean;
 }): Promise<void> {
   if (!params.preManagedServiceStop?.stopped || !params.preManagedServiceStop.serviceEnv) {
     return;
   }
   const exactRestore = params.preManagedServiceStop.restoreAfterUpdateFailure;
+  // Post-core failures preserve an already-stopped generic service. Only the
+  // owner callback can reconstruct launchd's persistent enabled/loaded state.
+  if (!exactRestore && params.exactStateOnly) {
+    return;
+  }
   try {
     if (exactRestore) {
       await exactRestore();
@@ -4452,6 +4458,11 @@ async function updateCommandInternal(
       if (!(await restoreWindowsTaskAutoStartOrExit(preManagedServiceStop))) {
         return;
       }
+      await maybeRestoreServiceAfterFailedMutableUpdate({
+        preManagedServiceStop,
+        jsonMode: Boolean(opts.json),
+        exactStateOnly: true,
+      });
       defaultRuntime.exit(freshProcessResult.exitCode);
       throw new Error(`post-update process exited with code ${freshProcessResult.exitCode}`);
     }
@@ -4530,6 +4541,11 @@ async function updateCommandInternal(
     if (!(await restoreWindowsTaskAutoStartOrExit(preManagedServiceStop))) {
       return;
     }
+    await maybeRestoreServiceAfterFailedMutableUpdate({
+      preManagedServiceStop,
+      jsonMode: Boolean(opts.json),
+      exactStateOnly: true,
+    });
     await writeControlPlaneUpdateRestartSentinelBestEffort({
       meta: controlPlaneUpdateSentinelMeta,
       result: resultWithPostUpdate,

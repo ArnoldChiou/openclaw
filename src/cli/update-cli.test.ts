@@ -3936,6 +3936,71 @@ describe("update-cli", () => {
     expect(serviceRestart).not.toHaveBeenCalled();
   });
 
+  it("uses the LaunchAgent rollback when the fresh post-core process exits non-zero", async () => {
+    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const restoreAfterUpdateFailure = vi.fn(async () => {});
+    const { root } = setupUpdatedRootRefresh();
+    mockPackageInstallStatus(root);
+    serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+    serviceStop.mockResolvedValueOnce({ restoreAfterUpdateFailure });
+    spawn.mockImplementationOnce(() => {
+      const child = new EventEmitter() as EventEmitter & {
+        once: EventEmitter["once"];
+      };
+      queueMicrotask(() => {
+        child.emit("exit", 2, null);
+      });
+      return child;
+    });
+
+    try {
+      await expect(updateCommand({ yes: true })).rejects.toThrow(
+        "post-update process exited with code 2",
+      );
+    } finally {
+      platformSpy.mockRestore();
+    }
+
+    expect(serviceStop).toHaveBeenCalledWith(expect.objectContaining({ quiesce: true }));
+    expect(restoreAfterUpdateFailure).toHaveBeenCalledOnce();
+    expect(serviceRestart).not.toHaveBeenCalled();
+  });
+
+  it("uses the LaunchAgent rollback when current-process plugin convergence fails", async () => {
+    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const restoreAfterUpdateFailure = vi.fn(async () => {});
+    const { root } = setupUpdatedRootRefresh();
+    mockPackageInstallStatus(root);
+    readPackageVersion.mockResolvedValue("2026.7.10");
+    serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+    serviceStop.mockResolvedValueOnce({ restoreAfterUpdateFailure });
+    runPostCorePluginConvergenceSpy.mockResolvedValueOnce({
+      changes: [],
+      warnings: [
+        {
+          pluginId: "demo",
+          reason: "plugin smoke failed",
+          message: "plugin smoke failed",
+          guidance: ["Run openclaw update repair."],
+        },
+      ],
+      errored: true,
+      smokeFailures: [],
+      installRecords: {},
+    });
+
+    try {
+      await updateCommand({ channel: "extended-stable", yes: true, json: true });
+    } finally {
+      platformSpy.mockRestore();
+    }
+
+    expect(serviceStop).toHaveBeenCalledWith(expect.objectContaining({ quiesce: true }));
+    expect(restoreAfterUpdateFailure).toHaveBeenCalledOnce();
+    expect(serviceRestart).not.toHaveBeenCalled();
+    expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
+  });
+
   it.each(["linux", "win32"] as const)(
     "does not quiesce or recovery-restart a stopped loaded %s service outside a managed-update handoff",
     async (platform) => {
