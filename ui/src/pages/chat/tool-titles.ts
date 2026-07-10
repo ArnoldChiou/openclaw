@@ -20,6 +20,13 @@ const MIN_GENERIC_INPUT_CHARS_FOR_TITLE = 120;
 const titlesByKey = new Map<string, string>();
 const pendingKeys = new Set<string>();
 const failedKeys = new Set<string>();
+// Bumped whenever titles land; chat threads include it in their lit guard()
+// dependencies so cached row subtrees repaint with the new titles.
+let titlesVersion = 0;
+
+export function getToolTitlesVersion(): number {
+  return titlesVersion;
+}
 
 // Everything a flush needs is captured at schedule time: split panes
 // reconfigure the module globals on every render, so flush-time globals can
@@ -195,6 +202,7 @@ async function flushTitleQueue(): Promise<void> {
       }
     }
     if (changed) {
+      titlesVersion += 1;
       head.notify?.();
     }
   } catch {
