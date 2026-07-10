@@ -69,6 +69,36 @@ describe("parseClawManifest", () => {
     ]);
   });
 
+  it("allows multiple optional unknown entries without ids", () => {
+    const result = parseClawManifest({
+      ...baseManifest,
+      entries: [
+        ...baseManifest.entries,
+        {
+          kind: "futureThing",
+          required: false,
+        },
+        {
+          kind: "anotherFutureThing",
+          required: false,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error("expected manifest to parse");
+    }
+    expect(result.manifest.optionalUnknownEntries).toEqual([
+      { kind: "futureThing", required: false },
+      { kind: "anotherFutureThing", required: false },
+    ]);
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({ code: "unsupported_optional_entry", path: "$.entries[2]" }),
+      expect.objectContaining({ code: "unsupported_optional_entry", path: "$.entries[3]" }),
+    ]);
+  });
+
   it("fails unknown top-level manifest keys", () => {
     const result = parseClawManifest({
       ...baseManifest,
@@ -161,6 +191,75 @@ describe("parseClawManifest", () => {
 
     expect(result.ok).toBe(false);
     expect(result.diagnostics.some((diagnostic) => diagnostic.level === "error")).toBe(true);
+  });
+
+  it("fails duplicate entry ids", () => {
+    const result = parseClawManifest({
+      ...baseManifest,
+      entries: [
+        {
+          kind: "skill",
+          id: "duplicate",
+          selector: "clawhub:first@1.0.0",
+        },
+        {
+          kind: "futureThing",
+          id: "future-entry",
+          required: false,
+        },
+        {
+          kind: "plugin",
+          id: "duplicate",
+          selector: "npm:@openclaw/plugin-second@1.0.0",
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({
+        level: "warning",
+        code: "unsupported_optional_entry",
+        path: "$.entries[1]",
+      }),
+      expect.objectContaining({
+        level: "error",
+        code: "duplicate_claw_entry",
+        path: "$.entries[2]",
+      }),
+    ]);
+  });
+
+  it("fails optional unknown entry ids that duplicate known entries", () => {
+    const result = parseClawManifest({
+      ...baseManifest,
+      entries: [
+        {
+          kind: "skill",
+          id: "duplicate",
+          selector: "clawhub:first@1.0.0",
+        },
+        {
+          kind: "futureThing",
+          id: "duplicate",
+          required: false,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({
+        level: "warning",
+        code: "unsupported_optional_entry",
+        path: "$.entries[1]",
+      }),
+      expect.objectContaining({
+        level: "error",
+        code: "duplicate_claw_entry",
+        path: "$.entries[1]",
+      }),
+    ]);
   });
 });
 

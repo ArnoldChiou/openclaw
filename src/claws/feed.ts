@@ -204,9 +204,7 @@ function validateManifestPathWithinFeedRoot(params: {
   feedDir: string;
   manifestPath: string;
   entryIndex: number;
-}):
-  | { ok: true; manifestPath: string }
-  | { ok: false; diagnostics: ClawDiagnostic[] } {
+}): { ok: true; manifestPath: string } | { ok: false; diagnostics: ClawDiagnostic[] } {
   const manifestPath = resolve(params.manifestPath);
   const relativePath = relative(params.feedDir, manifestPath);
   if (
@@ -234,9 +232,7 @@ export function resolveClawFeedEntrySource(params: {
   feedPath: string;
   entry: ClawFeedEntry;
   entryIndex: number;
-}):
-  | { ok: true; manifestPath: string }
-  | { ok: false; diagnostics: ClawDiagnostic[] } {
+}): { ok: true; manifestPath: string } | { ok: false; diagnostics: ClawDiagnostic[] } {
   const source = params.entry.source;
   const feedDir = resolve(params.feedPath, "..");
   if (hasUrlProtocol(source)) {
@@ -373,7 +369,7 @@ function manifestMismatchDiagnostics(params: {
   if (params.entry.version !== params.manifestVersion) {
     diagnostics.push(
       feedEntryDiagnostic(
-        "warning",
+        "error",
         "feed_manifest_version_mismatch",
         params.entryIndex,
         `Feed entry version ${JSON.stringify(params.entry.version)} does not match manifest version ${JSON.stringify(params.manifestVersion)}.`,

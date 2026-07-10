@@ -141,6 +141,27 @@ function normalizeKnownEntry(value: z.infer<typeof knownEntrySchema>): ClawEntry
   } as ClawEntry;
 }
 
+type ParsedEntryId = { id: string; index: number };
+
+function validateUniqueEntryIds(entries: ParsedEntryId[]): ClawDiagnostic[] {
+  const diagnostics: ClawDiagnostic[] = [];
+  const seen = new Map<string, number>();
+  entries.forEach((entry) => {
+    const existingIndex = seen.get(entry.id);
+    if (existingIndex !== undefined) {
+      diagnostics.push({
+        level: "error",
+        code: "duplicate_claw_entry",
+        path: `$.entries[${entry.index}]`,
+        message: `Claw entry id ${JSON.stringify(entry.id)} duplicates $.entries[${existingIndex}].`,
+      });
+      return;
+    }
+    seen.set(entry.id, entry.index);
+  });
+  return diagnostics;
+}
+
 function parseEntry(
   value: unknown,
   index: number,
@@ -194,17 +215,24 @@ export function parseClawManifest(value: unknown): ClawReadResult {
   const entries: ClawEntry[] = [];
   const optionalUnknownEntries: ClawUnknownEntry[] = [];
   const diagnostics: ClawDiagnostic[] = [];
+  const parsedEntryIds: ParsedEntryId[] = [];
 
   topLevel.data.entries.forEach((entryValue, index) => {
     const result = parseEntry(entryValue, index);
     diagnostics.push(...result.diagnostics);
     if (result.entry) {
       entries.push(result.entry);
+      parsedEntryIds.push({ id: result.entry.id, index });
     }
     if (result.unknown) {
       optionalUnknownEntries.push(result.unknown);
+      if (result.unknown.id) {
+        parsedEntryIds.push({ id: result.unknown.id, index });
+      }
     }
   });
+
+  diagnostics.push(...validateUniqueEntryIds(parsedEntryIds));
 
   if (diagnostics.some((diagnostic) => diagnostic.level === "error")) {
     return { ok: false, diagnostics };

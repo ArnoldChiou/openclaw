@@ -113,7 +113,6 @@ describe("readClawManifestFromFeed", () => {
     expect(result.manifest.id).toBe("incident-response");
   });
 
-
   it("resolves file URL sources that stay under the feed directory", async () => {
     const { feedPath, manifestPath } = await writeFeedWorkspace(baseFeed);
     await writeFile(
@@ -158,7 +157,6 @@ describe("readClawManifestFromFeed", () => {
       expect.objectContaining({ code: "feed_source_escapes_root", path: "$.entries[0]" }),
     );
   });
-
 
   it("allows in-root manifest names that start with two dots", async () => {
     const { dir, feedPath } = await writeFeedWorkspace(baseFeed);
@@ -261,6 +259,17 @@ describe("readClawManifestFromFeed", () => {
     expect(result.ok).toBe(false);
     expect(result.diagnostics).toContainEqual(
       expect.objectContaining({ code: "feed_manifest_id_mismatch", path: "$.entries[0]" }),
+    );
+  });
+
+  it("fails when a feed entry points at a different manifest version", async () => {
+    const { feedPath } = await writeFeedWorkspace(baseFeed, { ...baseManifest, version: "2.0.0" });
+
+    const result = await readClawManifestFromFeed({ feedPath, entryId: "incident-response" });
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostics).toContainEqual(
+      expect.objectContaining({ code: "feed_manifest_version_mismatch", path: "$.entries[0]" }),
     );
   });
 });
