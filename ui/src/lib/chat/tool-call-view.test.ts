@@ -248,6 +248,16 @@ describe("resolveToolCallView", () => {
     expect(resolveToolCallView(source).kind).toBe("generic");
   });
 
+  it("renders pure deletions without a phantom blank added line", () => {
+    const view = resolveToolCallView({
+      name: "edit",
+      args: { path: "/repo/a.ts", oldText: "gone-line", newText: "" },
+    });
+
+    expect(view.stat).toEqual({ added: 0, removed: 1 });
+    expect(view.diff).toEqual([{ kind: "del", text: "gone-line" }]);
+  });
+
   it("rebuilds the cached view when result details arrive on the same args", () => {
     const args = { path: "/repo/a.md", edits: [{ oldText: "x", newText: "y" }] };
 

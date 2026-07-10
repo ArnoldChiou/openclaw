@@ -75,6 +75,11 @@ export function parseDiffDetailsString(diff: string): DiffLine[] | null {
 
 function splitDiffLines(text: string): string[] {
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  // Empty snippets are zero lines: deletions (`newText: ""`) and insertions
+  // from an empty old side must not produce a phantom blank row in the diff.
+  if (normalized === "") {
+    return [];
+  }
   const lines = normalized.split("\n");
   // A trailing newline yields one empty trailing element; drop it so
   // "foo\n" diffs as one line, not two.
