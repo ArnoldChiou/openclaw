@@ -1031,11 +1031,11 @@ async function quiesceLaunchAgentOrThrow(params: {
           );
         }
         if (wasDisabled) {
-          const disable = await execLaunchctl(["disable", params.serviceTarget]);
-          if (disable.code !== 0) {
+          const restoreDisable = await execLaunchctl(["disable", params.serviceTarget]);
+          if (restoreDisable.code !== 0) {
             restoreErrors.push(
               new Error(
-                `launchctl disable rollback failed: ${formatLaunchctlResultDetail(disable)}`,
+                `launchctl disable rollback failed: ${formatLaunchctlResultDetail(restoreDisable)}`,
               ),
             );
           }
@@ -1049,10 +1049,12 @@ async function quiesceLaunchAgentOrThrow(params: {
       }
     }
     if (restoreErrors.length > 0) {
-      throw new AggregateError(
+      const failure = new AggregateError(
         [err, ...restoreErrors],
         "LaunchAgent quiescence failed and its prior state could not be restored",
       );
+      failure.cause = err;
+      throw failure;
     }
     throw err;
   }
