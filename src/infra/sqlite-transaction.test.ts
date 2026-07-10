@@ -1,14 +1,17 @@
 // Covers synchronous SQLite transaction helpers.
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { requireNodeSqlite } from "./node-sqlite.js";
 import { runSqliteImmediateTransactionSync } from "./sqlite-transaction.js";
 
 const openDatabases: Array<import("node:sqlite").DatabaseSync> = [];
-const openChildren: ChildProcessWithoutNullStreams[] = [];
+type WriterLockChild = ChildProcessByStdio<null, Readable, Readable>;
+
+const openChildren: WriterLockChild[] = [];
 const tempDirs: string[] = [];
 
 function createDatabase(): import("node:sqlite").DatabaseSync {
@@ -26,10 +29,7 @@ function readEntries(db: import("node:sqlite").DatabaseSync): string[] {
     .map((row) => (row as { id: string }).id);
 }
 
-function startWriterLockChild(
-  databasePath: string,
-  holdMs: number,
-): ChildProcessWithoutNullStreams {
+function startWriterLockChild(databasePath: string, holdMs: number): WriterLockChild {
   const child = spawn(
     process.execPath,
     [
@@ -54,7 +54,7 @@ function startWriterLockChild(
   return child;
 }
 
-async function waitForChildReady(child: ChildProcessWithoutNullStreams): Promise<void> {
+async function waitForChildReady(child: WriterLockChild): Promise<void> {
   let output = "";
   for await (const chunk of child.stdout) {
     output += chunk.toString();
@@ -65,7 +65,7 @@ async function waitForChildReady(child: ChildProcessWithoutNullStreams): Promise
   throw new Error(`writer-lock child exited before ready: ${output}`);
 }
 
-async function waitForChildExit(child: ChildProcessWithoutNullStreams): Promise<void> {
+async function waitForChildExit(child: WriterLockChild): Promise<void> {
   if (child.exitCode !== null) {
     expect(child.exitCode).toBe(0);
     return;
