@@ -10,7 +10,6 @@ import {
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
 import {
-  runSqliteImmediateTransactionAsync,
   runSqliteImmediateTransactionSync,
   type SqliteTransactionOptions,
 } from "../infra/sqlite-transaction.js";
@@ -641,32 +640,6 @@ export function runOpenClawAgentWriteTransaction<T>(
     maxBusyWaitMs: OPENCLAW_SQLITE_TRANSACTION_BUSY_WAIT_MS,
     ...transactionOptions,
   });
-  ensureOpenClawAgentDatabasePermissions(database.path, options);
-  return result;
-}
-
-/** Run an async immediate transaction against an agent database. */
-export async function runOpenClawAgentWriteTransactionAsync<T>(
-  operation: (database: OpenClawAgentDatabase) => Promise<T> | T,
-  options: OpenClawAgentDatabaseOptions,
-  transactionOptions: Pick<
-    SqliteTransactionOptions,
-    "operationLabel" | "slowTransactionHoldMs"
-  > = {},
-): Promise<T> {
-  const database = openOpenClawAgentDatabase(options);
-  // Async session-entry callbacks derive their patch from the fresh row; keep
-  // that derivation inside BEGIN IMMEDIATE so other processes cannot interleave.
-  const result = await runSqliteImmediateTransactionAsync(
-    database.db,
-    async () => await operation(database),
-    {
-      busyTimeoutMs: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
-      databaseLabel: database.path,
-      maxBusyWaitMs: OPENCLAW_SQLITE_TRANSACTION_BUSY_WAIT_MS,
-      ...transactionOptions,
-    },
-  );
   ensureOpenClawAgentDatabasePermissions(database.path, options);
   return result;
 }

@@ -1,10 +1,7 @@
 // Covers synchronous SQLite transaction helpers.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { requireNodeSqlite } from "./node-sqlite.js";
-import {
-  runSqliteImmediateTransactionAsync,
-  runSqliteImmediateTransactionSync,
-} from "./sqlite-transaction.js";
+import { runSqliteImmediateTransactionSync } from "./sqlite-transaction.js";
 
 const openDatabases: Array<import("node:sqlite").DatabaseSync> = [];
 
@@ -200,6 +197,7 @@ describe("runSqliteImmediateTransactionSync", () => {
       busyTimeoutMs: 5_000,
       databaseLabel: "agent.sqlite",
       logger,
+      slowTransactionHoldMs: 0,
     });
 
     expect(logger.warn).toHaveBeenCalledWith(
@@ -216,6 +214,13 @@ describe("runSqliteImmediateTransactionSync", () => {
         database: "agent.sqlite",
         elapsedMs: 1_500,
         step: "commit",
+      }),
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      "slow SQLite transaction hold",
+      expect.objectContaining({
+        async: false,
+        database: "agent.sqlite",
       }),
     );
   });
@@ -250,107 +255,5 @@ describe("runSqliteImmediateTransactionSync", () => {
 
     expect(execCalls.filter((sql) => sql === "COMMIT")).toHaveLength(2);
     expect(execCalls.at(-1)).toBe("ROLLBACK");
-  });
-});
-
-describe("runSqliteImmediateTransactionAsync", () => {
-  it("keeps outer async writes when a nested savepoint rolls back", async () => {
-    const db = createDatabase();
-
-    await runSqliteImmediateTransactionAsync(db, async () => {
-      db.prepare("INSERT INTO entries(id, value) VALUES (?, ?)").run("outer", "kept");
-      await expect(
-        runSqliteImmediateTransactionAsync(db, async () => {
-          db.prepare("INSERT INTO entries(id, value) VALUES (?, ?)").run("inner", "rolled back");
-          throw new Error("nested failure");
-        }),
-      ).rejects.toThrow("nested failure");
-    });
-
-    expect(readEntries(db)).toEqual(["outer"]);
-  });
-
-  it("retries retryable async commit failures", async () => {
-    const execCalls: string[] = [];
-    let commitAttempts = 0;
-    const db = {
-      exec(sql: string) {
-        execCalls.push(sql);
-        if (sql === "COMMIT") {
-          commitAttempts += 1;
-          if (commitAttempts === 1) {
-            throw Object.assign(new Error("database is busy"), { code: "SQLITE_BUSY" });
-          }
-        }
-      },
-    } as import("node:sqlite").DatabaseSync;
-
-    const result = await runSqliteImmediateTransactionAsync(db, async () => "committed");
-
-    expect(result).toBe("committed");
-    expect(execCalls).toEqual(["BEGIN IMMEDIATE", "COMMIT", "COMMIT"]);
-  });
-
-  it("logs slow async transaction holds with operation labels", async () => {
-    const logger = { warn: vi.fn() };
-    const db = createDatabase();
-
-    await runSqliteImmediateTransactionAsync(
-      db,
-      async () => {
-        db.prepare("INSERT INTO entries(id, value) VALUES (?, ?)").run("async", "kept");
-      },
-      {
-        databaseLabel: "agent.sqlite",
-        logger,
-        operationLabel: "session-transcript.append-expected-turn",
-        slowTransactionHoldMs: 0,
-      },
-    );
-
-    expect(logger.warn).toHaveBeenCalledWith(
-      "slow SQLite transaction hold",
-      expect.objectContaining({
-        async: true,
-        database: "agent.sqlite",
-        operation: "session-transcript.append-expected-turn",
-        thresholdMs: 0,
-      }),
-    );
-    expect(readEntries(db)).toEqual(["async"]);
-  });
-
-  it("does not treat unrelated same-handle writes as nested savepoints", async () => {
-    const db = createDatabase();
-    let releaseOuter: (() => void) | undefined;
-    const outerReady = new Promise<void>((resolve) => {
-      releaseOuter = resolve;
-    });
-    let outerEntered: (() => void) | undefined;
-    const outerStarted = new Promise<void>((resolve) => {
-      outerEntered = resolve;
-    });
-    const outer = runSqliteImmediateTransactionAsync(db, async () => {
-      db.prepare("INSERT INTO entries(id, value) VALUES (?, ?)").run("outer", "rolled back");
-      outerEntered?.();
-      await outerReady;
-      throw new Error("outer failure");
-    });
-
-    await outerStarted;
-    expect(() =>
-      runSqliteImmediateTransactionSync(db, () => {
-        db.prepare("INSERT INTO entries(id, value) VALUES (?, ?)").run("unrelated", "blocked");
-      }),
-    ).toThrow();
-    releaseOuter?.();
-    await expect(outer).rejects.toThrow("outer failure");
-    await expect(
-      runSqliteImmediateTransactionAsync(db, async () => {
-        db.prepare("INSERT INTO entries(id, value) VALUES (?, ?)").run("after", "works");
-      }),
-    ).resolves.toBeUndefined();
-
-    expect(readEntries(db)).toEqual(["after"]);
   });
 });

@@ -1,10 +1,8 @@
 // Provides SQLite transaction helpers with nested savepoints.
-import { AsyncLocalStorage } from "node:async_hooks";
 import type { DatabaseSync } from "node:sqlite";
 import { createSubsystemLogger, type SubsystemLogger } from "../logging/subsystem.js";
 
 const transactionDepthByDatabase = new WeakMap<DatabaseSync, number>();
-const transactionContext = new AsyncLocalStorage<{ depths: Map<DatabaseSync, number> }>();
 
 const RETRYABLE_SQLITE_LOCK_ERROR_CODES = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"]);
 const MAX_TRANSACTION_LOCK_ATTEMPTS = 8;
@@ -95,7 +93,6 @@ function transactionLogger(
 }
 
 function logSlowTransactionHold(params: {
-  async: boolean;
   elapsedMs: number;
   options?: SqliteTransactionOptions;
 }): void {
@@ -103,7 +100,7 @@ function logSlowTransactionHold(params: {
     return;
   }
   transactionLogger(params.options).warn("slow SQLite transaction hold", {
-    async: params.async,
+    async: false,
     ...(params.options?.databaseLabel ? { database: params.options.databaseLabel } : {}),
     elapsedMs: params.elapsedMs,
     ...(params.options?.operationLabel ? { operation: params.options.operationLabel } : {}),
@@ -260,23 +257,10 @@ function abortImmediateTransaction(db: DatabaseSync): void {
 }
 
 function getTransactionDepth(db: DatabaseSync): number {
-  const contextDepth = transactionContext.getStore()?.depths.get(db);
-  if (contextDepth !== undefined) {
-    return contextDepth;
-  }
   return transactionDepthByDatabase.get(db) ?? 0;
 }
 
 function setTransactionDepth(db: DatabaseSync, depth: number): void {
-  const contextDepths = transactionContext.getStore()?.depths;
-  if (contextDepths?.has(db)) {
-    if (depth <= 0) {
-      contextDepths.delete(db);
-      return;
-    }
-    contextDepths.set(db, depth);
-    return;
-  }
   if (depth <= 0) {
     transactionDepthByDatabase.delete(db);
     return;
@@ -335,83 +319,6 @@ export function runSqliteImmediateTransactionSync<T>(
 
   try {
     logSlowTransactionHold({
-      async: false,
-      elapsedMs: Date.now() - transactionStartedAt,
-      options,
-    });
-    commitImmediateTransaction(db, options);
-    transactionStillActive = false;
-    return result;
-  } catch (error) {
-    try {
-      abortImmediateTransaction(db);
-      transactionStillActive = false;
-    } catch {
-      // Preserve the original error; rollback failure is secondary.
-    }
-    throw error;
-  } finally {
-    if (!transactionStillActive) {
-      setTransactionDepth(db, 0);
-    }
-  }
-}
-
-/** Run an async callback inside a SQLite immediate transaction. */
-export async function runSqliteImmediateTransactionAsync<T>(
-  db: DatabaseSync,
-  operation: () => Promise<T> | T,
-  options?: SqliteTransactionOptions,
-): Promise<T> {
-  const depth = getTransactionDepth(db);
-  if (depth > 0) {
-    const savepointName = nextSavepointName();
-    db.exec(`SAVEPOINT ${savepointName}`);
-    setTransactionDepth(db, depth + 1);
-    try {
-      const result = await operation();
-      db.exec(`RELEASE SAVEPOINT ${savepointName}`);
-      return result;
-    } catch (error) {
-      try {
-        db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-      } finally {
-        db.exec(`RELEASE SAVEPOINT ${savepointName}`);
-      }
-      throw error;
-    } finally {
-      setTransactionDepth(db, depth);
-    }
-  }
-
-  beginImmediateTransaction(db, options);
-  let transactionStillActive = true;
-  let result: T;
-  const transactionStartedAt = Date.now();
-  const parentContext = transactionContext.getStore();
-  const transactionDepths = new Map(parentContext?.depths);
-  transactionDepths.set(db, 1);
-  try {
-    result = await transactionContext.run({ depths: transactionDepths }, async () => {
-      return await operation();
-    });
-  } catch (error) {
-    try {
-      abortImmediateTransaction(db);
-      transactionStillActive = false;
-    } catch {
-      // Preserve the original error; rollback failure is secondary.
-    }
-    throw error;
-  } finally {
-    if (!transactionStillActive) {
-      setTransactionDepth(db, 0);
-    }
-  }
-
-  try {
-    logSlowTransactionHold({
-      async: true,
       elapsedMs: Date.now() - transactionStartedAt,
       options,
     });
