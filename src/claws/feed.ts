@@ -1,4 +1,5 @@
 // Local Claw feed parsing and read-only manifest resolution.
+import { createHash } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -349,36 +350,6 @@ function findFeedEntry(
   return { entry: feed.entries[index], index };
 }
 
-function manifestMismatchDiagnostics(params: {
-  entry: ClawFeedEntry;
-  entryIndex: number;
-  manifestId: string;
-  manifestVersion: string;
-}): ClawDiagnostic[] {
-  const diagnostics: ClawDiagnostic[] = [];
-  if (params.entry.id !== params.manifestId) {
-    diagnostics.push(
-      feedEntryDiagnostic(
-        "error",
-        "feed_manifest_id_mismatch",
-        params.entryIndex,
-        `Feed entry id ${JSON.stringify(params.entry.id)} does not match manifest id ${JSON.stringify(params.manifestId)}.`,
-      ),
-    );
-  }
-  if (params.entry.version !== params.manifestVersion) {
-    diagnostics.push(
-      feedEntryDiagnostic(
-        "error",
-        "feed_manifest_version_mismatch",
-        params.entryIndex,
-        `Feed entry version ${JSON.stringify(params.entry.version)} does not match manifest version ${JSON.stringify(params.manifestVersion)}.`,
-      ),
-    );
-  }
-  return diagnostics;
-}
-
 export async function readClawManifestFromFeed(params: {
   feedPath: string;
   entryId: string;
@@ -461,28 +432,23 @@ export async function readClawManifestFromFeed(params: {
     return { ok: false, diagnostics: [...feedResult.diagnostics, ...manifestResult.diagnostics] };
   }
 
-  const mismatchDiagnostics = manifestMismatchDiagnostics({
-    entry: found.entry,
-    entryIndex: found.index,
-    manifestId: manifestResult.manifest.id,
-    manifestVersion: manifestResult.manifest.version,
-  });
-  const diagnostics = [
-    ...feedResult.diagnostics,
-    ...manifestResult.diagnostics,
-    ...mismatchDiagnostics,
-  ];
-  if (diagnostics.some((diagnostic) => diagnostic.level === "error")) {
-    return { ok: false, diagnostics };
-  }
+  const source = {
+    kind: "package" as const,
+    name: found.entry.id,
+    version: found.entry.version,
+    packageRoot: resolve(sourceResult.manifestPath, ".."),
+    manifestPath: sourceResult.manifestPath,
+    integrity: `sha256:${createHash("sha256").update(raw).digest("hex")}`,
+  };
 
   return {
     ok: true,
     feed: feedResult.feed,
     entry: found.entry,
     manifest: manifestResult.manifest,
+    source,
     manifestPath: sourceResult.manifestPath,
-    diagnostics,
+    diagnostics: [...feedResult.diagnostics, ...manifestResult.diagnostics],
   };
 }
 

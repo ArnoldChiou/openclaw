@@ -1,117 +1,251 @@
-// Zod schema and parser for openclaw.claw.v1 manifests.
+// Strict parser for grouped Claw schema version 1 manifests.
 import { z } from "zod";
+import { parseDurationMs } from "../cli/parse-duration.js";
+import { computeNextRunAtMs } from "../cron/schedule.js";
 import {
+  CLAW_BOOTSTRAP_FILE_NAMES,
   CLAW_SCHEMA_VERSION,
   type ClawDiagnostic,
-  type ClawEntry,
   type ClawManifest,
-  type ClawReadResult,
-  type ClawUnknownEntry,
 } from "./types.js";
 
 const nonEmptyString = z.string().trim().min(1);
-const optionalString = z.string().trim().min(1).optional();
+const optionalString = nonEmptyString.optional();
+const agentId = nonEmptyString.regex(
+  /^[a-z][a-z0-9_-]{0,63}$/,
+  "Agent id must start with a lowercase letter and contain only lowercase letters, digits, underscores, or hyphens.",
+);
+const exactVersion = nonEmptyString.regex(
+  /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/,
+  "Package version must be an exact semantic version.",
+);
 
-const entryBaseSchema = z
-  .object({
-    id: nonEmptyString,
-    required: z.boolean().optional(),
-    description: optionalString,
-  })
-  .strict();
-
-const packageEntrySchema = entryBaseSchema
-  .extend({
-    kind: z.enum(["skill", "plugin", "mcpServer", "connector"]),
-    selector: nonEmptyString,
-  })
-  .strict();
-
-const fileEntrySchema = entryBaseSchema
-  .extend({
-    kind: z.enum(["workspaceFile", "persona"]),
-    path: nonEmptyString,
-    source: nonEmptyString,
-  })
-  .strict();
-
-const automationEntrySchema = entryBaseSchema
-  .extend({
-    kind: z.enum(["heartbeat", "schedule", "automation"]),
-    source: nonEmptyString,
-    enableDefault: z.boolean().optional(),
-  })
-  .strict();
-
-const knownEntrySchema = z.union([packageEntrySchema, fileEntrySchema, automationEntrySchema]);
-
-type KnownEntrySchema =
-  | typeof packageEntrySchema
-  | typeof fileEntrySchema
-  | typeof automationEntrySchema;
-
-function schemaForKnownEntryKind(kind: string): KnownEntrySchema | undefined {
-  if (["skill", "plugin", "mcpServer", "connector"].includes(kind)) {
-    return packageEntrySchema;
+function isSafeRelativePath(value: string): boolean {
+  const normalized = value.replaceAll("\\", "/");
+  if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
+    return false;
   }
-  if (["workspaceFile", "persona"].includes(kind)) {
-    return fileEntrySchema;
-  }
-  if (["heartbeat", "schedule", "automation"].includes(kind)) {
-    return automationEntrySchema;
-  }
-  return undefined;
+  const segments = normalized.split("/");
+  return segments.every((segment) => segment !== "" && segment !== "." && segment !== "..");
 }
 
-const KNOWN_ENTRY_KINDS = new Set([
-  "skill",
-  "plugin",
-  "mcpServer",
-  "connector",
-  "workspaceFile",
-  "persona",
-  "heartbeat",
-  "schedule",
-  "automation",
-]);
+const packageRelativePath = nonEmptyString.refine(isSafeRelativePath, {
+  message: "Path must be package-relative and must not contain traversal segments.",
+});
 
-const topLevelManifestSchema = z
+const durationString = nonEmptyString.superRefine((value, ctx) => {
+  try {
+    parseDurationMs(value, { defaultUnit: "m" });
+  } catch {
+    ctx.addIssue({ code: "custom", message: "Invalid duration; use ms, s, m, or h." });
+  }
+});
+
+const identitySchema = z
   .object({
-    schemaVersion: z.literal(CLAW_SCHEMA_VERSION),
-    id: nonEmptyString,
-    name: nonEmptyString,
-    version: nonEmptyString,
-    publisher: optionalString,
-    description: optionalString,
-    compatibility: z
-      .object({
-        minHostVersion: optionalString,
-        surfaces: z.array(nonEmptyString).optional(),
-      })
-      .strict()
-      .optional(),
-    update: z
-      .object({
-        mode: z.enum(["pinned", "latest"]).optional(),
-      })
-      .strict()
-      .optional(),
-    entries: z.array(z.unknown()).min(1),
+    name: optionalString,
+    theme: optionalString,
+    emoji: optionalString,
+    avatar: optionalString,
   })
   .strict();
 
-const entryKindProbeSchema = z
+const agentSchema = z
   .object({
-    kind: nonEmptyString,
+    id: agentId,
+    name: optionalString,
+    description: optionalString,
+    identity: identitySchema.optional(),
+    groupChat: z
+      .object({ mentionPatterns: z.array(nonEmptyString).min(1).optional() })
+      .strict()
+      .optional(),
+    sandbox: z
+      .object({
+        mode: z.enum(["off", "non-main", "all"]).optional(),
+        scope: z.enum(["session", "agent", "shared"]).optional(),
+        workspaceAccess: z.enum(["none", "ro", "rw"]).optional(),
+      })
+      .strict()
+      .optional(),
+    tools: z
+      .object({
+        allow: z.array(nonEmptyString).min(1).optional(),
+        deny: z.array(nonEmptyString).min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    heartbeat: z
+      .object({
+        every: durationString.optional(),
+        activeHours: z
+          .object({ start: optionalString, end: optionalString, timezone: optionalString })
+          .strict()
+          .optional(),
+        lightContext: z.boolean().optional(),
+        isolatedSession: z.boolean().optional(),
+        skipWhenBusy: z.boolean().optional(),
+        timeoutSeconds: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
+    humanDelay: z
+      .object({
+        mode: z.enum(["off", "natural", "custom"]).optional(),
+        minMs: z.number().int().nonnegative().optional(),
+        maxMs: z.number().int().nonnegative().optional(),
+      })
+      .strict()
+      .optional(),
   })
-  .passthrough();
+  .strict();
 
-const unknownEntryProbeSchema = z.object({
-  kind: nonEmptyString,
-  id: optionalString,
-  required: z.boolean().optional(),
-  description: optionalString,
-});
+const workspaceSourceSchema = z.object({ source: packageRelativePath }).strict();
+const bootstrapFilesSchema = z
+  .object(
+    Object.fromEntries(
+      CLAW_BOOTSTRAP_FILE_NAMES.map((name) => [name, workspaceSourceSchema.optional()]),
+    ) as Record<
+      (typeof CLAW_BOOTSTRAP_FILE_NAMES)[number],
+      z.ZodOptional<typeof workspaceSourceSchema>
+    >,
+  )
+  .partial()
+  .strict();
+
+const workspaceFileSchema = z
+  .object({ source: packageRelativePath, path: packageRelativePath })
+  .strict();
+
+const workspaceSchema = z
+  .object({
+    bootstrapFiles: bootstrapFilesSchema.optional().default({}),
+    files: z.array(workspaceFileSchema).optional().default([]),
+  })
+  .strict()
+  .default({ bootstrapFiles: {}, files: [] });
+
+const packageSchema = z
+  .object({
+    kind: z.enum(["skill", "plugin"]),
+    source: z.literal("clawhub"),
+    ref: nonEmptyString,
+    version: exactVersion,
+  })
+  .strict();
+
+const environmentReference = nonEmptyString.regex(
+  /^\$\{[A-Z_][A-Z0-9_]*\}$/,
+  "MCP environment values must be unresolved ${ENV_VAR} references.",
+);
+
+const mcpServerSchema = z
+  .object({
+    command: nonEmptyString,
+    args: z.array(nonEmptyString).optional(),
+    env: z.record(nonEmptyString, environmentReference).optional(),
+    toolFilter: z
+      .object({
+        include: z.array(nonEmptyString).min(1).optional(),
+        exclude: z.array(nonEmptyString).min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    timeout: z.number().positive().optional(),
+    connectTimeout: z.number().positive().optional(),
+  })
+  .strict();
+
+const cronJobSchema = z
+  .object({
+    id: agentId,
+    name: optionalString,
+    schedule: z.object({ cron: nonEmptyString, timezone: optionalString }).strict(),
+    session: z.enum(["main", "isolated", "current"]),
+    message: nonEmptyString,
+    delivery: z
+      .object({
+        mode: z.enum(["none", "announce"]),
+        channel: z.literal("last").optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .superRefine((job, ctx) => {
+    try {
+      computeNextRunAtMs(
+        { kind: "cron", expr: job.schedule.cron, tz: job.schedule.timezone },
+        Date.now(),
+      );
+    } catch {
+      ctx.addIssue({
+        code: "custom",
+        path: ["schedule", "cron"],
+        message: "Invalid cron expression or timezone.",
+      });
+    }
+  });
+
+const manifestSchema = z
+  .object({
+    schemaVersion: z.literal(CLAW_SCHEMA_VERSION),
+    agent: agentSchema,
+    workspace: workspaceSchema.optional().default({ bootstrapFiles: {}, files: [] }),
+    packages: z.array(packageSchema).optional().default([]),
+    mcpServers: z
+      .record(
+        nonEmptyString.regex(/^[a-z][a-z0-9_-]{0,63}$/, "Invalid MCP server name."),
+        mcpServerSchema,
+      )
+      .optional()
+      .default({}),
+    cronJobs: z.array(cronJobSchema).optional().default([]),
+  })
+  .strict()
+  .superRefine((manifest, ctx) => {
+    const workspaceTargets = new Set<string>();
+    for (const name of CLAW_BOOTSTRAP_FILE_NAMES) {
+      if (manifest.workspace.bootstrapFiles[name]) {
+        workspaceTargets.add(name);
+      }
+    }
+    manifest.workspace.files.forEach((file, index) => {
+      if (workspaceTargets.has(file.path)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["workspace", "files", index, "path"],
+          message: `Workspace destination ${JSON.stringify(file.path)} is declared more than once.`,
+        });
+      }
+      workspaceTargets.add(file.path);
+    });
+
+    const packageKeys = new Set<string>();
+    manifest.packages.forEach((pkg, index) => {
+      const key = `${pkg.kind}:${pkg.source}:${pkg.ref}`;
+      if (packageKeys.has(key)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["packages", index],
+          message: `Package ${JSON.stringify(pkg.ref)} is declared more than once for ${pkg.kind}.`,
+        });
+      }
+      packageKeys.add(key);
+    });
+
+    const cronIds = new Set<string>();
+    manifest.cronJobs.forEach((job, index) => {
+      if (cronIds.has(job.id)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["cronJobs", index, "id"],
+          message: `Cron job id ${JSON.stringify(job.id)} is declared more than once.`,
+        });
+      }
+      cronIds.add(job.id);
+    });
+  });
 
 function formatIssuePath(path: PropertyKey[]): string {
   if (path.length === 0) {
@@ -122,136 +256,25 @@ function formatIssuePath(path: PropertyKey[]): string {
     .join("")}`;
 }
 
-function diagnosticsFromZodError(error: z.ZodError, pathPrefix = "$"): ClawDiagnostic[] {
+function diagnosticsFromZodError(error: z.ZodError): ClawDiagnostic[] {
   return error.issues.map((issue) => ({
     level: "error",
     code: "invalid_manifest",
-    path:
-      pathPrefix === "$"
-        ? formatIssuePath(issue.path)
-        : `${pathPrefix}${issue.path.length ? formatIssuePath(issue.path).slice(1) : ""}`,
+    path: formatIssuePath(issue.path),
     message: issue.message,
   }));
 }
 
-function normalizeKnownEntry(value: z.infer<typeof knownEntrySchema>): ClawEntry {
-  return {
-    ...value,
-    required: value.required ?? true,
-  } as ClawEntry;
-}
-
-type ParsedEntryId = { id: string; index: number };
-
-function validateUniqueEntryIds(entries: ParsedEntryId[]): ClawDiagnostic[] {
-  const diagnostics: ClawDiagnostic[] = [];
-  const seen = new Map<string, number>();
-  entries.forEach((entry) => {
-    const existingIndex = seen.get(entry.id);
-    if (existingIndex !== undefined) {
-      diagnostics.push({
-        level: "error",
-        code: "duplicate_claw_entry",
-        path: `$.entries[${entry.index}]`,
-        message: `Claw entry id ${JSON.stringify(entry.id)} duplicates $.entries[${existingIndex}].`,
-      });
-      return;
-    }
-    seen.set(entry.id, entry.index);
-  });
-  return diagnostics;
-}
-
-function parseEntry(
+export function parseClawManifest(
   value: unknown,
-  index: number,
-): { entry?: ClawEntry; unknown?: ClawUnknownEntry; diagnostics: ClawDiagnostic[] } {
-  const kindProbe = entryKindProbeSchema.safeParse(value);
-  const knownKindSchema = kindProbe.success
-    ? schemaForKnownEntryKind(kindProbe.data.kind)
-    : undefined;
-
-  if (knownKindSchema) {
-    const parsed = knownKindSchema.safeParse(value);
-    if (parsed.success) {
-      return { entry: normalizeKnownEntry(parsed.data), diagnostics: [] };
-    }
-    return { diagnostics: diagnosticsFromZodError(parsed.error, `$.entries[${index}]`) };
+):
+  | { ok: true; manifest: ClawManifest; diagnostics: ClawDiagnostic[] }
+  | { ok: false; diagnostics: ClawDiagnostic[] } {
+  const parsed = manifestSchema.safeParse(value);
+  if (!parsed.success) {
+    return { ok: false, diagnostics: diagnosticsFromZodError(parsed.error) };
   }
-
-  const parsed = knownEntrySchema.safeParse(value);
-  if (parsed.success) {
-    return { entry: normalizeKnownEntry(parsed.data), diagnostics: [] };
-  }
-
-  const probed = unknownEntryProbeSchema.safeParse(value);
-  if (
-    probed.success &&
-    probed.data.required === false &&
-    !KNOWN_ENTRY_KINDS.has(probed.data.kind)
-  ) {
-    return {
-      unknown: probed.data,
-      diagnostics: [
-        {
-          level: "warning",
-          code: "unsupported_optional_entry",
-          path: `$.entries[${index}]`,
-          message: `Optional claw entry kind ${JSON.stringify(probed.data.kind)} is not supported by this OpenClaw version.`,
-        },
-      ],
-    };
-  }
-
-  return { diagnostics: diagnosticsFromZodError(parsed.error, `$.entries[${index}]`) };
-}
-
-export function parseClawManifest(value: unknown): ClawReadResult {
-  const topLevel = topLevelManifestSchema.safeParse(value);
-  if (!topLevel.success) {
-    return { ok: false, diagnostics: diagnosticsFromZodError(topLevel.error) };
-  }
-
-  const entries: ClawEntry[] = [];
-  const optionalUnknownEntries: ClawUnknownEntry[] = [];
-  const diagnostics: ClawDiagnostic[] = [];
-  const parsedEntryIds: ParsedEntryId[] = [];
-
-  topLevel.data.entries.forEach((entryValue, index) => {
-    const result = parseEntry(entryValue, index);
-    diagnostics.push(...result.diagnostics);
-    if (result.entry) {
-      entries.push(result.entry);
-      parsedEntryIds.push({ id: result.entry.id, index });
-    }
-    if (result.unknown) {
-      optionalUnknownEntries.push(result.unknown);
-      if (result.unknown.id) {
-        parsedEntryIds.push({ id: result.unknown.id, index });
-      }
-    }
-  });
-
-  diagnostics.push(...validateUniqueEntryIds(parsedEntryIds));
-
-  if (diagnostics.some((diagnostic) => diagnostic.level === "error")) {
-    return { ok: false, diagnostics };
-  }
-
-  const manifest: ClawManifest = {
-    schemaVersion: topLevel.data.schemaVersion,
-    id: topLevel.data.id,
-    name: topLevel.data.name,
-    version: topLevel.data.version,
-    ...(topLevel.data.publisher ? { publisher: topLevel.data.publisher } : {}),
-    ...(topLevel.data.description ? { description: topLevel.data.description } : {}),
-    ...(topLevel.data.compatibility ? { compatibility: topLevel.data.compatibility } : {}),
-    ...(topLevel.data.update ? { update: topLevel.data.update } : {}),
-    entries,
-    optionalUnknownEntries,
-  };
-
-  return { ok: true, manifest, diagnostics };
+  return { ok: true, manifest: parsed.data as ClawManifest, diagnostics: [] };
 }
 
 export { CLAW_SCHEMA_VERSION };

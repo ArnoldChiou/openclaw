@@ -1,4 +1,4 @@
-// E2E coverage for the staged Claw lifecycle CLI flow.
+// E2E coverage for experimental grouped Claw inspection and add planning.
 import { execFile } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -27,11 +27,7 @@ async function runOpenClaw(args: string[], options?: { expectFailure?: boolean }
     const result = await execFileAsync(
       process.execPath,
       ["--import", "tsx", "src/entry.ts", ...args],
-      {
-        cwd: process.cwd(),
-        env,
-        maxBuffer: 1024 * 1024,
-      },
+      { cwd: process.cwd(), env, maxBuffer: 1024 * 1024 },
     );
     if (options?.expectFailure) {
       throw new Error(`expected command to fail: ${args.join(" ")}`);
@@ -58,75 +54,57 @@ function parseJson(stdout: string): unknown {
 }
 
 describe("claws lifecycle cli e2e", () => {
-  it("runs inspect and dry-run apply for a local Claw manifest", async () => {
-    const manifestPath = "src/claws/fixtures/incident-response.claw.json";
+  const manifestPath = "src/claws/fixtures/incident-response.claw.json";
 
+  it("inspects a grouped development manifest", async () => {
     const inspect = parseJson(
       (await runOpenClaw(["claws", "inspect", manifestPath, "--json"])).stdout,
     );
+
     expect(inspect).toMatchObject({
+      schemaVersion: "openclaw.clawInspect.v1",
+      stability: "experimental",
       valid: true,
-      manifest: { id: "incident-response", entries: expect.any(Array) },
-    });
-    const apply = parseJson(
-      (await runOpenClaw(["claws", "apply", manifestPath, "--dry-run", "--json"])).stdout,
-    );
-    expect(apply).toMatchObject({
-      schemaVersion: "openclaw.clawApplyPlan.v1",
-      dryRun: true,
-      mutationAllowed: false,
-      summary: {
-        totalEntries: 5,
-        installActions: 5,
-        consentRequired: 2,
-        blockedEntries: 0,
-        provenanceRecords: 5,
-        rollbackActions: 5,
+      source: { kind: "development", version: "0.0.0-development" },
+      manifest: {
+        schemaVersion: 1,
+        agent: { id: "incident-response" },
+        packages: expect.any(Array),
       },
     });
   });
 
-  it("runs feed inspect and feed dry-run apply from the local feed fixture", async () => {
-    const feedPath = "src/claws/fixtures/local-claws.feed.json";
-
-    const inspect = parseJson(
-      (await runOpenClaw(["claws", "feed", "inspect", feedPath, "--json"])).stdout,
+  it("builds a complete read-only add plan for one new agent", async () => {
+    const add = parseJson(
+      (await runOpenClaw(["claws", "add", manifestPath, "--dry-run", "--json"])).stdout,
     );
-    expect(inspect).toMatchObject({
-      valid: true,
-      feed: { id: "local-starter-claws", entries: expect.any(Array) },
-    });
 
-    const apply = parseJson(
-      (
-        await runOpenClaw([
-          "claws",
-          "feed",
-          "apply",
-          feedPath,
-          "incident-response",
-          "--dry-run",
-          "--json",
-        ])
-      ).stdout,
-    );
-    expect(apply).toMatchObject({
-      schemaVersion: "openclaw.clawApplyPlan.v1",
+    expect(add).toMatchObject({
+      schemaVersion: "openclaw.clawAddPlan.v1",
+      stability: "experimental",
       dryRun: true,
       mutationAllowed: false,
-      feed: { id: "local-starter-claws", entry: { id: "incident-response" } },
-      summary: { totalEntries: 5, consentRequired: 2, blockedEntries: 0 },
+      agent: { requestedId: "incident-response", finalId: "incident-response" },
+      summary: {
+        totalActions: 8,
+        agentActions: 1,
+        workspaceActions: 3,
+        packageActions: 2,
+        mcpServerActions: 1,
+        cronJobActions: 1,
+        blockedActions: 0,
+      },
+      blockers: [],
     });
   });
 
-  it("fails closed when apply is invoked without --dry-run", async () => {
-    const result = await runOpenClaw(
-      ["claws", "apply", "src/claws/fixtures/incident-response.claw.json"],
-      { expectFailure: true },
-    );
+  it("fails closed when add is invoked without dry-run", async () => {
+    const result = await runOpenClaw(["claws", "add", manifestPath], {
+      expectFailure: true,
+    });
 
     expect(result.ok).toBe(false);
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain("Claw apply is dry-run only");
+    expect(result.stderr).toContain("Claw add is dry-run only");
   });
 });

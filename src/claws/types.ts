@@ -1,14 +1,10 @@
-// Shared types for OpenClaw claw manifests and read-only plans.
+// Shared types for grouped OpenClaw Claw manifests and read-only add plans.
 
-export const CLAW_SCHEMA_VERSION = "openclaw.claw.v1" as const;
-export const CLAW_PLAN_SCHEMA_VERSION = "openclaw.clawPlan.v1" as const;
-export const CLAW_APPLY_PLAN_SCHEMA_VERSION = "openclaw.clawApplyPlan.v1" as const;
+export const CLAW_SCHEMA_VERSION = 1 as const;
+export const CLAW_ADD_PLAN_SCHEMA_VERSION = "openclaw.clawAddPlan.v1" as const;
+export const CLAW_INSPECT_RESULT_SCHEMA_VERSION = "openclaw.clawInspect.v1" as const;
 export const CLAW_FEED_SCHEMA_VERSION = "openclaw.clawFeed.v1" as const;
-
-export type ClawSchemaVersion = typeof CLAW_SCHEMA_VERSION;
-export type ClawPlanSchemaVersion = typeof CLAW_PLAN_SCHEMA_VERSION;
-export type ClawApplyPlanSchemaVersion = typeof CLAW_APPLY_PLAN_SCHEMA_VERSION;
-export type ClawFeedSchemaVersion = typeof CLAW_FEED_SCHEMA_VERSION;
+export const CLAW_OUTPUT_STABILITY = "experimental" as const;
 
 export type ClawDiagnosticLevel = "error" | "warning";
 
@@ -19,48 +15,167 @@ export type ClawDiagnostic = {
   message: string;
 };
 
-export type ClawEntryKind =
-  | "skill"
-  | "plugin"
-  | "mcpServer"
-  | "connector"
-  | "workspaceFile"
-  | "persona"
-  | "heartbeat"
-  | "schedule"
-  | "automation";
-
-export type ClawEntryBase = {
-  kind: ClawEntryKind;
+export type ClawAgent = {
   id: string;
-  required?: boolean;
+  name?: string;
   description?: string;
+  identity?: {
+    name?: string;
+    theme?: string;
+    emoji?: string;
+    avatar?: string;
+  };
+  groupChat?: {
+    mentionPatterns?: string[];
+  };
+  sandbox?: {
+    mode?: "off" | "non-main" | "all";
+    scope?: "session" | "agent" | "shared";
+    workspaceAccess?: "none" | "ro" | "rw";
+  };
+  tools?: {
+    allow?: string[];
+    deny?: string[];
+  };
+  heartbeat?: {
+    every?: string;
+    activeHours?: {
+      start?: string;
+      end?: string;
+      timezone?: string;
+    };
+    lightContext?: boolean;
+    isolatedSession?: boolean;
+    skipWhenBusy?: boolean;
+    timeoutSeconds?: number;
+  };
+  humanDelay?: {
+    mode?: "off" | "natural" | "custom";
+    minMs?: number;
+    maxMs?: number;
+  };
 };
 
-export type ClawPackageEntry = ClawEntryBase & {
-  kind: "skill" | "plugin" | "mcpServer" | "connector";
-  selector: string;
-};
+export const CLAW_BOOTSTRAP_FILE_NAMES = [
+  "AGENTS.md",
+  "SOUL.md",
+  "IDENTITY.md",
+  "TOOLS.md",
+  "HEARTBEAT.md",
+] as const;
 
-export type ClawFileEntry = ClawEntryBase & {
-  kind: "workspaceFile" | "persona";
+export type ClawBootstrapFileName = (typeof CLAW_BOOTSTRAP_FILE_NAMES)[number];
+
+export type ClawWorkspaceFile = {
+  source: string;
   path: string;
-  source: string;
 };
 
-export type ClawAutomationEntry = ClawEntryBase & {
-  kind: "heartbeat" | "schedule" | "automation";
-  source: string;
-  enableDefault?: boolean;
+export type ClawWorkspace = {
+  bootstrapFiles: Partial<Record<ClawBootstrapFileName, { source: string }>>;
+  files: ClawWorkspaceFile[];
 };
 
-export type ClawEntry = ClawPackageEntry | ClawFileEntry | ClawAutomationEntry;
+export type ClawPackage = {
+  kind: "skill" | "plugin";
+  source: "clawhub";
+  ref: string;
+  version: string;
+};
 
-export type ClawUnknownEntry = {
-  kind: string;
-  id?: string;
-  required?: boolean;
-  description?: string;
+export type ClawMcpServer = {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  toolFilter?: {
+    include?: string[];
+    exclude?: string[];
+  };
+  timeout?: number;
+  connectTimeout?: number;
+};
+
+export type ClawCronJob = {
+  id: string;
+  name?: string;
+  schedule: {
+    cron: string;
+    timezone?: string;
+  };
+  session: "main" | "isolated" | "current";
+  message: string;
+  delivery?: {
+    mode: "none" | "announce";
+    channel?: "last";
+  };
+};
+
+export type ClawManifest = {
+  schemaVersion: typeof CLAW_SCHEMA_VERSION;
+  agent: ClawAgent;
+  workspace: ClawWorkspace;
+  packages: ClawPackage[];
+  mcpServers: Record<string, ClawMcpServer>;
+  cronJobs: ClawCronJob[];
+};
+
+export type ClawSourceIdentity = {
+  kind: "package" | "development";
+  name: string;
+  version: string;
+  packageRoot: string;
+  manifestPath: string;
+  integrity: string;
+};
+
+export type ClawReadResult =
+  | {
+      ok: true;
+      manifest: ClawManifest;
+      source: ClawSourceIdentity;
+      diagnostics: ClawDiagnostic[];
+    }
+  | {
+      ok: false;
+      diagnostics: ClawDiagnostic[];
+    };
+
+export type ClawAddPlanAction = {
+  kind: "agent" | "workspace" | "workspaceFile" | "package" | "mcpServer" | "cronJob";
+  id: string;
+  action: "create" | "write" | "install" | "configure" | "schedule";
+  target: string;
+  source?: string;
+  digest?: string;
+  details?: Record<string, unknown>;
+  blocked: boolean;
+  reason?: string;
+};
+
+export type ClawAddPlan = {
+  schemaVersion: typeof CLAW_ADD_PLAN_SCHEMA_VERSION;
+  stability: typeof CLAW_OUTPUT_STABILITY;
+  dryRun: true;
+  mutationAllowed: false;
+  claw: ClawSourceIdentity;
+  agent: {
+    requestedId: string;
+    finalId: string;
+    workspace: string;
+    config: ClawAgent & { workspace: string };
+  };
+  summary: {
+    totalActions: number;
+    agentActions: number;
+    workspaceActions: number;
+    packageActions: number;
+    mcpServerActions: number;
+    cronJobActions: number;
+    blockedActions: number;
+  };
+  actions: ClawAddPlanAction[];
+  blockers: ClawDiagnostic[];
+  diagnostics: ClawDiagnostic[];
 };
 
 export type ClawFeedOwner = {
@@ -78,13 +193,11 @@ export type ClawFeedEntry = {
   publisher?: string;
   description?: string;
   owner?: ClawFeedOwner;
-  trust?: {
-    level: ClawFeedTrustLevel;
-  };
+  trust?: { level: ClawFeedTrustLevel };
 };
 
 export type ClawFeed = {
-  schemaVersion: ClawFeedSchemaVersion;
+  schemaVersion: typeof CLAW_FEED_SCHEMA_VERSION;
   id: string;
   name: string;
   publisher?: string;
@@ -94,15 +207,8 @@ export type ClawFeed = {
 };
 
 export type ClawFeedReadResult =
-  | {
-      ok: true;
-      feed: ClawFeed;
-      diagnostics: ClawDiagnostic[];
-    }
-  | {
-      ok: false;
-      diagnostics: ClawDiagnostic[];
-    };
+  | { ok: true; feed: ClawFeed; diagnostics: ClawDiagnostic[] }
+  | { ok: false; diagnostics: ClawDiagnostic[] };
 
 export type ClawFeedManifestReadResult =
   | {
@@ -110,144 +216,8 @@ export type ClawFeedManifestReadResult =
       feed: ClawFeed;
       entry: ClawFeedEntry;
       manifest: ClawManifest;
+      source: ClawSourceIdentity;
       manifestPath: string;
       diagnostics: ClawDiagnostic[];
     }
-  | {
-      ok: false;
-      diagnostics: ClawDiagnostic[];
-    };
-
-export type ClawManifest = {
-  schemaVersion: ClawSchemaVersion;
-  id: string;
-  name: string;
-  version: string;
-  publisher?: string;
-  description?: string;
-  compatibility?: {
-    minHostVersion?: string;
-    surfaces?: string[];
-  };
-  update?: {
-    mode?: "pinned" | "latest";
-  };
-  entries: ClawEntry[];
-  optionalUnknownEntries: ClawUnknownEntry[];
-};
-
-export type ClawReadResult =
-  | {
-      ok: true;
-      manifest: ClawManifest;
-      diagnostics: ClawDiagnostic[];
-    }
-  | {
-      ok: false;
-      diagnostics: ClawDiagnostic[];
-    };
-
-export type ClawPlanEntryDecision = "inspectOnly" | "requiresConsent" | "blockedUnsupported";
-
-export type ClawArtifactSource = "clawhub" | "npm" | "npmPack" | "git" | "path" | "unknown";
-
-export type ClawArtifactInstallSurface = "skills" | "plugins" | "mcpServers" | "connectors";
-
-export type ClawArtifactProvenanceRecord =
-  | "skill.clawhubOrigin"
-  | "plugin.installRecord"
-  | "mcpServer.installRecord"
-  | "connector.installRecord";
-
-export type ClawArtifactPreview = {
-  source: ClawArtifactSource;
-  selector: string;
-  installSurface: ClawArtifactInstallSurface;
-  packageName?: string;
-  version?: string;
-  provenance: {
-    record: ClawArtifactProvenanceRecord;
-    requestedSpecifier: string;
-    pinning: "pinned" | "floating" | "unknown";
-  };
-  supported: boolean;
-};
-
-export type ClawPlanEntry = {
-  id: string;
-  kind: ClawEntryKind | string;
-  required: boolean;
-  decision: ClawPlanEntryDecision;
-  target?: string;
-  source?: string;
-  artifact?: ClawArtifactPreview;
-  reason: string;
-};
-
-export type ClawPlan = {
-  schemaVersion: ClawPlanSchemaVersion;
-  readOnly: true;
-  claw: {
-    id: string;
-    name: string;
-    version: string;
-    sourcePath?: string;
-  };
-  summary: {
-    totalEntries: number;
-    requiredEntries: number;
-    optionalEntries: number;
-    requiresConsent: number;
-    unsupportedRequiredEntries: number;
-    unsupportedOptionalEntries: number;
-  };
-  entries: ClawPlanEntry[];
-  diagnostics: ClawDiagnostic[];
-};
-
-export type ClawApplyPlanEntryAction =
-  | "installArtifact"
-  | "writeWorkspaceFile"
-  | "writePersonaFile"
-  | "registerAutomation"
-  | "skipUnsupported";
-
-export type ClawApplyPlanEntryPhase = "artifact" | "workspace" | "automation" | "unsupported";
-
-export type ClawApplyPlanEntry = {
-  id: string;
-  kind: ClawEntryKind | string;
-  required: boolean;
-  phase: ClawApplyPlanEntryPhase;
-  action: ClawApplyPlanEntryAction;
-  target?: string;
-  source?: string;
-  consentRequired: boolean;
-  blocked: boolean;
-  provenanceRecord?:
-    | ClawArtifactProvenanceRecord
-    | "workspaceFile.installRecord"
-    | "automation.installRecord";
-  rollback: {
-    action: "uninstallArtifact" | "removeWorkspaceFile" | "disableAutomation" | "none";
-    target?: string;
-  };
-  reason: string;
-};
-
-export type ClawApplyPlan = {
-  schemaVersion: ClawApplyPlanSchemaVersion;
-  dryRun: true;
-  mutationAllowed: false;
-  claw: ClawPlan["claw"];
-  summary: {
-    totalEntries: number;
-    installActions: number;
-    consentRequired: number;
-    blockedEntries: number;
-    provenanceRecords: number;
-    rollbackActions: number;
-  };
-  entries: ClawApplyPlanEntry[];
-  diagnostics: ClawDiagnostic[];
-};
+  | { ok: false; diagnostics: ClawDiagnostic[] };

@@ -1,45 +1,76 @@
 {
-  "schemaVersion": "openclaw.claw.v1",
-  "id": "incident-response",
-  "name": "Incident Response",
-  "version": "1.0.0",
-  "publisher": "openclaw.examples",
-  "description": "Starter claw for triage, workspace context, and response automation.",
-  "compatibility": {
-    "minHostVersion": "2026.7.0",
-    "surfaces": ["cli", "gateway"]
+  "schemaVersion": 1,
+  "agent": {
+    "id": "incident-response",
+    "name": "Incident Response",
+    "description": "Triages incidents and prepares response updates.",
+    "identity": {
+      "name": "Incident Response",
+      "emoji": "siren"
+    },
+    "groupChat": {
+      "mentionPatterns": ["@incident-response"]
+    },
+    "sandbox": {
+      "mode": "all",
+      "scope": "agent",
+      "workspaceAccess": "rw"
+    },
+    "tools": {
+      "allow": ["read", "write", "web_fetch"],
+      "deny": ["exec", "browser"]
+    },
+    "heartbeat": {
+      "every": "30m",
+      "lightContext": true,
+      "isolatedSession": true,
+      "skipWhenBusy": true,
+      "timeoutSeconds": 120
+    }
   },
-  "update": {
-    "mode": "pinned"
+  "workspace": {
+    "bootstrapFiles": {
+      "SOUL.md": { "source": "workspace/SOUL.md" },
+      "HEARTBEAT.md": { "source": "workspace/HEARTBEAT.md" }
+    }
   },
-  "entries": [
+  "packages": [
     {
       "kind": "skill",
-      "id": "incident-triage-skill",
-      "selector": "clawhub:incident-triage@1.0.0"
+      "source": "clawhub",
+      "ref": "incident-triage",
+      "version": "1.0.0"
     },
     {
       "kind": "plugin",
-      "id": "pager-duty-plugin",
-      "selector": "npm:@openclaw/plugin-pager-duty@2.4.0"
-    },
+      "source": "clawhub",
+      "ref": "@openclaw/plugin-pager-duty",
+      "version": "2.4.0"
+    }
+  ],
+  "mcpServers": {
+    "statuspage": {
+      "command": "npx",
+      "args": ["-y", "@acme/statuspage-mcp"],
+      "env": {
+        "STATUSPAGE_TOKEN": "${STATUSPAGE_TOKEN}"
+      }
+    }
+  },
+  "cronJobs": [
     {
-      "kind": "mcpServer",
-      "id": "statuspage-mcp",
-      "selector": "clawhub:statuspage-mcp@1.1.0",
-      "required": false
-    },
-    {
-      "kind": "workspaceFile",
-      "id": "runbook",
-      "path": "SOUL.md",
-      "source": "files/SOUL.md"
-    },
-    {
-      "kind": "schedule",
       "id": "heartbeat-summary",
-      "source": "automations/heartbeat-summary.json",
-      "enableDefault": false
+      "name": "Incident heartbeat summary",
+      "schedule": {
+        "cron": "0 * * * *",
+        "timezone": "UTC"
+      },
+      "session": "isolated",
+      "message": "Review active incidents and prepare a concise status summary.",
+      "delivery": {
+        "mode": "announce",
+        "channel": "last"
+      }
     }
   ]
 }

@@ -3,7 +3,7 @@
   "id": "local-starter-claws",
   "name": "Local Starter Claws",
   "publisher": "openclaw.examples",
-  "description": "Local feed fixture for read-only Claw discovery and dry-run apply previews.",
+  "description": "Local feed fixture for read-only Claw discovery and dry-run add previews.",
   "generatedAt": "2026-07-07T00:00:00.000Z",
   "entries": [
     {

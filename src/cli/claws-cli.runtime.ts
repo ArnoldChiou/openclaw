@@ -1,18 +1,20 @@
-// Runtime handlers for local Claws CLI commands.
-import { resolve } from "node:path";
 import { assertExperimentalClawsEnabled } from "../claws/experimental.js";
-import { readClawFeedFile, readClawManifestFromFeed } from "../claws/feed.js";
-import { buildClawApplyPlan } from "../claws/lifecycle.js";
-import { buildClawPlan } from "../claws/plan.js";
+import { buildClawAddPlan } from "../claws/lifecycle.js";
 import { readClawManifestFile } from "../claws/reader.js";
-import type { ClawApplyPlan } from "../claws/types.js";
+import {
+  CLAW_INSPECT_RESULT_SCHEMA_VERSION,
+  CLAW_ADD_PLAN_SCHEMA_VERSION,
+  CLAW_OUTPUT_STABILITY,
+  type ClawAddPlan,
+} from "../claws/types.js";
+// Runtime handlers for experimental local Claws commands.
+import { loadConfig } from "../config/config.js";
+import {
+  loadCronJobsStoreWithConfigJobsReadOnly,
+  resolveCronJobsStorePath,
+} from "../cron/store.js";
 import { defaultRuntime, writeRuntimeJson, type RuntimeEnv } from "../runtime.js";
-import type {
-  ClawsApplyOptions,
-  ClawsFeedApplyOptions,
-  ClawsFeedInspectOptions,
-  ClawsInspectOptions,
-} from "./claws-cli.js";
+import type { ClawsAddOptions, ClawsInspectOptions } from "./claws-cli.js";
 
 type DiagnosticLike = { level: string; code: string; path: string; message: string };
 
@@ -25,27 +27,35 @@ function formatDiagnostics(diagnostics: DiagnosticLike[]): string {
     .join("\n");
 }
 
-function logClawApplyPlanSummary(plan: ClawApplyPlan, runtime: RuntimeEnv): void {
-  runtime.log("Dry-run: true");
-  runtime.log("Mutation allowed: false");
-  runtime.log(`Entries: ${plan.summary.totalEntries}`);
-  runtime.log(`Install actions: ${plan.summary.installActions}`);
-  runtime.log(`Consent required: ${plan.summary.consentRequired}`);
-  runtime.log(`Provenance records: ${plan.summary.provenanceRecords}`);
-  runtime.log(`Rollback actions: ${plan.summary.rollbackActions}`);
-  if (plan.summary.blockedEntries > 0) {
-    runtime.log(`Blocked entries: ${plan.summary.blockedEntries}`);
+function logExperimentalWarning(runtime: RuntimeEnv): void {
+  runtime.log("Experimental: Claws contracts may change while RFC 0016 is under review.");
+}
+
+function logClawAddPlanSummary(plan: ClawAddPlan, runtime: RuntimeEnv): void {
+  runtime.log(`Agent: ${plan.agent.finalId}`);
+  runtime.log(`Workspace: ${plan.agent.workspace}`);
+  runtime.log(`Actions: ${plan.summary.totalActions}`);
+  runtime.log(`Packages: ${plan.summary.packageActions}`);
+  runtime.log(`MCP servers: ${plan.summary.mcpServerActions}`);
+  runtime.log(`Cron jobs: ${plan.summary.cronJobActions}`);
+  if (plan.summary.blockedActions > 0) {
+    runtime.log(`Blocked actions: ${plan.summary.blockedActions}`);
   }
 }
 
-function failNonDryRun(opts: { dryRun?: boolean; json?: boolean }, runtime: RuntimeEnv): boolean {
+function failNonDryRun(opts: ClawsAddOptions, runtime: RuntimeEnv): boolean {
   if (opts.dryRun) {
     return false;
   }
   const message =
-    "Claw apply is dry-run only in this OpenClaw build; pass --dry-run to preview lifecycle actions.";
+    "Claw add is dry-run only in this OpenClaw build; pass --dry-run to preview lifecycle actions.";
   if (opts.json) {
-    writeRuntimeJson(runtime, { ok: false, error: { code: "dry_run_required", message } });
+    writeRuntimeJson(runtime, {
+      schemaVersion: CLAW_ADD_PLAN_SCHEMA_VERSION,
+      stability: CLAW_OUTPUT_STABILITY,
+      ok: false,
+      error: { code: "dry_run_required", message },
+    });
   } else {
     runtime.error(message);
   }
@@ -54,15 +64,20 @@ function failNonDryRun(opts: { dryRun?: boolean; json?: boolean }, runtime: Runt
 }
 
 export async function runClawsInspectCommand(
-  manifestPath: string,
+  sourcePath: string,
   opts: ClawsInspectOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ): Promise<void> {
   assertExperimentalClawsEnabled();
-  const result = await readClawManifestFile(manifestPath);
+  const result = await readClawManifestFile(sourcePath);
   if (!result.ok) {
     if (opts.json) {
-      writeRuntimeJson(runtime, { valid: false, diagnostics: result.diagnostics });
+      writeRuntimeJson(runtime, {
+        schemaVersion: CLAW_INSPECT_RESULT_SCHEMA_VERSION,
+        stability: CLAW_OUTPUT_STABILITY,
+        valid: false,
+        diagnostics: result.diagnostics,
+      });
     } else {
       runtime.error(formatDiagnostics(result.diagnostics));
     }
@@ -71,41 +86,43 @@ export async function runClawsInspectCommand(
   }
 
   const payload = {
+    schemaVersion: CLAW_INSPECT_RESULT_SCHEMA_VERSION,
+    stability: CLAW_OUTPUT_STABILITY,
     valid: true,
-    sourcePath: resolve(manifestPath),
+    source: result.source,
     manifest: result.manifest,
     diagnostics: result.diagnostics,
   };
-
   if (opts.json) {
     writeRuntimeJson(runtime, payload);
     return;
   }
-
-  runtime.log(`Claw: ${result.manifest.name} (${result.manifest.id}@${result.manifest.version})`);
-  runtime.log(`Entries: ${result.manifest.entries.length}`);
-  if (result.manifest.optionalUnknownEntries.length > 0) {
-    runtime.log(`Optional unsupported entries: ${result.manifest.optionalUnknownEntries.length}`);
-  }
-  if (result.diagnostics.length > 0) {
-    runtime.log(formatDiagnostics(result.diagnostics));
-  }
+  logExperimentalWarning(runtime);
+  runtime.log(`Claw: ${result.source.name}@${result.source.version}`);
+  runtime.log(`Agent: ${result.manifest.agent.name ?? result.manifest.agent.id}`);
+  runtime.log(`Packages: ${result.manifest.packages.length}`);
+  runtime.log(`MCP servers: ${Object.keys(result.manifest.mcpServers).length}`);
+  runtime.log(`Cron jobs: ${result.manifest.cronJobs.length}`);
 }
 
-export async function runClawsApplyCommand(
-  manifestPath: string,
-  opts: ClawsApplyOptions,
+export async function runClawsAddCommand(
+  sourcePath: string,
+  opts: ClawsAddOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ): Promise<void> {
   assertExperimentalClawsEnabled();
   if (failNonDryRun(opts, runtime)) {
     return;
   }
-
-  const result = await readClawManifestFile(manifestPath);
+  const result = await readClawManifestFile(sourcePath);
   if (!result.ok) {
     if (opts.json) {
-      writeRuntimeJson(runtime, { valid: false, diagnostics: result.diagnostics });
+      writeRuntimeJson(runtime, {
+        schemaVersion: CLAW_ADD_PLAN_SCHEMA_VERSION,
+        stability: CLAW_OUTPUT_STABILITY,
+        valid: false,
+        diagnostics: result.diagnostics,
+      });
     } else {
       runtime.error(formatDiagnostics(result.diagnostics));
     }
@@ -113,107 +130,38 @@ export async function runClawsApplyCommand(
     return;
   }
 
-  const plan = buildClawApplyPlan(
-    buildClawPlan({
-      manifest: result.manifest,
-      diagnostics: result.diagnostics,
-      sourcePath: resolve(manifestPath),
-    }),
+  const config = loadConfig();
+  const existingAgents = config.agents?.list ?? [];
+  const cronStore = await loadCronJobsStoreWithConfigJobsReadOnly(
+    resolveCronJobsStorePath(config.cron?.store),
   );
+  const plan = await buildClawAddPlan({
+    manifest: result.manifest,
+    source: result.source,
+    diagnostics: result.diagnostics,
+    context: {
+      ...(opts.agentId ? { agentId: opts.agentId } : {}),
+      ...(opts.workspace ? { workspace: opts.workspace } : {}),
+      existingAgentIds: existingAgents.map((agent) => agent.id),
+      existingWorkspacePaths: existingAgents.flatMap((agent) =>
+        agent.workspace ? [agent.workspace] : [],
+      ),
+      existingMcpServerNames: Object.keys(config.mcp?.servers ?? {}),
+      existingCronJobIds: cronStore.store.jobs.map((job) => job.id),
+    },
+  });
 
   if (opts.json) {
     writeRuntimeJson(runtime, plan);
-    return;
-  }
-
-  runtime.log(`Claw apply plan: ${plan.claw.name} (${plan.claw.id}@${plan.claw.version})`);
-  logClawApplyPlanSummary(plan, runtime);
-}
-
-export async function runClawsFeedInspectCommand(
-  feedPath: string,
-  opts: ClawsFeedInspectOptions,
-  runtime: RuntimeEnv = defaultRuntime,
-): Promise<void> {
-  assertExperimentalClawsEnabled();
-  const result = await readClawFeedFile(feedPath);
-  if (!result.ok) {
-    if (opts.json) {
-      writeRuntimeJson(runtime, { valid: false, diagnostics: result.diagnostics });
-    } else {
-      runtime.error(formatDiagnostics(result.diagnostics));
+  } else {
+    logExperimentalWarning(runtime);
+    runtime.log(`Claw add plan: ${plan.claw.name}@${plan.claw.version}`);
+    logClawAddPlanSummary(plan, runtime);
+    if (plan.blockers.length > 0) {
+      runtime.error(formatDiagnostics(plan.blockers));
     }
+  }
+  if (plan.blockers.length > 0) {
     runtime.exit(1);
-    return;
-  }
-
-  const payload = {
-    valid: true,
-    sourcePath: resolve(feedPath),
-    feed: result.feed,
-    diagnostics: result.diagnostics,
-  };
-
-  if (opts.json) {
-    writeRuntimeJson(runtime, payload);
-    return;
-  }
-
-  runtime.log(`Claw feed: ${result.feed.name} (${result.feed.id})`);
-  runtime.log(`Entries: ${result.feed.entries.length}`);
-  if (result.diagnostics.length > 0) {
-    runtime.log(formatDiagnostics(result.diagnostics));
-  }
-}
-
-export async function runClawsFeedApplyCommand(
-  feedPath: string,
-  clawId: string,
-  opts: ClawsFeedApplyOptions,
-  runtime: RuntimeEnv = defaultRuntime,
-): Promise<void> {
-  assertExperimentalClawsEnabled();
-  if (failNonDryRun(opts, runtime)) {
-    return;
-  }
-
-  const result = await readClawManifestFromFeed({ feedPath, entryId: clawId });
-  if (!result.ok) {
-    if (opts.json) {
-      writeRuntimeJson(runtime, { valid: false, diagnostics: result.diagnostics });
-    } else {
-      runtime.error(formatDiagnostics(result.diagnostics));
-    }
-    runtime.exit(1);
-    return;
-  }
-
-  const plan = buildClawApplyPlan(
-    buildClawPlan({
-      manifest: result.manifest,
-      diagnostics: result.diagnostics,
-      sourcePath: result.manifestPath,
-    }),
-  );
-  const payload = {
-    ...plan,
-    feed: {
-      id: result.feed.id,
-      name: result.feed.name,
-      sourcePath: resolve(feedPath),
-      entry: result.entry,
-    },
-  };
-
-  if (opts.json) {
-    writeRuntimeJson(runtime, payload);
-    return;
-  }
-
-  runtime.log(`Claw apply plan: ${plan.claw.name} (${plan.claw.id}@${plan.claw.version})`);
-  runtime.log(`Feed: ${result.feed.name} (${result.feed.id})`);
-  logClawApplyPlanSummary(plan, runtime);
-  if (result.diagnostics.length > 0) {
-    runtime.log(formatDiagnostics(result.diagnostics));
   }
 }
