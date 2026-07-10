@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
@@ -10,6 +11,11 @@ import {
   releaseNotesVersionForTag,
   verifyGithubReleaseNotes,
 } from "../../../../scripts/render-github-release-notes.mjs";
+import {
+  assertCompleteReleaseSourceInventory,
+  buildReleaseSourceInventory,
+  canonicalGitEnvironment,
+} from "./lib/release-source-inventory.mjs";
 
 const repo = "openclaw/openclaw";
 const commitAssociationQueryBatchSize = 20;
@@ -67,6 +73,9 @@ Options:
   --manifest <path>     Read or write the complete contribution record ledger.
   --seed-ref <ref>      Use an existing release section as editorial input.
   --shipped-ref <tag>   Exclude PRs already recorded by this shipped tag; repeatable.
+  --source-target <ref> Inventory cutoff; --target may be one final CHANGELOG-only child.
+  --provenance-ref <ref>
+                        Search this trusted ref for unique cherry-pick provenance; repeatable.
   --write-ledger        Write the verified ledger back into CHANGELOG.md.
   --release-tag <tag>   GitHub release tag to compare; repeatable with --check-github.
   --check-github        Require each supplied GitHub release body to match.
@@ -81,6 +90,7 @@ function parseArgs(argv) {
     help: false,
     json: false,
     manifestPath: undefined,
+    provenanceRefs: [],
     seedRef: undefined,
     shippedRefs: [],
     writeLedger: false,
@@ -104,6 +114,8 @@ function parseArgs(argv) {
       arg === "--version" ||
       arg === "--release-tag" ||
       arg === "--shipped-ref" ||
+      arg === "--source-target" ||
+      arg === "--provenance-ref" ||
       arg === "--manifest" ||
       arg === "--seed-ref"
     ) {
@@ -115,6 +127,10 @@ function parseArgs(argv) {
         options.releaseTags.push(value);
       } else if (arg === "--shipped-ref") {
         options.shippedRefs.push(value);
+      } else if (arg === "--source-target") {
+        options.sourceTarget = value;
+      } else if (arg === "--provenance-ref") {
+        options.provenanceRefs.push(value);
       } else if (arg === "--manifest") {
         options.manifestPath = value;
       } else if (arg === "--seed-ref") {
@@ -145,13 +161,20 @@ function parseArgs(argv) {
     fail("--shipped-ref values must be unique");
   }
   options.shippedRefs = options.shippedRefs.toSorted((a, b) => (a === b ? 0 : a < b ? -1 : 1));
+  const uniqueProvenanceRefs = new Set(options.provenanceRefs);
+  if (uniqueProvenanceRefs.size !== options.provenanceRefs.length) {
+    fail("--provenance-ref values must be unique");
+  }
+  options.provenanceRefs = options.provenanceRefs.toSorted((a, b) =>
+    a === b ? 0 : a < b ? -1 : 1,
+  );
   return options;
 }
 
 function run(command, args) {
   return execFileSync(command, args, {
     encoding: "utf8",
-    env: { ...process.env, NO_COLOR: "1" },
+    env: command === "git" ? canonicalGitEnvironment() : { ...process.env, NO_COLOR: "1" },
     maxBuffer: 16 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -167,7 +190,7 @@ function gitIsAncestor(base, target) {
     ["merge-base", "--is-ancestor", `${base}^{commit}`, `${target}^{commit}`],
     {
       encoding: "utf8",
-      env: { ...process.env, NO_COLOR: "1" },
+      env: canonicalGitEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -502,6 +525,34 @@ export function subtractShippedPullRequests(source, baselines) {
   return { baselines: metadata, pullRequests: excluded };
 }
 
+export function exactShippedPullRequestExclusions(source, baselines) {
+  const included = new Set(source.inventory.partitions.pullRequests.included.members);
+  const excluded = new Set(
+    source.inventory.partitions.pullRequests.shipped.members.filter(
+      (number) => !included.has(number),
+    ),
+  );
+  const claimed = new Set();
+  const metadata = baselines
+    .toSorted((left, right) => left.ref.localeCompare(right.ref))
+    .map((baseline) => {
+      const pullRequests = source.inventory.commits
+        .filter(
+          (commit) =>
+            commit.disposition === "shipped" &&
+            commit.shippedEvidence.some((evidence) => evidence.ref === baseline.ref),
+        )
+        .flatMap((commit) => commit.pullRequests)
+        .filter((number) => excluded.has(number) && !claimed.has(number));
+      const members = [...new Set(pullRequests)].toSorted((left, right) => left - right);
+      for (const number of members) {
+        claimed.add(number);
+      }
+      return { count: members.length, pullRequests: members, ref: baseline.ref };
+    });
+  return { baselines: metadata, pullRequests: excluded };
+}
+
 export function withoutExcludedContributionRecords(record, excludedReferences) {
   if (excludedReferences.size === 0) {
     return record;
@@ -542,16 +593,10 @@ export function contaminatingPullRequestReferences({
   noteReferences,
   recordedReferences,
   sourcePullRequests,
-  sourceReferences,
   seededPullRequests,
   nodes,
 }) {
   const allowed = new Set([...sourcePullRequests, ...seededPullRequests]);
-  for (const number of sourceReferences) {
-    if (nodes.get(number)?.__typename === "PullRequest") {
-      allowed.add(number);
-    }
-  }
   return [...new Set([...noteReferences, ...recordedReferences])].filter(
     (number) => nodes.get(number)?.__typename === "PullRequest" && !allowed.has(number),
   );
@@ -567,137 +612,55 @@ function appendReferences(references, additions) {
   }
 }
 
-function sourceCommits(base, target) {
-  const targetCommit = git(["rev-parse", `${target}^{commit}`]);
-  if (!gitIsAncestor(base, targetCommit)) {
-    fail(`release range base ${base} must be an ancestor of target ${target}`);
-  }
-  const mergeBase = git(["merge-base", base, targetCommit]);
-  const targetTimestamp = Date.parse(git(["show", "-s", "--format=%cI", targetCommit]));
-  if (!Number.isFinite(targetTimestamp)) {
-    fail(`could not resolve timestamp for release target ${target}`);
-  }
-  const output = git([
-    "log",
-    "--first-parent",
-    "--reverse",
-    "--format=%H%x1f%s%x1f%an%x1f%ae%x1f%B%x1e",
-    `${mergeBase}..${targetCommit}`,
-  ]);
-  const commits = new Map();
-  const revertsByTarget = new Map();
-  for (const record of output.split("\x1e")) {
-    if (!record) {
-      continue;
-    }
-    const [rawHash, subject, authorName, authorEmail, ...bodyParts] = record.split("\x1f");
-    const hash = rawHash.trim();
-    const body = bodyParts.join("\x1f");
-    const revertedHash = standardRevertedHash(body);
-    const isRevert = Boolean(revertedHash) || subject.startsWith('Revert "');
-    commits.set(hash, {
-      authorEmail,
-      authorName,
-      body,
-      hash,
-      isRevert,
-      revertedHash,
-      subject,
-    });
-  }
-  for (const commit of commits.values()) {
-    if (!commit.revertedHash) {
-      continue;
-    }
-    const targetHash = [...commits.keys()].find((candidate) =>
-      candidate.startsWith(commit.revertedHash),
-    );
-    if (targetHash) {
-      const reverts = revertsByTarget.get(targetHash) ?? [];
-      reverts.push(commit.hash);
-      revertsByTarget.set(targetHash, reverts);
-    }
-  }
-  const active = new Map();
-  function isActive(hash) {
-    if (active.has(hash)) {
-      return active.get(hash);
-    }
-    const cancellingReverts = revertsByTarget.get(hash) ?? [];
-    const value = !cancellingReverts.some((revertHash) => isActive(revertHash));
-    active.set(hash, value);
-    return value;
-  }
-  const revertedCommitStates = new Map();
-  function revertedCommitState(ref, seen = new Set()) {
-    let hash;
-    try {
-      hash = git(["rev-parse", `${ref}^{commit}`]);
-    } catch {
-      return undefined;
-    }
-    const cached = revertedCommitStates.get(hash);
-    if (cached) {
-      return cached;
-    }
-    if (seen.has(hash)) {
-      fail(`cyclic revert history at ${hash}`);
-    }
-    seen.add(hash);
-    const output = git(["show", "-s", "--format=%s%x1f%B", hash]);
-    const [subject, ...bodyParts] = output.split("\x1f");
-    const body = bodyParts.join("\x1f");
-    const message = `${subject}\n${body}`;
-    const revertedHash = standardRevertedHash(body);
-    const targetState = revertedHash ? revertedCommitState(revertedHash, seen) : undefined;
-    const state = targetState
-      ? { ...targetState, depth: targetState.depth + 1 }
-      : { depth: 0, hash, references: referencesIn(message) };
-    revertedCommitStates.set(hash, state);
-    return state;
-  }
+function sourceCommits(options) {
+  const inventory = assertCompleteReleaseSourceInventory(
+    buildReleaseSourceInventory(
+      {
+        baseRef: options.base,
+        finalTargetRef: options.target,
+        provenanceRefs: options.provenanceRefs,
+        shippedRefs: options.shippedRefs,
+        sourceTargetRef: options.sourceTarget ?? options.target,
+      },
+      {
+        resolveAssociations: (commits, targetTimestamp) =>
+          resolveAssociatedPullRequests(commits, targetTimestamp),
+        resolvePullRequests: (numbers) => {
+          const nodes = resolveReferences(numbers);
+          return new Map(numbers.map((number) => [number, nodes.get(number) ?? null]));
+        },
+      },
+    ),
+  );
+  const source = sourceContributionsFromInventory(inventory);
+  return sourceContributionsFromInventory(inventory, resolveCommitCoauthors(source.activeCommits));
+}
 
-  const references = [];
-  const revertedReferences = new Set();
-  const revertedCommitHashes = new Set();
-  const coauthorsByReference = new Map();
+export function sourceContributionsFromInventory(inventory, resolvedCommitCoauthors = new Map()) {
   const activeCommits = [];
-  for (const commit of commits.values()) {
-    if (commit.isRevert && isActive(commit.hash)) {
-      const coauthorEmails = [...commit.body.matchAll(/^Co-authored-by:\s*.+?<([^>\s]+)>$/gim)].map(
-        (match) => match[1],
-      );
-      activeCommits.push({
-        authorEmail: commit.authorEmail,
-        authorHandle: githubHandleFromNoreply(commit.authorEmail),
-        authorName: commit.authorName,
-        body: commit.body,
-        closingReferences: [],
-        coauthors: coauthorEmails.map(githubHandleFromNoreply).filter(isEligibleHandle),
-        coauthorEmails,
-        hash: commit.hash,
-        isRevert: true,
-        pullRequests: [],
-        references: [],
-        subject: commit.subject,
-      });
-      continue;
-    }
-    if (commit.isRevert) {
-      continue;
-    }
-    const uniqueReferences = [...new Set(referencesIn(`${commit.subject}\n${commit.body}`))];
-    if (!isActive(commit.hash)) {
-      revertedCommitHashes.add(commit.hash);
-      for (const number of uniqueReferences) {
+  const coauthorsByReference = new Map();
+  const references = [];
+  const pullRequests = new Set(inventory.partitions.pullRequests.included.members);
+  const revertedReferences = new Set();
+  for (const commit of inventory.commits) {
+    if (commit.disposition === "reverted") {
+      for (const number of [...commit.references, ...commit.pullRequests]) {
         revertedReferences.add(number);
       }
+      continue;
+    }
+    if (commit.disposition !== "pull-request" && commit.disposition !== "direct") {
       continue;
     }
     const coauthorEmails = [...commit.body.matchAll(/^Co-authored-by:\s*.+?<([^>\s]+)>$/gim)].map(
       (match) => match[1],
     );
     const coauthors = coauthorEmails.map(githubHandleFromNoreply).filter(isEligibleHandle);
+    addHandles(coauthors, resolvedCommitCoauthors.get(commit.commit) ?? []);
+    const isRevert = Boolean(standardRevertedHash(commit.body));
+    const commitReferences = isRevert ? [] : [...commit.references];
+    appendReferences(commitReferences, commit.pullRequests);
+    appendReferences(references, commitReferences);
     activeCommits.push({
       authorEmail: commit.authorEmail,
       authorHandle: githubHandleFromNoreply(commit.authorEmail),
@@ -706,76 +669,20 @@ function sourceCommits(base, target) {
       closingReferences: closingReferencesIn(`${commit.subject}\n${commit.body}`),
       coauthors,
       coauthorEmails,
-      hash: commit.hash,
-      isRevert: false,
-      pullRequests: [],
-      references: uniqueReferences,
+      hash: commit.commit,
+      isRevert,
+      pullRequests: commit.pullRequests,
+      references: commitReferences,
       subject: commit.subject,
     });
-  }
-  for (const commit of commits.values()) {
-    if (!commit.isRevert || !commit.revertedHash || !isActive(commit.hash)) {
-      continue;
-    }
-    const targetInRange = [...commits.keys()].some((candidate) =>
-      candidate.startsWith(commit.revertedHash),
-    );
-    if (targetInRange) {
-      continue;
-    }
-    const revertedState = revertedCommitState(commit.revertedHash);
-    if (!revertedState) {
-      continue;
-    }
-    if (revertedState.depth % 2 !== 0) {
-      continue;
-    }
-    revertedCommitHashes.add(revertedState.hash);
-    for (const number of revertedState.references) {
-      revertedReferences.add(number);
-    }
-  }
-  const activePullRequests = resolveAssociatedPullRequests(
-    activeCommits.map((commit) => commit.hash),
-    targetTimestamp,
-  );
-  const resolvedCoauthors = resolveCommitCoauthors(activeCommits);
-  const pullRequests = new Set();
-  const nonRevertPullRequests = new Set();
-  for (const commit of activeCommits) {
-    const associatedPullRequests = activePullRequests.get(commit.hash) ?? [];
-    commit.pullRequests = associatedPullRequests;
-    addHandles(commit.coauthors, resolvedCoauthors.get(commit.hash) ?? []);
-    appendReferences(commit.references, associatedPullRequests);
-    for (const number of associatedPullRequests) {
-      pullRequests.add(number);
-      if (!commit.isRevert) {
-        nonRevertPullRequests.add(number);
-      }
-    }
-    appendReferences(references, commit.references);
-    if (commit.coauthors.length === 0) {
-      continue;
-    }
-    for (const number of commit.references) {
+    for (const number of commitReferences) {
       const handles = coauthorsByReference.get(number) ?? new Set();
-      for (const handle of commit.coauthors) {
+      for (const handle of coauthors) {
         handles.add(handle);
       }
       coauthorsByReference.set(number, handles);
     }
   }
-  const revertedPullRequests = new Set();
-  for (const pullRequests of resolveAssociatedPullRequests(
-    [...revertedCommitHashes],
-    targetTimestamp,
-  ).values()) {
-    for (const number of pullRequests) {
-      revertedPullRequests.add(number);
-    }
-  }
-  // A later active implementation supersedes an earlier reverted fix, including
-  // direct commits that cite the same issue without having a recoverable PR.
   for (const commit of activeCommits) {
     if (commit.isRevert) {
       continue;
@@ -784,28 +691,38 @@ function sourceCommits(base, target) {
       revertedReferences.delete(number);
     }
   }
-  // A PR can span several commits. A reverted commit does not erase the PR while
-  // another non-revert commit from it remains active in this release range.
-  for (const number of revertedPullRequests) {
-    if (!nonRevertPullRequests.has(number)) {
-      pullRequests.delete(number);
-      revertedReferences.add(number);
-    }
-  }
   for (const number of pullRequests) {
     revertedReferences.delete(number);
   }
-
   return {
     activeCommits,
     coauthorsByReference,
-    mergeBase,
+    finalTarget: inventory.range.finalTarget,
+    inventory,
+    mergeBase: inventory.range.mergeBase,
     pullRequests,
     references,
     revertedReferences,
-    target: targetCommit,
-    targetTimestamp,
+    sourceTail: inventory.range.sourceTail,
+    target: inventory.range.sourceTarget,
+    targetTimestamp: inventory.range.targetTimestamp,
   };
+}
+
+export function graphqlDataForResponse(response) {
+  const errors = Array.isArray(response?.errors) ? response.errors : [];
+  if (errors.length > 0) {
+    fail(
+      `GitHub GraphQL response contained errors:\n${errors
+        .map((error) => error?.message || "unknown GraphQL error")
+        .join("\n")}`,
+    );
+  }
+  if (response?.data && typeof response.data === "object") {
+    return response.data;
+  }
+  const detail = response?.message ? `\n${response.message}` : "";
+  fail(`GitHub GraphQL response did not include data.${detail}`);
 }
 
 function graphql(query) {
@@ -813,18 +730,7 @@ function graphql(query) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       const response = githubApi(["graphql", "-f", `query=${query}`]);
-      if (response?.data && typeof response.data === "object") {
-        return response.data;
-      }
-      const errors = Array.isArray(response?.errors)
-        ? response.errors.map((error) => error?.message).filter(Boolean)
-        : [];
-      const detail = [...errors, response?.message].filter(Boolean).join("\n");
-      throw new Error(
-        detail
-          ? `GitHub GraphQL response did not include data:\n${detail}`
-          : "GitHub GraphQL response did not include data.",
-      );
+      return graphqlDataForResponse(response);
     } catch (error) {
       lastError = error;
       const message = [error?.message, error?.stdout, error?.stderr].filter(Boolean).join("\n");
@@ -842,145 +748,274 @@ function graphql(query) {
   throw lastError;
 }
 
-function resolveAssociatedPullRequests(commitHashes, targetTimestamp) {
-  const pullRequestsByCommit = new Map();
+export function resolveAssociatedPullRequests(
+  commitHashes,
+  targetTimestamp,
+  allowExactMergeCommit = true,
+  { fetchPage = graphql } = {},
+) {
+  const states = new Map(
+    commitHashes.map((commit) => [
+      commit,
+      {
+        all: [],
+        expectedCount: undefined,
+        included: [],
+        seenCursors: new Set(),
+        seenNumbers: new Set(),
+      },
+    ]),
+  );
   const pending = [];
-  function appendPullRequests(commitHash, connection) {
-    const pullRequests = pullRequestsByCommit.get(commitHash) ?? [];
-    const seen = new Set(pullRequests);
-    for (const pullRequest of connection?.nodes ?? []) {
-      // GitHub's mergedAt can trail the merge commit timestamp by a second.
-      // Keep an exact merge-commit association so a release ending there does not drop its PR.
-      const isExactMergeCommit = pullRequest.mergeCommit?.oid === commitHash;
+  function appendPage(commit, connection) {
+    const state = states.get(commit);
+    if (
+      !connection ||
+      !Array.isArray(connection.nodes) ||
+      !Number.isInteger(connection.totalCount) ||
+      connection.totalCount < 0 ||
+      typeof connection.pageInfo?.hasNextPage !== "boolean" ||
+      (connection.pageInfo.hasNextPage &&
+        (typeof connection.pageInfo.endCursor !== "string" ||
+          connection.pageInfo.endCursor.length === 0))
+    ) {
+      fail(`GitHub did not return a complete associatedPullRequests connection for ${commit}`);
+    }
+    if (state.expectedCount !== undefined && state.expectedCount !== connection.totalCount) {
+      fail(`GitHub associatedPullRequests totalCount changed for commit ${commit}`);
+    }
+    state.expectedCount = connection.totalCount;
+    for (const pullRequest of connection.nodes) {
+      const hasMergedAt = Object.hasOwn(pullRequest ?? {}, "mergedAt");
+      const hasMergeCommit = Object.hasOwn(pullRequest ?? {}, "mergeCommit");
+      const mergedAt =
+        typeof pullRequest?.mergedAt === "string"
+          ? Date.parse(pullRequest.mergedAt)
+          : pullRequest?.mergedAt === null
+            ? undefined
+            : Number.NaN;
+      const mergeCommit = pullRequest?.mergeCommit;
       if (
-        pullRequest.mergedAt &&
-        (isExactMergeCommit || mergedByTarget(pullRequest.mergedAt, targetTimestamp)) &&
-        !seen.has(pullRequest.number)
+        !Number.isInteger(pullRequest?.number) ||
+        pullRequest.number <= 0 ||
+        !hasMergedAt ||
+        !hasMergeCommit ||
+        (pullRequest.mergedAt !== null && !Number.isFinite(mergedAt)) ||
+        (mergeCommit !== null &&
+          (typeof mergeCommit !== "object" ||
+            typeof mergeCommit.oid !== "string" ||
+            !/^[0-9a-f]{40}$/.test(mergeCommit.oid)))
       ) {
-        pullRequests.push(pullRequest.number);
-        seen.add(pullRequest.number);
+        fail(`GitHub returned an invalid associated pull request for commit ${commit}`);
+      }
+      if (state.seenNumbers.has(pullRequest.number)) {
+        fail(`GitHub associatedPullRequests returned a duplicate member for commit ${commit}`);
+      }
+      state.seenNumbers.add(pullRequest.number);
+      state.all.push(pullRequest.number);
+      const exactMerge = allowExactMergeCommit && pullRequest.mergeCommit?.oid === commit;
+      if (exactMerge && mergedAt > targetTimestamp + 1_000) {
+        fail(`exact merge association for commit ${commit} was merged after the release target`);
+      }
+      if (
+        Number.isFinite(mergedAt) &&
+        (mergedAt <= targetTimestamp || (exactMerge && mergedAt <= targetTimestamp + 1_000))
+      ) {
+        state.included.push(pullRequest.number);
       }
     }
-    pullRequestsByCommit.set(commitHash, pullRequests);
-    if (connection?.pageInfo?.hasNextPage) {
-      pending.push({ commitHash, cursor: connection.pageInfo.endCursor });
+    if (connection.pageInfo.hasNextPage) {
+      const cursor = connection.pageInfo.endCursor;
+      if (state.seenCursors.has(cursor)) {
+        fail(`GitHub associatedPullRequests repeated cursor ${cursor} for commit ${commit}`);
+      }
+      state.seenCursors.add(cursor);
+      pending.push({ commit, cursor });
     }
   }
-  for (let index = 0; index < commitHashes.length; index += commitAssociationQueryBatchSize) {
-    const chunk = commitHashes.slice(index, index + commitAssociationQueryBatchSize);
-    const fields = chunk
+  function queryFor(items) {
+    return `query { ${items
       .map(
-        (hash, offset) =>
-          `c${index + offset}: repository(owner: "openclaw", name: "openclaw") {
-            object(expression: ${JSON.stringify(hash)}) {
+        (item, index) =>
+          `c${index}: repository(owner: "openclaw", name: "openclaw") {
+            object(expression: ${JSON.stringify(item.commit)}) {
               ... on Commit {
-                associatedPullRequests(first: 100) {
-                  nodes {
-                    number
-                    mergedAt
-                    mergeCommit { oid }
-                  }
+                associatedPullRequests(first: 100${
+                  item.cursor ? `, after: ${JSON.stringify(item.cursor)}` : ""
+                }) {
+                  totalCount
+                  nodes { number mergedAt mergeCommit { oid } }
                   pageInfo { hasNextPage endCursor }
                 }
               }
             }
           }`,
       )
-      .join("\n");
-    const data = graphql(`query { ${fields} }`);
-    for (let offset = 0; offset < chunk.length; offset += 1) {
-      appendPullRequests(chunk[offset], data[`c${index + offset}`]?.object?.associatedPullRequests);
+      .join("\n")} }`;
+  }
+  for (let index = 0; index < commitHashes.length; index += commitAssociationQueryBatchSize) {
+    const items = commitHashes
+      .slice(index, index + commitAssociationQueryBatchSize)
+      .map((commit) => ({ commit }));
+    const data = fetchPage(queryFor(items));
+    for (let offset = 0; offset < items.length; offset += 1) {
+      appendPage(items[offset].commit, data?.[`c${offset}`]?.object?.associatedPullRequests);
     }
   }
   while (pending.length > 0) {
-    const chunk = pending.splice(0, 20);
-    const fields = chunk
-      .map(
-        (item, offset) =>
-          `c${offset}: repository(owner: "openclaw", name: "openclaw") {
-            object(expression: ${JSON.stringify(item.commitHash)}) {
-              ... on Commit {
-                associatedPullRequests(first: 100, after: ${JSON.stringify(item.cursor)}) {
-                  nodes {
-                    number
-                    mergedAt
-                    mergeCommit { oid }
-                  }
-                  pageInfo { hasNextPage endCursor }
-                }
-              }
-            }
-          }`,
-      )
-      .join("\n");
-    const data = graphql(`query { ${fields} }`);
-    for (let offset = 0; offset < chunk.length; offset += 1) {
-      appendPullRequests(
-        chunk[offset].commitHash,
-        data[`c${offset}`]?.object?.associatedPullRequests,
+    const items = pending.splice(0, 20);
+    const data = fetchPage(queryFor(items));
+    for (let offset = 0; offset < items.length; offset += 1) {
+      appendPage(items[offset].commit, data?.[`c${offset}`]?.object?.associatedPullRequests);
+    }
+  }
+  for (const [commit, state] of states) {
+    if (state.seenNumbers.size !== state.expectedCount) {
+      fail(
+        `GitHub associatedPullRequests did not return ${state.expectedCount} complete unique members for commit ${commit}`,
       );
     }
   }
-  return pullRequestsByCommit;
+  return {
+    allPullRequests: new Map(
+      [...states].map(([commit, state]) => [
+        commit,
+        state.all.toSorted((left, right) => left - right),
+      ]),
+    ),
+    pullRequests: new Map(
+      [...states].map(([commit, state]) => [
+        commit,
+        state.included.toSorted((left, right) => left - right),
+      ]),
+    ),
+    unresolved: [],
+  };
 }
 
 function issueConnectionName(node) {
-  if (node.__typename === "Issue") {
+  if (node?.__typename === "Issue") {
     return "closedByPullRequestsReferences";
   }
-  if (node.__typename === "PullRequest") {
+  if (node?.__typename === "PullRequest") {
     return "closingIssuesReferences";
   }
   return undefined;
 }
 
-function resolveIssueRelationshipPages(nodes) {
+export function resolveIssueRelationshipPages(nodes, { fetchPage = graphql } = {}) {
+  const states = new Map();
   const pending = [];
-  for (const [number, node] of nodes) {
-    const connectionName = issueConnectionName(node);
-    const pageInfo = connectionName ? node[connectionName]?.pageInfo : undefined;
-    if (pageInfo?.hasNextPage) {
-      pending.push({ connectionName, cursor: pageInfo.endCursor, number, type: node.__typename });
+
+  function appendPage(number, connection) {
+    const state = states.get(number);
+    if (
+      !connection ||
+      !Array.isArray(connection.nodes) ||
+      !Number.isInteger(connection.totalCount) ||
+      connection.totalCount < 0 ||
+      typeof connection.pageInfo?.hasNextPage !== "boolean" ||
+      (connection.pageInfo.hasNextPage &&
+        (typeof connection.pageInfo.endCursor !== "string" ||
+          connection.pageInfo.endCursor.length === 0))
+    ) {
+      fail(`GitHub did not return a complete ${state.connectionName} connection for #${number}`);
+    }
+    if (state.expectedCount !== undefined && state.expectedCount !== connection.totalCount) {
+      fail(`GitHub ${state.connectionName} totalCount changed for #${number}`);
+    }
+    state.expectedCount = connection.totalCount;
+    for (const member of connection.nodes) {
+      if (!Number.isInteger(member?.number) || member.number <= 0) {
+        fail(`GitHub returned an invalid ${state.connectionName} member for #${number}`);
+      }
+      if (state.seenNumbers.has(member.number)) {
+        fail(`GitHub ${state.connectionName} returned a duplicate member for #${number}`);
+      }
+      state.seenNumbers.add(member.number);
+      state.members.push(member);
+    }
+    if (state.seenNumbers.size > state.expectedCount) {
+      fail(`GitHub ${state.connectionName} returned more members than totalCount for #${number}`);
+    }
+    if (connection.pageInfo.hasNextPage) {
+      const cursor = connection.pageInfo.endCursor;
+      if (state.seenCursors.has(cursor)) {
+        fail(`GitHub ${state.connectionName} repeated cursor ${cursor} for #${number}`);
+      }
+      state.seenCursors.add(cursor);
+      pending.push({
+        connectionName: state.connectionName,
+        cursor,
+        number,
+        type: state.type,
+      });
     }
   }
+
+  for (const [number, node] of nodes) {
+    const connectionName = issueConnectionName(node);
+    if (!connectionName || node.number !== number) {
+      fail(`GitHub returned an invalid issue or pull request for #${number}`);
+    }
+    states.set(number, {
+      connectionName,
+      expectedCount: undefined,
+      members: [],
+      seenCursors: new Set(),
+      seenNumbers: new Set(),
+      type: node.__typename,
+    });
+    appendPage(number, node[connectionName]);
+  }
+
   while (pending.length > 0) {
     const chunk = pending.splice(0, 20);
     const fields = chunk
       .map((item, offset) => {
         const connection = `${item.connectionName}(first: 100, after: ${JSON.stringify(item.cursor)}) {
+          totalCount
           nodes { number }
           pageInfo { hasNextPage endCursor }
         }`;
         return `n${offset}: repository(owner: "openclaw", name: "openclaw") {
           issueOrPullRequest(number: ${item.number}) {
             ... on ${item.type} {
+              number
               ${connection}
             }
           }
         }`;
       })
       .join("\n");
-    const data = graphql(`query { ${fields} }`);
+    const data = fetchPage(`query { ${fields} }`);
     for (let offset = 0; offset < chunk.length; offset += 1) {
       const item = chunk[offset];
-      const node = nodes.get(item.number);
-      const connection = data[`n${offset}`]?.issueOrPullRequest?.[item.connectionName];
-      if (!node || !connection) {
-        continue;
+      const alias = data?.[`n${offset}`];
+      const pageNode = alias?.issueOrPullRequest;
+      if (
+        !alias ||
+        !Object.hasOwn(alias, "issueOrPullRequest") ||
+        !pageNode ||
+        pageNode.number !== item.number
+      ) {
+        fail(`GitHub did not return issue or pull request #${item.number} while paginating`);
       }
-      node[item.connectionName] = {
-        nodes: [...(node[item.connectionName]?.nodes ?? []), ...connection.nodes],
-        pageInfo: connection.pageInfo,
-      };
-      if (connection.pageInfo.hasNextPage) {
-        pending.push({
-          connectionName: item.connectionName,
-          cursor: connection.pageInfo.endCursor,
-          number: item.number,
-          type: item.type,
-        });
-      }
+      appendPage(item.number, pageNode[item.connectionName]);
     }
+  }
+
+  for (const [number, state] of states) {
+    if (state.seenNumbers.size !== state.expectedCount) {
+      fail(
+        `GitHub ${state.connectionName} did not return ${state.expectedCount} complete unique members for #${number}`,
+      );
+    }
+    nodes.get(number)[state.connectionName] = {
+      nodes: state.members,
+      pageInfo: { endCursor: null, hasNextPage: false },
+      totalCount: state.expectedCount,
+    };
   }
   return nodes;
 }
@@ -999,6 +1034,7 @@ function resolveReferences(numbers) {
               title
               author { __typename login }
               closedByPullRequestsReferences(first: 100) {
+                totalCount
                 nodes { number }
                 pageInfo { hasNextPage endCursor }
               }
@@ -1009,6 +1045,7 @@ function resolveReferences(numbers) {
               mergedAt
               author { __typename login }
               closingIssuesReferences(first: 100) {
+                totalCount
                 nodes { number }
                 pageInfo { hasNextPage endCursor }
               }
@@ -1019,13 +1056,34 @@ function resolveReferences(numbers) {
       .join("\n");
     const data = graphql(`query { ${fields} }`);
     for (const number of chunk) {
-      const node = data[`n${number}`]?.issueOrPullRequest;
+      const alias = data?.[`n${number}`];
+      if (!alias || !Object.hasOwn(alias, "issueOrPullRequest")) {
+        fail(`GitHub did not return an issueOrPullRequest result for #${number}`);
+      }
+      const node = alias.issueOrPullRequest;
       if (node) {
         nodes.set(number, node);
       }
     }
   }
   return resolveIssueRelationshipPages(nodes);
+}
+
+function unresolvedRelationshipMembers(nodes, sourceNumbers, connectionName) {
+  const unresolved = [];
+  for (const sourceNumber of sourceNumbers) {
+    const node = nodes.get(sourceNumber);
+    for (const member of node?.[connectionName]?.nodes ?? []) {
+      if (!nodes.has(member.number)) {
+        unresolved.push({
+          connectionName,
+          member: member.number,
+          source: sourceNumber,
+        });
+      }
+    }
+  }
+  return unresolved;
 }
 
 function resolveGitHubHandles(handles) {
@@ -1082,42 +1140,122 @@ function resolveDirectCommitAuthors(commits) {
   return resolved;
 }
 
-function resolveCommitCoauthors(commits) {
-  const resolved = new Map();
+export function resolveCommitCoauthors(commits, { fetchPage = graphql } = {}) {
   const commitsWithCoauthors = commits.filter((commit) => commit.coauthorEmails.length > 0);
-  for (let index = 0; index < commitsWithCoauthors.length; index += 40) {
-    const chunk = commitsWithCoauthors.slice(index, index + 40);
-    const fields = chunk
+  const states = new Map(
+    commitsWithCoauthors.map((commit) => [
+      commit.hash,
+      {
+        coauthorEmails: new Set(commit.coauthorEmails.map((email) => email.toLowerCase())),
+        expectedCount: undefined,
+        handles: [],
+        seenCursors: new Set(),
+        seenMembers: new Set(),
+      },
+    ]),
+  );
+  const pending = [];
+
+  function appendPage(commit, connection) {
+    const state = states.get(commit);
+    if (
+      !connection ||
+      !Array.isArray(connection.nodes) ||
+      !Number.isInteger(connection.totalCount) ||
+      connection.totalCount < 0 ||
+      typeof connection.pageInfo?.hasNextPage !== "boolean" ||
+      (connection.pageInfo.hasNextPage &&
+        (typeof connection.pageInfo.endCursor !== "string" ||
+          connection.pageInfo.endCursor.length === 0))
+    ) {
+      fail(`GitHub did not return a complete authors connection for commit ${commit}`);
+    }
+    if (state.expectedCount !== undefined && state.expectedCount !== connection.totalCount) {
+      fail(`GitHub authors totalCount changed for commit ${commit}`);
+    }
+    state.expectedCount = connection.totalCount;
+    for (const author of connection.nodes) {
+      if (
+        typeof author?.email !== "string" ||
+        (author.user !== null &&
+          (typeof author.user !== "object" || typeof author.user.login !== "string"))
+      ) {
+        fail(`GitHub returned an invalid author for commit ${commit}`);
+      }
+      const memberKey = JSON.stringify({
+        email: author.email.toLowerCase(),
+        login: author.user?.login?.toLowerCase() ?? null,
+      });
+      if (state.seenMembers.has(memberKey)) {
+        fail(`GitHub authors returned a duplicate member for commit ${commit}`);
+      }
+      state.seenMembers.add(memberKey);
+      if (
+        state.coauthorEmails.has(author.email.toLowerCase()) &&
+        isEligibleHandle(author.user?.login)
+      ) {
+        addHandles(state.handles, [author.user.login]);
+      }
+    }
+    if (state.seenMembers.size > state.expectedCount) {
+      fail(`GitHub authors returned more members than totalCount for commit ${commit}`);
+    }
+    if (connection.pageInfo.hasNextPage) {
+      const cursor = connection.pageInfo.endCursor;
+      if (state.seenCursors.has(cursor)) {
+        fail(`GitHub authors repeated cursor ${cursor} for commit ${commit}`);
+      }
+      state.seenCursors.add(cursor);
+      pending.push({ commit, cursor });
+    }
+  }
+
+  function queryFor(items) {
+    return `query { ${items
       .map(
-        (commit, offset) =>
-          `c${index + offset}: repository(owner: "openclaw", name: "openclaw") {
-            object(expression: ${JSON.stringify(commit.hash)}) {
+        (item, offset) =>
+          `c${offset}: repository(owner: "openclaw", name: "openclaw") {
+            object(expression: ${JSON.stringify(item.commit)}) {
               ... on Commit {
-                authors(first: 20) {
+                authors(first: 100${item.cursor ? `, after: ${JSON.stringify(item.cursor)}` : ""}) {
+                  totalCount
                   nodes {
                     email
                     user { login }
                   }
+                  pageInfo { hasNextPage endCursor }
                 }
               }
             }
           }`,
       )
-      .join("\n");
-    const data = graphql(`query { ${fields} }`);
-    for (let offset = 0; offset < chunk.length; offset += 1) {
-      const coauthorEmails = new Set(
-        chunk[offset].coauthorEmails.map((email) => email.toLowerCase()),
-      );
-      const handles =
-        data[`c${index + offset}`]?.object?.authors?.nodes
-          .filter((author) => coauthorEmails.has(author.email?.toLowerCase()))
-          .map((author) => author.user?.login)
-          .filter(isEligibleHandle) ?? [];
-      resolved.set(chunk[offset].hash, handles);
+      .join("\n")} }`;
+  }
+
+  for (let index = 0; index < commitsWithCoauthors.length; index += 40) {
+    const items = commitsWithCoauthors.slice(index, index + 40).map((commit) => ({
+      commit: commit.hash,
+    }));
+    const data = fetchPage(queryFor(items));
+    for (let offset = 0; offset < items.length; offset += 1) {
+      appendPage(items[offset].commit, data?.[`c${offset}`]?.object?.authors);
     }
   }
-  return resolved;
+  while (pending.length > 0) {
+    const items = pending.splice(0, 20);
+    const data = fetchPage(queryFor(items));
+    for (let offset = 0; offset < items.length; offset += 1) {
+      appendPage(items[offset].commit, data?.[`c${offset}`]?.object?.authors);
+    }
+  }
+  for (const [commit, state] of states) {
+    if (state.seenMembers.size !== state.expectedCount) {
+      fail(
+        `GitHub authors did not return ${state.expectedCount} complete unique members for commit ${commit}`,
+      );
+    }
+  }
+  return new Map([...states].map(([commit, state]) => [commit, state.handles]));
 }
 
 function withDirectCommitAuthors(commits, resolvedAuthors) {
@@ -1356,9 +1494,6 @@ export function ledgerFor(
   relationships,
   priorRecord,
   sourcePullRequests,
-  sourceReferences,
-  noteReferences,
-  legacyIssuePullRequests,
   revertedReferences,
   shippedBaselines,
   targetTimestamp,
@@ -1379,13 +1514,7 @@ export function ledgerFor(
     };
   });
 
-  const recordedPullRequests = new Set([
-    ...sourcePullRequests,
-    ...sourceReferences,
-    ...noteReferences,
-    ...legacyIssuePullRequests,
-    ...priorRecord.pullRequests.keys(),
-  ]);
+  const recordedPullRequests = new Set([...sourcePullRequests, ...priorRecord.pullRequests.keys()]);
   const pullRequests = entries.filter(
     (entry) =>
       entry.type === "PullRequest" &&
@@ -1628,7 +1757,54 @@ export function ledgerChecks(section, pullRequests, nodes, directCommits, shippe
   return errors;
 }
 
-function manifestFor(options, source, ledger, directCommitRecords) {
+function summarizedNumbers(numbers) {
+  const members = [...new Set(numbers)].toSorted((left, right) => left - right);
+  return {
+    count: members.length,
+    members,
+    sha256: createHash("sha256")
+      .update(`${JSON.stringify(members)}\n`)
+      .digest("hex"),
+  };
+}
+
+export function ledgerReconciliationFor(
+  source,
+  renderedRecord,
+  generatedPullRequests = [],
+  allowedHistoricalPullRequests = [],
+) {
+  const canonical = new Set(source.inventory.partitions.pullRequests.included.members);
+  const current = new Set(renderedRecord.pullRequests.keys());
+  const generated = new Set(generatedPullRequests);
+  const allowedHistorical = new Set(allowedHistoricalPullRequests);
+  const missing = [...canonical].filter((number) => !current.has(number));
+  const stale = [...current].filter((number) => !canonical.has(number));
+  const generatedMissing = [...canonical].filter((number) => !generated.has(number));
+  const generatedUnexpected = [...generated].filter(
+    (number) => !canonical.has(number) && !allowedHistorical.has(number),
+  );
+  return {
+    canonicalRows: summarizedNumbers(canonical),
+    coverage:
+      canonical.size === 0
+        ? 1
+        : [...canonical].filter((number) => current.has(number)).length / canonical.size,
+    currentRows: summarizedNumbers(current),
+    equation: `${current.size} - ${stale.length} + ${missing.length} = ${canonical.size}`,
+    generatedCoverage:
+      canonical.size === 0
+        ? 1
+        : [...canonical].filter((number) => generated.has(number)).length / canonical.size,
+    generatedMissingRows: summarizedNumbers(generatedMissing),
+    generatedRows: summarizedNumbers(generated),
+    generatedUnexpectedRows: summarizedNumbers(generatedUnexpected),
+    missingRows: summarizedNumbers(missing),
+    staleRows: summarizedNumbers(stale),
+  };
+}
+
+function manifestFor(options, source, ledger, directCommitRecords, reconciliation) {
   const directCommits = directCommitRecords.map((commit) => ({
     ...editorialClassification(commit.subject),
     commit: commit.hash.slice(0, 12),
@@ -1644,8 +1820,11 @@ function manifestFor(options, source, ledger, directCommitRecords) {
   }));
   const unlinkedCommits = directCommits.filter((commit) => commit.references.length === 0);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     base: options.base,
+    finalTarget: source.finalTarget,
+    inventory: source.inventory,
+    reconciliation,
     target: options.target,
     mergeBase: source.mergeBase,
     version: options.version,
@@ -1707,9 +1886,9 @@ function main() {
   }
   let changelog = readFileSync("CHANGELOG.md", "utf8");
   let section = sectionFor(changelog, options.version);
-  const source = sourceCommits(options.base, options.target);
+  const source = sourceCommits(options);
   const shippedBaselineRecords = options.shippedRefs.map(shippedBaselineFor);
-  const shippedExclusions = subtractShippedPullRequests(source, shippedBaselineRecords);
+  const shippedExclusions = exactShippedPullRequestExclusions(source, shippedBaselineRecords);
   source.shippedBaselines = shippedExclusions.baselines;
   const preexistingNotes = section.source.replace(
     /\n+### Complete contribution (?:ledger|record)[\s\S]*$/m,
@@ -1774,7 +1953,6 @@ function main() {
     noteReferences,
     recordedReferences: effectiveRenderedRecordReferences,
     sourcePullRequests: source.pullRequests,
-    sourceReferences: source.references,
     seededPullRequests: new Set(priorRecord.pullRequests.keys()),
     nodes,
   });
@@ -1809,6 +1987,28 @@ function main() {
   appendReferences(resolvedReferences, titleReferenceNumbers);
   appendReferences(resolvedReferences, closingIssueNumbers);
   nodes = resolveReferences(resolvedReferences);
+  const relationshipDrift = [
+    ...unresolvedRelationshipMembers(
+      nodes,
+      references.filter((number) => nodes.get(number)?.__typename === "PullRequest"),
+      "closingIssuesReferences",
+    ),
+    ...unresolvedRelationshipMembers(
+      nodes,
+      priorRecord.legacyIssues.keys(),
+      "closedByPullRequestsReferences",
+    ),
+  ];
+  if (relationshipDrift.length > 0) {
+    fail(
+      `GitHub relationships changed while resolving release references: ${relationshipDrift
+        .map(
+          (entry) =>
+            `#${entry.source} ${entry.connectionName} now includes unresolved #${entry.member}`,
+        )
+        .join(", ")}; rerun the verifier`,
+    );
+  }
   const invalidRecordedPullRequests = [...priorRecord.pullRequests.keys()].filter((number) => {
     const node = nodes.get(number);
     return (
@@ -1838,7 +2038,6 @@ function main() {
   ];
   const resolvedHandles = resolveGitHubHandles(contributorHandles);
   const relationships = contributionRelationships(source, nodes, resolvedHandles);
-  const unlinkedCommits = source.activeCommits.filter((commit) => commit.references.length === 0);
   const resolvedCommitAuthors = resolveDirectCommitAuthors(relationships.directCommits);
   relationships.directCommits = withDirectCommitAuthors(
     relationships.directCommits,
@@ -1854,45 +2053,59 @@ function main() {
     relationships,
     priorRecord,
     source.pullRequests,
-    source.references,
-    noteReferences,
-    legacyIssuePullRequests,
     source.revertedReferences,
     source.shippedBaselines,
     source.targetTimestamp,
+  );
+  const reconciliation = ledgerReconciliationFor(
+    source,
+    renderedRecord,
+    ledger.pullRequests.map((entry) => entry.number),
+    priorRecord.pullRequests.keys(),
   );
   const manifest = manifestFor(
     { ...options, target: source.target },
     source,
     ledger,
     relationships.directCommits,
+    reconciliation,
   );
-
-  if (options.manifestPath) {
-    writeFileSync(options.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  }
-
+  let candidateChangelog = changelog;
+  let candidateSection = section;
   if (options.writeLedger) {
-    changelog = replaceLedger(
+    candidateChangelog = replaceLedger(
       changelog,
       section,
       ledger.ledger,
       ledger.pullRequests,
       relationships.directCommits,
     );
-    writeFileSync("CHANGELOG.md", changelog);
-    section = sectionFor(changelog, options.version);
+    candidateSection = sectionFor(candidateChangelog, options.version);
   }
 
   const errors = ledgerChecks(
-    section,
+    candidateSection,
     ledger.pullRequests,
     nodes,
     relationships.directCommits,
     source.shippedBaselines,
   );
+  if (reconciliation.generatedMissingRows.count > 0) {
+    errors.push(
+      `generated contribution record is missing canonical PRs: ${reconciliation.generatedMissingRows.members
+        .map((number) => `#${number}`)
+        .join(", ")}`,
+    );
+  }
+  if (reconciliation.generatedUnexpectedRows.count > 0) {
+    errors.push(
+      `generated contribution record contains non-canonical PRs outside --seed-ref: ${reconciliation.generatedUnexpectedRows.members
+        .map((number) => `#${number}`)
+        .join(", ")}`,
+    );
+  }
   const github = options.checkGithub
-    ? releaseChecks(changelog, options.version, options.releaseTags)
+    ? releaseChecks(candidateChangelog, options.version, options.releaseTags)
     : [];
   for (const check of github) {
     if (!check.matches) {
@@ -1901,9 +2114,21 @@ function main() {
       );
     }
   }
+  if (!options.writeLedger || errors.length === 0) {
+    if (options.manifestPath) {
+      writeFileSync(options.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    }
+    if (options.writeLedger) {
+      writeFileSync("CHANGELOG.md", candidateChangelog);
+      changelog = candidateChangelog;
+      section = candidateSection;
+    }
+  }
 
   const result = {
     base: options.base,
+    finalTarget: source.finalTarget,
+    inventorySha256: source.inventory.sha256,
     target: source.target,
     mergeBase: source.mergeBase,
     version: options.version,
@@ -1916,6 +2141,7 @@ function main() {
       unlinkedCommits: manifest.unlinkedCommits.length,
     },
     github,
+    reconciliation,
     errors,
   };
   if (options.json) {

@@ -20,12 +20,13 @@ every human `Thanks @...` attribution.
 ## Inputs
 
 - Target base version: `YYYY.M.PATCH`, without beta suffix.
-- Base tag: last reachable shipped release tag, usually the previous stable or
-  the previous beta train requested by the operator. It must be an ancestor of
-  the target; a newer but divergent tag is not a valid history boundary. Use
-  an explicit shipped/main-closeout SHA only when it is also reachable from the
-  target.
+- Base tag: the previous shipped release used to locate the unique raw-object
+  merge base. It may be on a divergent release line. Repeat it as
+  `--shipped-ref` when it is also publication evidence.
 - Target ref: exact branch/SHA being released.
+- Source target: optional immutable contribution cutoff. When `--target` is a
+  later final candidate, `--source-target` must be its sole parent and that
+  target commit must change only `CHANGELOG.md`.
 
 ## Workflow
 
@@ -33,7 +34,8 @@ every human `Thanks @...` attribution.
    - `git fetch --tags origin`
    - `git pull --ff-only`
    - confirm clean `git status -sb`
-2. Audit history, including direct commits:
+2. Audit integration order, then let the verifier enumerate the complete raw
+   commit DAG including direct and off-first-parent commits:
    - `git log --first-parent --date=iso-strict --pretty=format:'%h%x09%ad%x09%s' <base-tag>..<target-ref>`
    - `git log --first-parent --grep='(#' --date=short --pretty=format:'%h%x09%ad%x09%s' <base-tag>..<target-ref>`
    - also inspect `--since='24 hours ago'` when main moved during the release.
@@ -67,10 +69,22 @@ every human `Thanks @...` attribution.
      target prose, or target record. The manifest and generated provenance retain
      each tag plus the exact excluded PR inventory and count for deterministic
      candidate validation
-   - source PR discovery combines merged GitHub commit associations with merged
-     PR references explicitly present in active commit subjects/bodies so
-     cherry-picks and squash commits remain accounted for. Resolve every
-     association page and exclude PRs merged after the target release commit
+   - source PR ownership comes from complete GitHub commit associations, a
+     strict terminal/directive PR reference, or exact cherry-pick/patch
+     provenance under a repeatable trusted `--provenance-ref`
+   - every strict ownership reference must resolve to a pull request merged by
+     the source-target cutoff; issue numbers, open PRs, and later merges fail
+     closed instead of becoming contribution rows
+   - generic `#NNN`, `Fixes #NNN`, title, note, and legacy references are
+     metadata only; they never create PR ownership
+   - resolve every association page and fail closed on GraphQL errors, missing
+     aliases/connections, count drift, duplicate members, or repeated cursors
+   - resolve commit-author pages completely so verified non-noreply co-authors
+     retain contributor credit
+   - the manifest records canonical/current/generated/missing/stale PR members
+     and hashes, every commit disposition, ownership evidence, and the raw
+     merge base; ledger writes require the generated rows to match canonical
+     ownership except for an explicit `--seed-ref` historical backfill
    - read the manifest before editing `### Highlights`, `### Changes`, or
      `### Fixes`; do not carry old grouped prose forward without re-auditing it
    - inspect linked PRs/issues or diffs for ambiguous commits. Direct commits
@@ -178,8 +192,9 @@ every human `Thanks @...` attribution.
   direct commits are rendered as a public record dump, when non-editorial
   PRs appear in grouped prose, or when an eligible PR author or known
   co-author is missing from that PR's `Thanks @...` credit. It also fails
-  before history collection when `--base` is not an ancestor of `--target`,
-  when `### Highlights` has fewer than five or more than eight top-level
+  before history collection when the raw object graph is shallow, grafted,
+  replaced, missing, or has an ambiguous merge base, when `### Highlights` has
+  fewer than five or more than eight top-level
   bullets, or when the existing prose/record names a PR outside the source
   range. Only an explicit `--seed-ref` may add historical PR inventory; an
   explicit repeatable `--shipped-ref` may subtract PRs proven present in a

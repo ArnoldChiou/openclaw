@@ -628,7 +628,16 @@ const TOOLING_SOURCE_TEST_TARGETS = new Map([
   ["Dockerfile", ROOT_DOCKERFILE_TEST_TARGETS],
   [
     ".agents/skills/openclaw-changelog-update/scripts/verify-release-notes.mjs",
-    ["test/scripts/release-notes-ledger.test.ts", "test/scripts/verify-release-notes.test.ts"],
+    [
+      "test/scripts/release-notes-associated-pull-requests.test.ts",
+      "test/scripts/release-notes-ledger.test.ts",
+      "test/scripts/release-notes-source-inventory.test.ts",
+      "test/scripts/verify-release-notes.test.ts",
+    ],
+  ],
+  [
+    ".agents/skills/openclaw-changelog-update/scripts/lib/release-source-inventory.mjs",
+    ["test/scripts/release-notes-source-inventory.test.ts"],
   ],
   [".crabbox.yaml", ["test/scripts/package-acceptance-workflow.test.ts"]],
   [".github/actions/detect-docs-changes/action.yml", ["test/scripts/ci-workflow-guards.test.ts"]],

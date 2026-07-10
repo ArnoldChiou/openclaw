@@ -213,7 +213,7 @@ describe("release-note verification", () => {
       );
 
       expect(result.stderr).toBe("");
-      expect(result.status).toBe(0);
+      expect(result.status, result.stdout).toBe(0);
       expect(JSON.parse(result.stdout).target).toBe(targetSha);
       expect(readFileSync(join(cwd, "CHANGELOG.md"), "utf8")).toContain(
         `This audited record covers the complete HEAD..${targetSha} history:`,
@@ -223,7 +223,7 @@ describe("release-note verification", () => {
     }
   });
 
-  it("rejects a release base that is not an ancestor of the target", () => {
+  it("uses the raw merge base when the shipped release line diverged", () => {
     const cwd = mkdtempSync(join(tmpdir(), "openclaw-release-notes-"));
     try {
       git(cwd, ["init", "-q"]);
@@ -236,7 +236,15 @@ describe("release-note verification", () => {
           "",
           "### Highlights",
           "",
-          "- Test release.",
+          "- One.",
+          "- Two.",
+          "- Three.",
+          "- Four.",
+          "- Five.",
+          "",
+          "### Changes",
+          "",
+          "### Fixes",
           "",
           "### Complete contribution record",
           "",
@@ -252,20 +260,30 @@ describe("release-note verification", () => {
       git(cwd, ["tag", "base-ref"]);
 
       git(cwd, ["checkout", "-q", "target"]);
-      writeFileSync(join(cwd, "target.txt"), "target\n");
-      git(cwd, ["add", "target.txt"]);
-      git(cwd, ["commit", "-qm", "target"]);
+      const target = git(cwd, ["rev-parse", "HEAD"]);
 
       const result = spawnSync(
         process.execPath,
-        [verifier, "--base", "base-ref", "--target", "HEAD", "--version", "2026.7.1"],
+        [
+          verifier,
+          "--base",
+          "base-ref",
+          "--target",
+          "HEAD",
+          "--version",
+          "2026.7.1",
+          "--write-ledger",
+          "--json",
+        ],
         { cwd, encoding: "utf8" },
       );
 
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain(
-        "release range base base-ref must be an ancestor of target HEAD",
-      );
+      expect(result.stderr).toBe("");
+      expect(result.status, result.stdout).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        mergeBase: target,
+        target,
+      });
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

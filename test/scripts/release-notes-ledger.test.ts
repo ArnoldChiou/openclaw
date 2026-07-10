@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   contributionRecordFor,
+  exactShippedPullRequestExclusions,
   ledgerChecks,
   ledgerFor,
+  ledgerReconciliationFor,
   renderContributionRecordEntry,
 } from "../../.agents/skills/openclaw-changelog-update/scripts/verify-release-notes.mjs";
 
@@ -110,9 +112,6 @@ describe("renderContributionRecordEntry", () => {
       priorRecord,
       new Set([125]),
       new Set(),
-      new Set(),
-      new Set(),
-      new Set(),
       [],
       Date.parse("2026-07-09T00:00:00Z"),
     );
@@ -217,5 +216,73 @@ describe("renderContributionRecordEntry", () => {
     expect(
       ledgerChecks({ source }, [entry], new Map([[127, { __typename: "PullRequest" }]]), []),
     ).toEqual([]);
+  });
+});
+
+describe("generated contribution reconciliation", () => {
+  const source = {
+    inventory: {
+      partitions: {
+        pullRequests: {
+          included: { members: [1] },
+        },
+      },
+    },
+  };
+  const renderedRecord = { pullRequests: new Map([[9, {}]]) };
+
+  it("reports missing and unexpected generated rows independently of the current record", () => {
+    const reconciliation = ledgerReconciliationFor(source, renderedRecord, [2]);
+
+    expect(reconciliation).toMatchObject({
+      canonicalRows: { members: [1] },
+      currentRows: { members: [9] },
+      generatedMissingRows: { members: [1] },
+      generatedRows: { members: [2] },
+      generatedUnexpectedRows: { members: [2] },
+    });
+  });
+
+  it("accepts exact canonical rows and an explicit historical seed only", () => {
+    expect(ledgerReconciliationFor(source, renderedRecord, [1])).toMatchObject({
+      generatedCoverage: 1,
+      generatedMissingRows: { count: 0 },
+      generatedUnexpectedRows: { count: 0 },
+    });
+    expect(ledgerReconciliationFor(source, renderedRecord, [1, 2], [2])).toMatchObject({
+      generatedCoverage: 1,
+      generatedMissingRows: { count: 0 },
+      generatedUnexpectedRows: { count: 0 },
+    });
+  });
+});
+
+describe("shipped contribution exclusions", () => {
+  it("keeps a PR when any commit from it remains active in the release", () => {
+    const source = {
+      inventory: {
+        commits: [
+          {
+            disposition: "shipped",
+            pullRequests: [1, 2],
+            shippedEvidence: [{ ref: "v1" }, { ref: "v2" }],
+          },
+        ],
+        partitions: {
+          pullRequests: {
+            included: { members: [2] },
+            shipped: { members: [1, 2] },
+          },
+        },
+      },
+    };
+
+    expect(exactShippedPullRequestExclusions(source, [{ ref: "v2" }, { ref: "v1" }])).toEqual({
+      baselines: [
+        { count: 1, pullRequests: [1], ref: "v1" },
+        { count: 0, pullRequests: [], ref: "v2" },
+      ],
+      pullRequests: new Set([1]),
+    });
   });
 });
