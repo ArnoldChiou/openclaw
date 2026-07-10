@@ -346,37 +346,6 @@ function renderToolDataBlock(params: { label: string; text: string }) {
   `;
 }
 
-function renderCollapsedToolSummary(params: {
-  label: string;
-  icon: ReturnType<typeof html> | undefined;
-  name?: string;
-  expanded: boolean;
-  isError?: boolean;
-  onToggleExpanded: () => void;
-}) {
-  const { label, icon, name, expanded, isError, onToggleExpanded } = params;
-  const displayLabel = formatCollapsedToolSummaryText(label) ?? label;
-  const displayName = formatDistinctCollapsedToolSummaryText(name, displayLabel);
-  return html`
-    <button
-      class="chat-tool-msg-summary ${isError ? "chat-tool-msg-summary--error" : ""}"
-      type="button"
-      aria-expanded=${String(expanded)}
-      @click=${(event: MouseEvent) => {
-        if (shouldToggleSelectableDisclosure(event)) {
-          onToggleExpanded();
-        }
-      }}
-    >
-      <span class="chat-tool-msg-summary__icon">${icon}</span>
-      <span class="chat-tool-msg-summary__label">${displayLabel}</span>
-      ${displayName
-        ? html`<span class="chat-tool-msg-summary__names">${displayName}</span>`
-        : nothing}
-    </button>
-  `;
-}
-
 // ── Kind-aware tool rows (command / read / edit / write / search / fetch) ──
 
 const TOOL_ROW_VERBS: Partial<Record<ToolCallView["kind"], string>> = {
