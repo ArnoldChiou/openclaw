@@ -132,6 +132,29 @@ export function upstreamErrorStatus(status: number): number {
   return 502;
 }
 
+// GitHub reports quota exhaustion as 429 or as 403 with exhausted-quota
+// headers; a bare 403 is a permission response and must stay distinguishable
+// so callers can degrade optional fetches instead of flagging rate limits.
+function isGitHubRateLimitResponse(response: Response): boolean {
+  if (response.status === 429) {
+    return true;
+  }
+  return (
+    response.status === 403 &&
+    (response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after"))
+  );
+}
+
+function jsonErrorStatus(response: Response): number {
+  if (isGitHubRateLimitResponse(response)) {
+    return 429;
+  }
+  if (response.status === 404 || response.status === 403) {
+    return response.status;
+  }
+  return 502;
+}
+
 /** Fetch a GitHub API JSON document with bounded size and normalized errors. */
 export async function fetchGitHubJson(
   rawUrl: string,
@@ -140,11 +163,9 @@ export async function fetchGitHubJson(
 ): Promise<unknown> {
   const response = await fetchGitHubApi(rawUrl, fetchImpl, token);
   if (!response.ok) {
+    const status = jsonErrorStatus(response);
     await discardResponse(response);
-    throw new ControlUiGitHubError(
-      upstreamErrorStatus(response.status),
-      `GitHub request failed (${response.status})`,
-    );
+    throw new ControlUiGitHubError(status, `GitHub request failed (${response.status})`);
   }
   const body = await readBoundedResponse(response, GITHUB_JSON_MAX_BYTES);
   try {

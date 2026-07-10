@@ -232,12 +232,17 @@ describe("loadControlUiSessionPullRequests", () => {
 
   it("serves stale chips flagged rateLimited when GitHub quota runs out", async () => {
     let limited = false;
+    const rateLimitedResponse = () =>
+      new Response(JSON.stringify({ message: "rate limited" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json", "x-ratelimit-remaining": "0" },
+      });
     const fetchImpl = routedFetch([
       {
         match: "/pulls?head=",
         response: () =>
           limited
-            ? githubJson({ message: "rate limited" }, 403)
+            ? rateLimitedResponse()
             : githubJson([pullListItem({ merged_at: "2026-07-09T10:00:00Z" })]),
       },
     ]);
@@ -256,6 +261,28 @@ describe("loadControlUiSessionPullRequests", () => {
     );
     expect(stale.rateLimited).toBe(true);
     expect(stale.pullRequests).toEqual(fresh.pullRequests);
+  });
+
+  it("degrades permission 403s on optional fetches to chips without checks", async () => {
+    // A bare 403 (fine-grained token without checks read) is not a rate
+    // limit; the chip must render without CI instead of aborting the row.
+    const fetchImpl = routedFetch([
+      { match: "/pulls?head=", response: () => githubJson([pullListItem()]) },
+      { match: "/pulls/103469", response: () => githubJson({ additions: 4, deletions: 3 }) },
+      {
+        match: "/check-runs",
+        response: () => githubJson({ message: "Resource not accessible by integration" }, 403),
+      },
+    ]);
+
+    const result = await loadControlUiSessionPullRequests(
+      { sessionKey: "agent:main:main" },
+      { fetchImpl, resolveGitContext },
+    );
+
+    expect(result.rateLimited).toBe(false);
+    expect(result.pullRequests[0]).toMatchObject({ number: 103469, additions: 4, deletions: 3 });
+    expect(result.pullRequests[0]?.checks).toBeUndefined();
   });
 
   it("returns no chips without a git context and spends no quota", async () => {
