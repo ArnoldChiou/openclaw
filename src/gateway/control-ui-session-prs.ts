@@ -29,6 +29,7 @@ const MAX_PULL_REQUESTS = 3;
 
 export type ControlUiSessionPullRequestsParams = {
   sessionKey: string;
+  agentId?: string;
 };
 
 /** GitHub repo + branch resolved from a session's git checkout. */
@@ -69,7 +70,11 @@ export function parseControlUiSessionPullRequestsParams(
     return null;
   }
   const sessionKey = typeof value.sessionKey === "string" ? value.sessionKey.trim() : "";
-  return sessionKey ? { sessionKey } : null;
+  if (!sessionKey) {
+    return null;
+  }
+  const agentId = typeof value.agentId === "string" ? value.agentId.trim() : "";
+  return agentId ? { sessionKey, agentId } : { sessionKey };
 }
 
 async function gitOutput(cwd: string, args: string[]): Promise<string | null> {
@@ -115,20 +120,32 @@ export function parseGitHubRemoteUrl(raw: string): { owner: string; repo: string
 
 /**
  * Resolves the GitHub repo + branch a session works on. Returns null for
- * non-git roots, detached HEADs, non-GitHub remotes, and the remote default
- * branch (no PR can have the default branch as head from the same checkout,
- * and skipping it protects the anonymous GitHub quota for plain sessions).
+ * unknown sessions, non-git roots, detached HEADs, non-GitHub remotes, and
+ * the remote default branch (no PR can have the default branch as head from
+ * the same checkout, and skipping it protects the anonymous GitHub quota for
+ * plain sessions).
  */
 export async function resolveSessionPullRequestGitContext(
-  sessionKey: string,
+  params: ControlUiSessionPullRequestsParams,
 ): Promise<SessionPullRequestGitContext | null> {
-  const { cfg, entry, canonicalKey } = loadSessionEntry(sessionKey);
+  const { cfg, entry, storePath, canonicalKey } = loadSessionEntry(params.sessionKey, {
+    agentId: params.agentId,
+  });
+  // Same session/agent scoping as sessions.files.*: a missing entry means an
+  // unknown or deleted session, which must not fall back to some agent
+  // workspace and surface another checkout's PRs.
+  if (!entry?.sessionId || !storePath) {
+    return null;
+  }
   const agentId = normalizeAgentId(
-    parseAgentSessionKey(canonicalKey)?.agentId ?? resolveDefaultAgentId(cfg),
+    parseAgentSessionKey(canonicalKey)?.agentId ??
+      params.agentId ??
+      parseAgentSessionKey(params.sessionKey)?.agentId ??
+      resolveDefaultAgentId(cfg),
   );
   const root =
-    normalizeOptionalString(entry?.spawnedCwd) ??
-    normalizeOptionalString(entry?.spawnedWorkspaceDir) ??
+    normalizeOptionalString(entry.spawnedCwd) ??
+    normalizeOptionalString(entry.spawnedWorkspaceDir) ??
     normalizeOptionalString(resolveAgentWorkspaceDir(cfg, agentId));
   if (!root) {
     return null;
@@ -370,7 +387,9 @@ async function refreshBranchPullRequests(
 
 export type LoadSessionPullRequestDeps = {
   fetchImpl?: typeof fetch;
-  resolveGitContext?: (sessionKey: string) => Promise<SessionPullRequestGitContext | null>;
+  resolveGitContext?: (
+    params: ControlUiSessionPullRequestsParams,
+  ) => Promise<SessionPullRequestGitContext | null>;
 };
 
 export async function loadControlUiSessionPullRequests(
@@ -378,7 +397,7 @@ export async function loadControlUiSessionPullRequests(
   deps: LoadSessionPullRequestDeps = {},
 ): Promise<ControlUiSessionPullRequests> {
   const resolveGitContext = deps.resolveGitContext ?? resolveSessionPullRequestGitContext;
-  const context = await resolveGitContext(params.sessionKey);
+  const context = await resolveGitContext(params);
   if (!context) {
     return { pullRequests: [], rateLimited: false };
   }

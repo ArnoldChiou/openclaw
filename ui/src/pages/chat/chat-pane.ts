@@ -283,7 +283,7 @@ class ChatPane extends OpenClawLightDomElement {
     try {
       const result = await scope.client.request<ControlUiSessionPullRequests>(
         "controlUi.sessionPullRequests",
-        { sessionKey },
+        { sessionKey, ...scopedAgentParamsForSession(scope.state, sessionKey) },
       );
       if (
         requestVersion !== this.sessionPullRequestsRequestVersion ||

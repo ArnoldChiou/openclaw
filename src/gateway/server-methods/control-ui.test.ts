@@ -114,10 +114,13 @@ describe("controlUi.sessionPullRequests", () => {
     const respond = vi.fn<RespondFn>();
 
     await handlers["controlUi.sessionPullRequests"](
-      requestOptions({ sessionKey: "agent:main:main" }, respond),
+      requestOptions({ sessionKey: "agent:main:main", agentId: "main" }, respond),
     );
 
-    expect(loadPullRequests).toHaveBeenCalledWith({ sessionKey: "agent:main:main" });
+    expect(loadPullRequests).toHaveBeenCalledWith({
+      sessionKey: "agent:main:main",
+      agentId: "main",
+    });
     expect(respond).toHaveBeenCalledWith(true, result, undefined);
   });
 

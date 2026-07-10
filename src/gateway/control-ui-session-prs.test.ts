@@ -83,6 +83,15 @@ describe("parseControlUiSessionPullRequestsParams", () => {
     expect(parseControlUiSessionPullRequestsParams("agent:main:main")).toBeNull();
     expect(parseControlUiSessionPullRequestsParams({})).toBeNull();
   });
+
+  it("keeps the UI's scoped agent id for global-alias session keys", () => {
+    expect(
+      parseControlUiSessionPullRequestsParams({ sessionKey: "global", agentId: "work" }),
+    ).toEqual({ sessionKey: "global", agentId: "work" });
+    expect(parseControlUiSessionPullRequestsParams({ sessionKey: "global", agentId: " " })).toEqual(
+      { sessionKey: "global" },
+    );
+  });
 });
 
 describe("loadControlUiSessionPullRequests", () => {
