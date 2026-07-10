@@ -499,9 +499,9 @@ public struct GatewaySuspendTaskBlocker: Codable, Sendable {
         taskid: String,
         status: String,
         runtime: AnyCodable,
-        runid: String?,
-        label: String?,
-        title: String?)
+        runid: String? = nil,
+        label: String? = nil,
+        title: String? = nil)
     {
         self.taskid = taskid
         self.status = status
@@ -531,7 +531,7 @@ public struct GatewaySuspendBlocker: Codable, Sendable {
         kind: AnyCodable,
         count: Int,
         message: String,
-        task: GatewaySuspendTaskBlocker?)
+        task: GatewaySuspendTaskBlocker? = nil)
     {
         self.kind = kind
         self.count = count
