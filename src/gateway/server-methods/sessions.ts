@@ -2612,13 +2612,15 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     }
     respond(true, { groups: listSessionGroups() }, undefined);
   },
-  "sessions.groups.put": async ({ params, respond }) => {
+  "sessions.groups.put": async ({ params, respond, context }) => {
     if (
       !assertValidParams(params, validateSessionsGroupsPutParams, "sessions.groups.put", respond)
     ) {
       return;
     }
     respond(true, { ok: true, groups: putSessionGroups(params.names) }, undefined);
+    // Catalog-only changes still need to reach other open clients.
+    emitSessionsChanged(context, { reason: "groups" });
   },
   "sessions.groups.rename": async ({ params, respond, context }) => {
     if (
@@ -2638,9 +2640,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
         to: params.to,
       });
       respond(true, { ok: true, ...result }, undefined);
-      if (result.updatedSessions > 0) {
-        emitSessionsChanged(context, { reason: "groups" });
-      }
+      emitSessionsChanged(context, { reason: "groups" });
     } catch (error) {
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error)));
     }
@@ -2662,9 +2662,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
         name: params.name,
       });
       respond(true, { ok: true, ...result }, undefined);
-      if (result.updatedSessions > 0) {
-        emitSessionsChanged(context, { reason: "groups" });
-      }
+      emitSessionsChanged(context, { reason: "groups" });
     } catch (error) {
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error)));
     }
