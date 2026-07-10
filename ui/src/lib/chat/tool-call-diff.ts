@@ -20,7 +20,7 @@ export type DiffStat = { added: number; removed: number };
 
 /** Bound diff rendering work; oversized inputs degrade to a truncation marker. */
 const MAX_DIFF_INPUT_LINES = 600;
-const MAX_DIFF_RENDER_LINES = 400;
+export const MAX_DIFF_RENDER_LINES = 400;
 
 export function diffStat(lines: readonly DiffLine[]): DiffStat {
   let added = 0;

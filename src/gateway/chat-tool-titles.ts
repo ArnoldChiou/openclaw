@@ -2,9 +2,12 @@
  * Cheap-model purpose titles for tool calls shown in the Control UI.
  *
  * Model selection is intentionally cheap-only: the configured utility model
- * when present, otherwise the OpenAI Luna fast tier. Titles are decorative,
- * so this never falls through to the agent's (potentially expensive) primary
- * model — callers get an empty result and keep deterministic labels.
+ * when present, otherwise the OpenAI Luna fast tier — and the Luna default
+ * applies only when the agent's primary model already routes to OpenAI, so
+ * decorative titles never send tool arguments to a provider the session was
+ * not already talking to. Titles never fall through to the (potentially
+ * expensive) primary model — callers get an empty result and keep
+ * deterministic labels.
  *
  * Generated titles cache in the per-agent SQLite database (`cache_entries`,
  * scope below) keyed by a digest of tool name + input, so reopening a session
@@ -13,9 +16,11 @@
 import { createHash } from "node:crypto";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { resolveAgentConfig } from "../agents/agent-scope.js";
+import { isOpenAIProvider } from "../agents/openai-routing.js";
 import {
   completeWithPreparedSimpleCompletionModel,
   prepareSimpleCompletionModelForAgent,
+  resolveSimpleCompletionSelectionForAgent,
 } from "../agents/simple-completion-runtime.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { logVerbose } from "../globals.js";
@@ -194,6 +199,11 @@ function hasConfiguredUtilityModel(cfg: OpenClawConfig, agentId: string): boolea
   );
 }
 
+function agentPrimaryUsesOpenAI(cfg: OpenClawConfig, agentId: string): boolean {
+  const selection = resolveSimpleCompletionSelectionForAgent({ cfg, agentId });
+  return selection ? isOpenAIProvider(selection.provider) : false;
+}
+
 async function generateMissingTitles(params: {
   cfg: OpenClawConfig;
   agentId: string;
@@ -204,7 +214,16 @@ async function generateMissingTitles(params: {
     return generated;
   }
   // Cheap-only selection: configured utility model, else the Luna fast tier.
+  // Egress contract: without an explicit utilityModel, the Luna default is
+  // allowed only when the agent already sends its turns to OpenAI. Tool args
+  // must not reach a new provider just for decorative titles.
   const useUtility = hasConfiguredUtilityModel(params.cfg, params.agentId);
+  if (!useUtility && !agentPrimaryUsesOpenAI(params.cfg, params.agentId)) {
+    logVerbose(
+      "chat-tool-titles: skipping Luna default because the agent's primary provider is not OpenAI and no utilityModel is configured",
+    );
+    return generated;
+  }
   let prepared: Awaited<ReturnType<typeof prepareSimpleCompletionModelForAgent>>;
   try {
     prepared = await prepareSimpleCompletionModelForAgent({

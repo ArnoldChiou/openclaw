@@ -178,6 +178,22 @@ describe("resolveToolCallView", () => {
     expect(view.stat).toEqual({ added: 1, removed: 1 });
   });
 
+  it("caps apply_patch rows while keeping the full diffstat", () => {
+    const bigPatch = [
+      "*** Begin Patch",
+      "*** Update File: big.ts",
+      ...Array.from({ length: 900 }, (_, index) => `+line ${index}`),
+      "*** End Patch",
+    ].join("\n");
+
+    const view = resolveToolCallView({ name: "apply_patch", args: { patch: bigPatch } });
+
+    expect(view.kind).toBe("edit");
+    expect(view.stat).toEqual({ added: 900, removed: 0 });
+    expect(view.diff?.length).toBe(401);
+    expect(view.diff?.at(-1)?.kind).toBe("skip");
+  });
+
   it("accepts the Codex input spelling for patch text", () => {
     const view = resolveToolCallView({
       name: "apply_patch",

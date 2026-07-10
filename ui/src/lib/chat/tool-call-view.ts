@@ -12,6 +12,7 @@ import {
   countTextLines,
   diffStat,
   joinDiffSections,
+  MAX_DIFF_RENDER_LINES,
   parseDiffDetailsString,
   type DiffLine,
   type DiffStat,
@@ -154,6 +155,18 @@ function resolvePatchView(args: Record<string, unknown> | null): ToolCallView | 
   }
   let target: string | undefined;
   const lines: DiffLine[] = [];
+  const stat = { added: 0, removed: 0 };
+  let truncated = false;
+  // Rows render on every paint, so cap them like the other diff producers;
+  // the diffstat still counts the whole patch (cheap string scans only).
+  const pushLine = (line: DiffLine) => {
+    if (lines.length < MAX_DIFF_RENDER_LINES) {
+      lines.push(line);
+    } else if (!truncated) {
+      truncated = true;
+      lines.push({ kind: "skip", text: "" });
+    }
+  };
   for (const raw of patchText.split("\n")) {
     const fileMatch = raw.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$|^\+\+\+ (?:b\/)?(.+)$/);
     if (fileMatch) {
@@ -164,14 +177,15 @@ function resolvePatchView(args: Record<string, unknown> | null): ToolCallView | 
       continue;
     }
     if (raw.startsWith("+")) {
-      lines.push({ kind: "add", text: raw.slice(1) });
+      stat.added += 1;
+      pushLine({ kind: "add", text: raw.slice(1) });
     } else if (raw.startsWith("-")) {
-      lines.push({ kind: "del", text: raw.slice(1) });
+      stat.removed += 1;
+      pushLine({ kind: "del", text: raw.slice(1) });
     } else {
-      lines.push({ kind: "ctx", text: raw.startsWith(" ") ? raw.slice(1) : raw });
+      pushLine({ kind: "ctx", text: raw.startsWith(" ") ? raw.slice(1) : raw });
     }
   }
-  const stat = diffStat(lines);
   if (!target && stat.added === 0 && stat.removed === 0) {
     return null;
   }

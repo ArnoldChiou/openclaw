@@ -6,10 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const completeWithPreparedSimpleCompletionModel = vi.hoisted(() => vi.fn());
 const prepareSimpleCompletionModelForAgent = vi.hoisted(() => vi.fn());
+const resolveSimpleCompletionSelectionForAgent = vi.hoisted(() => vi.fn());
 
 vi.mock("../agents/simple-completion-runtime.js", () => ({
   completeWithPreparedSimpleCompletionModel,
   prepareSimpleCompletionModelForAgent,
+  resolveSimpleCompletionSelectionForAgent,
 }));
 
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -41,6 +43,14 @@ describe("generateToolCallTitles", () => {
   beforeEach(() => {
     completeWithPreparedSimpleCompletionModel.mockReset();
     prepareSimpleCompletionModelForAgent.mockReset();
+    resolveSimpleCompletionSelectionForAgent.mockReset();
+    // Default: the agent's primary model already routes to OpenAI, so the
+    // Luna fallback is permitted by the egress gate.
+    resolveSimpleCompletionSelectionForAgent.mockReturnValue({
+      provider: "openai",
+      modelId: "gpt-5.5",
+      agentDir: "/tmp/openclaw-agent",
+    });
     // realpath: macOS tmpdir is a /var -> /private/var symlink and DB paths resolve canonically.
     stateDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-tool-titles-")));
     previousStateDir = process.env.OPENCLAW_STATE_DIR;
@@ -148,5 +158,23 @@ describe("generateToolCallTitles", () => {
       useAsyncModelResolution: true,
       allowMissingApiKeyModes: ["aws-sdk"],
     });
+  });
+
+  it("skips the Luna default when the agent's primary provider is not OpenAI", async () => {
+    resolveSimpleCompletionSelectionForAgent.mockReturnValue({
+      provider: "anthropic",
+      modelId: "claude-test",
+      agentDir: "/tmp/openclaw-agent",
+    });
+
+    await expect(
+      generateToolCallTitles({
+        cfg: {} satisfies OpenClawConfig,
+        agentId: AGENT_ID,
+        items: [{ id: "item-1", name: "bash", input: "git status --short" }],
+      }),
+    ).resolves.toEqual({});
+    expect(prepareSimpleCompletionModelForAgent).not.toHaveBeenCalled();
+    expect(completeWithPreparedSimpleCompletionModel).not.toHaveBeenCalled();
   });
 });
