@@ -199,6 +199,16 @@ describe("loadControlUiSessionPullRequests", () => {
       { fetchImpl, resolveGitContext },
     );
     expect(failing.pullRequests[0]?.checks).toBe("failing");
+
+    // A stale conclusion means GitHub invalidated the run; it must not be
+    // rolled up as green.
+    resetControlUiSessionPullRequestCacheForTests();
+    checkRuns[0] = { status: "completed", conclusion: "stale" };
+    const stale = await loadControlUiSessionPullRequests(
+      { sessionKey: "agent:main:main" },
+      { fetchImpl, resolveGitContext },
+    );
+    expect(stale.pullRequests[0]?.checks).toBe("pending");
   });
 
   it("falls back to the fork parent repo when the origin repo has no PRs", async () => {

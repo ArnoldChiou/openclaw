@@ -283,7 +283,9 @@ function rollupCheckRuns(value: unknown): ControlUiSessionPullRequest["checks"] 
     if (conclusion && FAILING_CHECK_CONCLUSIONS.has(conclusion)) {
       return "failing";
     }
-    if (run.status !== "completed") {
+    // "stale" means GitHub invalidated the run (for example a new push), so
+    // its old verdict must not read as green.
+    if (run.status !== "completed" || conclusion === "stale") {
       pending = true;
     }
   }
