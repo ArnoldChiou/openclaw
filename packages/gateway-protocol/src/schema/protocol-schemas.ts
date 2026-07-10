@@ -223,7 +223,6 @@ import {
 } from "./frames.js";
 import {
   GatewaySuspendBlockerSchema,
-  GatewaySuspendCountsSchema,
   GatewaySuspendPrepareBusyResultSchema,
   GatewaySuspendPrepareParamsSchema,
   GatewaySuspendPrepareReadyResultSchema,
@@ -409,7 +408,6 @@ export const ProtocolSchemas = {
   StateVersion: StateVersionSchema,
   Snapshot: SnapshotSchema,
   ErrorShape: ErrorShapeSchema,
-  GatewaySuspendCounts: GatewaySuspendCountsSchema,
   GatewaySuspendTaskBlocker: GatewaySuspendTaskBlockerSchema,
   GatewaySuspendBlocker: GatewaySuspendBlockerSchema,
   GatewaySuspendPrepareParams: GatewaySuspendPrepareParamsSchema,
