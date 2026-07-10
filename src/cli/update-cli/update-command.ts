@@ -1209,7 +1209,11 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     };
   }
 
-  const stoppedServiceMayRespawn = serviceState.loaded && serviceMatchesMutationRoot !== false;
+  const managedUpdateHandoff = process.env.OPENCLAW_UPDATE_RUN_HANDOFF?.trim() === "1";
+  const stoppedServiceMayRespawn =
+    (process.platform === "darwin" || managedUpdateHandoff) &&
+    serviceState.loaded &&
+    serviceMatchesMutationRoot !== false;
   if (!serviceState.running && !stoppedServiceMayRespawn) {
     const windowsTaskAutoStartRecovery = await maybeSuspendWindowsTaskAutoStartForPackageUpdate({
       updateInstallKind: params.updateInstallKind,
@@ -1226,8 +1230,8 @@ async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     };
   }
 
-  // A loaded supervisor can be between process exit and automatic respawn.
-  // Quiesce the job before mutation even when its runtime snapshot is stopped.
+  // A loaded LaunchAgent has KeepAlive; an operator bootout is not loaded.
+  // Other managers need the handoff marker to prove update-owned restart intent.
   const blockMessage = gatewayAncestryBlockMessage(serviceState.runtime?.pid);
   if (blockMessage) {
     return {

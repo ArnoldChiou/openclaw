@@ -3816,52 +3816,106 @@ describe("update-cli", () => {
     processOffSpy.mockRestore();
   });
 
-  it("waits for a stopped loaded service to quiesce before package replacement", async () => {
-    mockPackageInstallStatus(createCaseDir("openclaw-update-stopped-service"));
-    serviceReadCommand.mockResolvedValue({
-      programArguments: ["openclaw", "gateway", "run"],
-      environment: {
-        OPENCLAW_SERVICE_MARKER: "openclaw",
-        OPENCLAW_SERVICE_KIND: "gateway",
-      },
-    });
-    serviceLoaded.mockResolvedValue(true);
-    serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+  it.each([
+    ["a stopped loaded managed-update handoff", "linux", "1"],
+    ["a stopped loaded Darwin LaunchAgent", "darwin", undefined],
+  ] as const)(
+    "waits for %s to quiesce before package replacement",
+    async (_caseName, platform, handoffMarker) => {
+      const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+      mockPackageInstallStatus(createCaseDir(`openclaw-update-stopped-service-${platform}`));
+      serviceReadCommand.mockResolvedValue({
+        programArguments: ["openclaw", "gateway", "run"],
+        environment: {
+          OPENCLAW_SERVICE_MARKER: "openclaw",
+          OPENCLAW_SERVICE_KIND: "gateway",
+        },
+      });
+      serviceLoaded.mockResolvedValue(true);
+      serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
 
-    let releaseStop: (() => void) | undefined;
-    serviceStop.mockImplementationOnce(
-      async () =>
-        await new Promise<void>((resolve) => {
-          releaseStop = resolve;
-        }),
-    );
+      let releaseStop: (() => void) | undefined;
+      serviceStop.mockImplementationOnce(
+        async () =>
+          await new Promise<void>((resolve) => {
+            releaseStop = resolve;
+          }),
+      );
 
-    const updatePromise = updateCommand({ yes: true });
+      try {
+        await withEnvAsync({ OPENCLAW_UPDATE_RUN_HANDOFF: handoffMarker }, async () => {
+          const updatePromise = updateCommand({ yes: true });
 
-    await vi.waitFor(() => expect(serviceStop).toHaveBeenCalledTimes(1));
-    expect(packageInstallCommandCall()).toBeUndefined();
-    if (!releaseStop) {
-      throw new Error("expected managed service stop to be pending");
-    }
-    releaseStop();
-    await updatePromise;
+          await vi.waitFor(() => expect(serviceStop).toHaveBeenCalledTimes(1));
+          expect(packageInstallCommandCall()).toBeUndefined();
+          if (!releaseStop) {
+            throw new Error("expected managed service stop to be pending");
+          }
+          releaseStop();
+          await updatePromise;
+        });
+      } finally {
+        platformSpy.mockRestore();
+      }
 
-    const installCallIndex = commandCalls().findIndex(
-      ([argv]) => argv[0] === "npm" && argv[1] === "i" && argv[2] === "-g",
-    );
-    const installOrder = requireValue(
-      vi.mocked(runCommandWithTimeout).mock.invocationCallOrder[installCallIndex],
-      "package install call order",
-    );
-    const stopOrder = requireValue(
-      serviceStop.mock.invocationCallOrder[0],
-      "managed service stop call order",
-    );
-    expect(stopOrder).toBeLessThan(installOrder);
-    expect(runRestartScript).toHaveBeenCalledWith("/tmp/openclaw-restart-test.sh");
-  });
+      const installCallIndex = commandCalls().findIndex(
+        ([argv]) => argv[0] === "npm" && argv[1] === "i" && argv[2] === "-g",
+      );
+      const installOrder = requireValue(
+        vi.mocked(runCommandWithTimeout).mock.invocationCallOrder[installCallIndex],
+        "package install call order",
+      );
+      const stopOrder = requireValue(
+        serviceStop.mock.invocationCallOrder[0],
+        "managed service stop call order",
+      );
+      expect(stopOrder).toBeLessThan(installOrder);
+      expect(runRestartScript).toHaveBeenCalledWith("/tmp/openclaw-restart-test.sh");
+    },
+  );
 
-  it("does not stop an unloaded idle service before package replacement", async () => {
+  it.each(["linux", "win32"] as const)(
+    "does not quiesce or recovery-restart a stopped loaded %s service outside a managed-update handoff",
+    async (platform) => {
+      const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+      mockPackageInstallStatus(createCaseDir(`openclaw-update-stopped-service-${platform}`));
+      serviceReadCommand.mockResolvedValue({
+        programArguments: ["openclaw", "gateway", "run"],
+      });
+      serviceLoaded.mockResolvedValue(true);
+      serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+      vi.mocked(runCommandWithTimeout).mockImplementation(async (argv) => {
+        if (argv[0] === "npm" && argv[1] === "i" && argv[2] === "-g") {
+          throw new Error("package mutation failed");
+        }
+        return {
+          stdout: "",
+          stderr: "",
+          code: 0,
+          signal: null,
+          killed: false,
+          termination: "exit",
+        };
+      });
+
+      try {
+        await expect(
+          withEnvAsync({ OPENCLAW_UPDATE_RUN_HANDOFF: undefined }, async () => {
+            await updateCommand({ yes: true });
+          }),
+        ).rejects.toThrow("package mutation failed");
+      } finally {
+        platformSpy.mockRestore();
+      }
+
+      expect(serviceStop).not.toHaveBeenCalled();
+      expect(packageInstallCommandCall()).toBeDefined();
+      expect(serviceRestart).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not stop an unloaded idle Darwin LaunchAgent before package replacement", async () => {
+    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
     mockPackageInstallStatus(createCaseDir("openclaw-update-unloaded-service"));
     serviceReadCommand.mockResolvedValue({
       programArguments: ["openclaw", "gateway", "run"],
@@ -3869,7 +3923,11 @@ describe("update-cli", () => {
     serviceLoaded.mockResolvedValue(false);
     serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
 
-    await updateCommand({ yes: true });
+    try {
+      await updateCommand({ yes: true });
+    } finally {
+      platformSpy.mockRestore();
+    }
 
     expect(serviceStop).not.toHaveBeenCalled();
     expect(packageInstallCommandCall()).toBeDefined();
