@@ -1088,7 +1088,10 @@ describe("processGatewayAllowlist", () => {
     if (!authorizationPlan.ok) {
       throw new Error(authorizationPlan.reason);
     }
-    const allowlistEntry = { pattern: "/usr/bin/ls", source: "allow-always" };
+    const allowlistEntry: ExecAllowlistEntry = {
+      pattern: "/usr/bin/ls",
+      source: "allow-always",
+    };
     requiresExecApprovalMock.mockReturnValue(false);
     hasDurableExecApprovalMock.mockReturnValue(true);
     hasExactCommandDurableExecApprovalMock.mockReturnValue(true);
