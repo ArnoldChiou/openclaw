@@ -1,6 +1,11 @@
 // Control UI tests cover tool-call classification and view-model resolution.
 import { describe, expect, it } from "vitest";
-import { resolveToolCallKind, resolveToolCallView, splitPathForDisplay } from "./tool-call-view.ts";
+import {
+  resolveToolCallKind,
+  resolveToolCallView,
+  splitPathForDisplay,
+  unwrapShellWrapperCommand,
+} from "./tool-call-view.ts";
 
 describe("resolveToolCallKind", () => {
   it.each([
@@ -33,6 +38,24 @@ describe("splitPathForDisplay", () => {
     ["/repo/dir/", { base: "dir", dir: "/repo" }],
   ])("splits %s", (path, expected) => {
     expect(splitPathForDisplay(path)).toEqual(expected);
+  });
+});
+
+describe("unwrapShellWrapperCommand", () => {
+  it.each([
+    ["/bin/zsh -lc 'pnpm test ui'", "pnpm test ui"],
+    ['/bin/bash -c "git status"', "git status"],
+    ["sh -lc 'echo hi'", "echo hi"],
+    ["pnpm test ui", "pnpm test ui"],
+    ["/bin/zsh -lc unquoted", "/bin/zsh -lc unquoted"],
+  ])("unwraps %s", (wrapped, expected) => {
+    expect(unwrapShellWrapperCommand(wrapped)).toBe(expected);
+  });
+
+  it("unwraps the shell wrapper in command views", () => {
+    expect(
+      resolveToolCallView({ name: "bash", args: { command: "/bin/zsh -lc 'node --version'" } }),
+    ).toEqual({ kind: "command", command: "node --version" });
   });
 });
 

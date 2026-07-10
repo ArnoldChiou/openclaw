@@ -766,7 +766,12 @@ export function renderExpandedToolCardContent(
 ) {
   const view = resolveToolCallView({ name: card.name, args: card.args, details: card.details });
   const display = resolveToolDisplay({ name: card.name, args: card.args });
-  const detail = formatToolDetail(display);
+  // File/search rows already carry their target; the "with …" connector only
+  // reads well for generic tools ("with query …"), not "with from sessions.ts".
+  const detail =
+    view.kind === "read" || view.kind === "search" || view.kind === "fetch"
+      ? display.detail
+      : formatToolDetail(display);
   const hasOutput = Boolean(card.outputText?.trim());
   const hasInput = Boolean(card.inputText?.trim());
   const isError = isToolCardError(card);

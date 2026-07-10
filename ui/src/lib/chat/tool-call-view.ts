@@ -235,6 +235,17 @@ export function resolveToolCallView(source: ToolCallViewSource): ToolCallView {
   return view;
 }
 
+/**
+ * Strip the `sh -lc '<command>'` wrapper harnesses add around agent commands
+ * so rows show the command the model actually wrote. Display-only.
+ */
+export function unwrapShellWrapperCommand(command: string): string {
+  const match = command.match(
+    /^\s*(?:\/(?:usr\/)?bin\/)?(?:ba|z|da)?sh\s+-l?c\s+(['"])([\s\S]+)\1\s*$/,
+  );
+  return match ? match[2] : command;
+}
+
 function buildToolCallView(
   source: ToolCallViewSource,
   args: Record<string, unknown> | null,
@@ -244,7 +255,7 @@ function buildToolCallView(
 
   if (kind === "command") {
     const command = args ? readString(args.command) : undefined;
-    return { kind, command };
+    return { kind, command: command ? unwrapShellWrapperCommand(command) : command };
   }
 
   if (kind === "read") {
