@@ -61,6 +61,9 @@ const OPENCLAW_SCRIPT_NAMES = new Set(["openclaw.mjs"]);
 const LAUNCH_AGENT_STOP_PORT_RELEASE_TIMEOUT_MS = LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS * 1_000;
 const LAUNCH_AGENT_STOP_PORT_RELEASE_POLL_MS = 100;
 const LAUNCH_AGENT_QUIESCE_BOOTOUT_ATTEMPTS = 3;
+const LAUNCH_AGENT_QUIESCE_BOOTOUT_RETRY_MS = 1_000;
+const LAUNCH_AGENT_QUIESCE_COMPLETION_MARGIN_MS = 5_000;
+const LAUNCH_AGENT_QUIESCE_TIMEOUT_MS = LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS * 1_000;
 
 export type StaleOpenClawUpdateLaunchdJob = {
   label: string;
@@ -949,6 +952,14 @@ async function probeLaunchAgentDisabledOverride(
     : { state: disabled ? "disabled" : "not-disabled" };
 }
 
+async function requestLaunchAgentBootoutForQuiescence(serviceTarget: string): Promise<void> {
+  const bootout = await execLaunchctl(["bootout", serviceTarget]);
+  const bootoutInProgress = isLaunchctlOperationAlreadyInProgress(bootout.stderr || bootout.stdout);
+  if (bootout.code !== 0 && !isLaunchctlNotLoaded(bootout) && !bootoutInProgress) {
+    throw new Error(`launchctl bootout failed: ${formatLaunchctlResultDetail(bootout)}`);
+  }
+}
+
 async function quiesceLaunchAgentOrThrow(params: {
   domain: string;
   label: string;
@@ -982,10 +993,18 @@ async function quiesceLaunchAgentOrThrow(params: {
 
   try {
     let lastState: LaunchAgentProbeResult | null = null;
-    for (let attempt = 0; attempt < LAUNCH_AGENT_QUIESCE_BOOTOUT_ATTEMPTS; attempt += 1) {
-      const bootout = await execLaunchctl(["bootout", params.serviceTarget]);
-      if (bootout.code !== 0 && !isLaunchctlNotLoaded(bootout)) {
-        throw new Error(`launchctl bootout failed: ${formatLaunchctlResultDetail(bootout)}`);
+    await requestLaunchAgentBootoutForQuiescence(params.serviceTarget);
+    let bootoutAttempts = 1;
+    let nextBootoutAt = Date.now() + LAUNCH_AGENT_QUIESCE_BOOTOUT_RETRY_MS;
+    // ExitTimeOut covers process termination; launchd can remove the job shortly after it expires.
+    const deadline =
+      Date.now() + LAUNCH_AGENT_QUIESCE_TIMEOUT_MS + LAUNCH_AGENT_QUIESCE_COMPLETION_MARGIN_MS;
+    while (true) {
+      const now = Date.now();
+      if (bootoutAttempts < LAUNCH_AGENT_QUIESCE_BOOTOUT_ATTEMPTS && now >= nextBootoutAt) {
+        await requestLaunchAgentBootoutForQuiescence(params.serviceTarget);
+        bootoutAttempts += 1;
+        nextBootoutAt = Date.now() + LAUNCH_AGENT_QUIESCE_BOOTOUT_RETRY_MS;
       }
       const state = await probeLaunchAgentState(params.serviceTarget);
       if (state.state === "not-loaded") {
@@ -993,6 +1012,13 @@ async function quiesceLaunchAgentOrThrow(params: {
         return;
       }
       lastState = state;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        break;
+      }
+      // `bootout` can return before launchd completes its ExitTimeOut shutdown.
+      // Keep the job disabled while polling so no replacement process can race the package swap.
+      await sleep(Math.min(LAUNCH_AGENT_STOP_PORT_RELEASE_POLL_MS, remainingMs));
     }
 
     const detail =

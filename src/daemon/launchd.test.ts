@@ -28,6 +28,7 @@ import {
 
 const state = vi.hoisted(() => ({
   launchctlCalls: [] as string[][],
+  launchctlCallTimes: [] as number[],
   listOutput: "",
   printOutput: "",
   printNotLoadedRemaining: 0,
@@ -240,6 +241,7 @@ vi.mock("./exec-file.js", () => ({
   execFileUtf8: vi.fn(async (file: string, args: string[]) => {
     const call = normalizeLaunchctlArgs(file, args);
     state.launchctlCalls.push(call);
+    state.launchctlCallTimes.push(Date.now());
     if (call[0] === "list") {
       return { stdout: state.listOutput, stderr: "", code: 0 };
     }
@@ -412,6 +414,7 @@ vi.mock("node:fs/promises", async () => {
 
 beforeEach(() => {
   state.launchctlCalls.length = 0;
+  state.launchctlCallTimes.length = 0;
   state.listOutput = "";
   state.printOutput = "";
   state.printNotLoadedRemaining = 0;
@@ -1547,19 +1550,24 @@ describe("launchd install", () => {
       output += chunk.toString();
     });
 
-    await stopLaunchAgent({ env, stdout, quiesce: true });
+    await runStopLaunchAgentWithFakeTimers({ env, stdout, quiesce: true });
 
     const domain = typeof process.getuid === "function" ? `gui/${process.getuid()}` : "gui/501";
     const serviceId = `${domain}/ai.openclaw.gateway`;
-    expect(state.launchctlCalls).toEqual([
+    expect(state.launchctlCalls.slice(0, 4)).toEqual([
       ["print", serviceId],
       ["print-disabled", domain],
       ["disable", serviceId],
       ["bootout", serviceId],
-      ["print", serviceId],
-      ["bootout", serviceId],
-      ["print", serviceId],
     ]);
+    const bootoutIndexes = state.launchctlCalls
+      .map((call, index) => (call[0] === "bootout" ? index : -1))
+      .filter((index) => index >= 0);
+    expect(bootoutIndexes).toHaveLength(2);
+    expect(
+      state.launchctlCallTimes[bootoutIndexes[1]!]! - state.launchctlCallTimes[bootoutIndexes[0]!]!,
+    ).toBeGreaterThanOrEqual(1_000);
+    expect(state.launchctlCalls.at(-1)).toEqual(["print", serviceId]);
     expect(output).toContain("Quiesced LaunchAgent");
   });
 
@@ -1568,22 +1576,18 @@ describe("launchd install", () => {
     state.bootoutKeepsLoadedRemaining = 3;
 
     await expect(
-      stopLaunchAgent({ env, stdout: new PassThrough(), quiesce: true }),
+      runStopLaunchAgentWithFakeTimers({ env, stdout: new PassThrough(), quiesce: true }),
     ).rejects.toThrow("LaunchAgent remained loaded after bootout: state=running");
 
-    expect(launchctlCommandNames()).toEqual([
-      "print",
-      "print-disabled",
-      "disable",
-      "bootout",
-      "print",
-      "bootout",
-      "print",
-      "bootout",
-      "print",
-      "enable",
-      "print",
-    ]);
+    const commands = launchctlCommandNames();
+    expect(commands.slice(0, 4)).toEqual(["print", "print-disabled", "disable", "bootout"]);
+    expect(commands.filter((command) => command === "bootout")).toHaveLength(3);
+    expect(commands.slice(-2)).toEqual(["enable", "print"]);
+    const firstBootoutIndex = commands.indexOf("bootout");
+    const rollbackEnableIndex = commands.lastIndexOf("enable");
+    expect(
+      state.launchctlCallTimes[rollbackEnableIndex]! - state.launchctlCallTimes[firstBootoutIndex]!,
+    ).toBeGreaterThan(LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS * 1_000);
   });
 
   it("re-enables LaunchAgent when quiescence cannot prove its port was released", async () => {
