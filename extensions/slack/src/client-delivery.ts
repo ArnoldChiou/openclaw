@@ -4,16 +4,17 @@ import type { Block, KnownBlock, WebClient } from "@slack/web-api";
 import { withTrustedEnvProxyGuardedFetchMode } from "openclaw/plugin-sdk/fetch-runtime";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
+import { hasSlackDataTableBlock } from "./data-table.js";
+import { SLACK_TEXT_LIMIT } from "./limits.js";
+import {
+  appendSlackNativeDataFallbackText,
+  hasSlackNativeDataBlock,
+  isSlackInvalidBlocksError,
+} from "./native-data-blocks.js";
 import {
   postSlackMessageWithIdentityFallback,
   type SlackPostMessageIdentity,
 } from "./post-message-identity.js";
-import {
-  appendSlackDataVisualizationFallbackText,
-  hasSlackDataVisualizationBlock,
-  isSlackInvalidBlocksError,
-} from "./data-visualization.js";
-import { SLACK_TEXT_LIMIT } from "./limits.js";
 import {
   buildSlackPostMessagePayload,
   type SlackPostMessagePayload,
@@ -116,21 +117,22 @@ export async function postSlackMessageBestEffort(params: {
         identity,
       };
     } catch (error) {
-      if (!hasSlackDataVisualizationBlock(payload.blocks) || !isSlackInvalidBlocksError(error)) {
+      if (!hasSlackNativeDataBlock(payload.blocks) || !isSlackInvalidBlocksError(error)) {
         throw error;
       }
       const { blocks, ...textPayload } = payload;
-      // Slack rejects unsupported chart blocks before posting, so one text-only
-      // retry preserves the complete accessible summary without duplicating a send.
-      logVerbose("slack send: data visualization rejected, retrying with text fallback");
+      // Slack rejects unsupported native data blocks before posting, so one text-only
+      // retry preserves the accessible summary without duplicating a send. send.ts
+      // routes oversized table fallbacks through text chunking before this call.
+      logVerbose("slack send: native data block rejected, retrying with text fallback");
+      const fallbackText = appendSlackNativeDataFallbackText(payload.text ?? "", blocks);
       return {
         response: await withSlackDnsRequestRetry("chat.postMessage", () =>
           postChatMessage({
             ...textPayload,
-            text: truncateSlackText(
-              appendSlackDataVisualizationFallbackText(payload.text ?? "", blocks),
-              SLACK_TEXT_LIMIT,
-            ),
+            text: hasSlackDataTableBlock(blocks)
+              ? fallbackText
+              : truncateSlackText(fallbackText, SLACK_TEXT_LIMIT),
           }),
         ),
         identity,
