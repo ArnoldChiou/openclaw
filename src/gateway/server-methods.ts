@@ -393,7 +393,7 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
     loadHandlers: loadDiagnosticsHandlers,
   }),
   ...createLazyCoreHandlers({
-    methods: ["controlUi.githubPreview"],
+    methods: ["controlUi.githubPreview", "controlUi.sessionPullRequests"],
     loadHandlers: loadControlUiHandlers,
   }),
   ...createLazyCoreHandlers({
