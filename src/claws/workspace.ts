@@ -35,6 +35,7 @@ type PreparedWorkspaceFile = {
   content: Buffer;
   contentSha256: string;
   operation: PersistedClawWorkspaceFileRef["operation"];
+  previousContentSha256?: string;
   existingRef?: ExistingWorkspaceFileRefRow;
 };
 
@@ -134,6 +135,7 @@ async function prepareWorkspaceFile(params: {
       );
     }
     let operation: PersistedClawWorkspaceFileRef["operation"] = "created";
+    let previousContentSha256: string | undefined;
     if (await workspace.exists(entry.target)) {
       const existing = asBuffer(
         await workspace.readBytes(entry.target, { maxBytes: MAX_CLAW_WORKSPACE_FILE_BYTES }),
@@ -156,6 +158,7 @@ async function prepareWorkspaceFile(params: {
       } else {
         operation = "unchanged";
       }
+      previousContentSha256 = operation === "updated" ? contentSha256(existing) : undefined;
     }
     return {
       entry,
@@ -165,6 +168,7 @@ async function prepareWorkspaceFile(params: {
       content,
       contentSha256: contentSha256(content),
       operation,
+      ...(previousContentSha256 ? { previousContentSha256 } : {}),
       ...(managedRef ? { existingRef: managedRef } : {}),
     };
   } catch (error) {
@@ -419,6 +423,33 @@ export async function applyClawWorkspaceFiles(
   const refsByEntryId = new Map(refs.map((ref) => [ref.entryId, ref] as const));
   const appliedRefs: PersistedClawWorkspaceFileRef[] = [];
   for (const item of prepared) {
+    if (item.operation === "updated") {
+      try {
+        const current = asBuffer(
+          await workspace.readBytes(item.entry.target ?? item.entry.id, {
+            maxBytes: MAX_CLAW_WORKSPACE_FILE_BYTES,
+          }),
+        );
+        if (contentSha256(current) !== item.previousContentSha256) {
+          throw new ClawWorkspaceApplyError([
+            diagnostic(
+              item.entry,
+              "workspace_file_conflict",
+              `Workspace target ${JSON.stringify(item.entry.target)} changed after apply preflight.`,
+              item.entryIndex,
+            ),
+          ]);
+        }
+      } catch (error) {
+        persistSuccessfulWorkspaceRefs(appliedRefs, options);
+        if (error instanceof ClawWorkspaceApplyError) {
+          throw error;
+        }
+        throw new ClawWorkspaceApplyError([
+          workspaceDiagnosticFromError(item.entry, item.entryIndex, error),
+        ]);
+      }
+    }
     if (item.operation !== "unchanged") {
       try {
         await workspace.write(item.entry.target ?? item.entry.id, item.content, {

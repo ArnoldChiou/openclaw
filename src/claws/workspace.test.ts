@@ -1,8 +1,9 @@
-// Tests for Claw workspace/persona file application.
 import { mkdtempSync } from "node:fs";
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+// Tests for Claw workspace/persona file application.
+import { __setFsSafeTestHooksForTest } from "@openclaw/fs-safe/test-hooks";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { buildClawApplyPlan } from "./lifecycle.js";
@@ -58,6 +59,7 @@ function applyPlan(params: { manifestRoot: string; clawId?: string; entries?: un
 }
 
 afterEach(() => {
+  __setFsSafeTestHooksForTest();
   closeOpenClawStateDatabaseForTest();
 });
 
@@ -134,6 +136,59 @@ describe("applyClawWorkspaceFiles", () => {
       updatedAtMs: 2,
     });
     await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toBe("new\n");
+  });
+
+  it("does not overwrite a managed file changed after apply preflight", async () => {
+    const manifestRoot = tempDir("openclaw-claw-workspace-manifest-");
+    const workspaceRoot = tempDir("openclaw-claw-workspace-target-");
+    const env = stateEnv();
+    const entries = [
+      {
+        kind: "workspaceFile",
+        id: "agents",
+        path: "AGENTS.md",
+        source: "files/AGENTS.md",
+      },
+      {
+        kind: "workspaceFile",
+        id: "soul",
+        path: "SOUL.md",
+        source: "files/SOUL.md",
+      },
+    ];
+    await writeSource(manifestRoot, "files/AGENTS.md", "old agents\n");
+    await writeSource(manifestRoot, "files/SOUL.md", "old soul\n");
+    const plan = applyPlan({ manifestRoot, entries });
+    await applyClawWorkspaceFiles(plan, { env, workspaceRoot, nowMs: 1 });
+    await writeSource(manifestRoot, "files/AGENTS.md", "new agents\n");
+    await writeSource(manifestRoot, "files/SOUL.md", "new soul\n");
+
+    let agentsOpenCount = 0;
+    __setFsSafeTestHooksForTest({
+      beforeOpen: async (filePath) => {
+        if (filePath !== join(workspaceRoot, "AGENTS.md")) {
+          return;
+        }
+        agentsOpenCount += 1;
+        if (agentsOpenCount !== 2) {
+          return;
+        }
+        await writeFile(join(workspaceRoot, "SOUL.md"), "user edit\n", "utf8");
+      },
+    });
+
+    await expect(
+      applyClawWorkspaceFiles(plan, { env, workspaceRoot, nowMs: 2 }),
+    ).rejects.toMatchObject({
+      diagnostics: [
+        expect.objectContaining({
+          code: "workspace_file_conflict",
+          path: "$.entries[1]",
+        }),
+      ],
+    });
+    await expect(readFile(join(workspaceRoot, "AGENTS.md"), "utf8")).resolves.toBe("new agents\n");
+    await expect(readFile(join(workspaceRoot, "SOUL.md"), "utf8")).resolves.toBe("user edit\n");
   });
 
   it("tracks a workspace by canonical root across symlink and real paths", async () => {
