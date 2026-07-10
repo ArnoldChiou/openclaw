@@ -21,7 +21,7 @@ const titlesByKey = new Map<string, string>();
 const pendingKeys = new Set<string>();
 const failedKeys = new Set<string>();
 
-type PendingItem = { key: string; name: string; input: string };
+type PendingItem = { key: string; name: string; input: string; sessionKey: string };
 type ToolTitlesResult = { titles?: Record<string, string> };
 
 let queue = new Map<string, PendingItem>();
@@ -115,6 +115,7 @@ export function configureToolTitleFetcher(params: {
 function scheduleTitleRequest(name: string, request: { key: string; input: string }): void {
   if (
     !activeClient ||
+    !activeSessionKey ||
     titlesByKey.has(request.key) ||
     pendingKeys.has(request.key) ||
     failedKeys.has(request.key) ||
@@ -122,7 +123,16 @@ function scheduleTitleRequest(name: string, request: { key: string; input: strin
   ) {
     return;
   }
-  queue.set(request.key, { key: request.key, name, input: request.input });
+  // Capture the session at schedule time: split panes reconfigure the fetcher
+  // on every render, so flush-time session state can belong to another pane.
+  // Sending pane A's args under pane B's session would resolve the wrong agent
+  // and could bypass the gateway's provider egress gate.
+  queue.set(request.key, {
+    key: request.key,
+    name,
+    input: request.input,
+    sessionKey: activeSessionKey,
+  });
   flushTimer ??= setTimeout(() => {
     flushTimer = null;
     void flushTitleQueue();
@@ -131,12 +141,23 @@ function scheduleTitleRequest(name: string, request: { key: string; input: strin
 
 async function flushTitleQueue(): Promise<void> {
   const client = activeClient;
-  const sessionKey = activeSessionKey;
-  if (!client || !sessionKey || queue.size === 0) {
+  if (!client || queue.size === 0) {
     queue = new Map();
     return;
   }
-  const batch = [...queue.values()].slice(0, MAX_ITEMS_PER_REQUEST);
+  // One request per captured session; other sessions' items stay queued for
+  // the follow-up flush.
+  const sessionKey = queue.values().next().value?.sessionKey;
+  if (!sessionKey) {
+    queue = new Map();
+    return;
+  }
+  const batch: PendingItem[] = [];
+  for (const item of queue.values()) {
+    if (item.sessionKey === sessionKey && batch.length < MAX_ITEMS_PER_REQUEST) {
+      batch.push(item);
+    }
+  }
   for (const item of batch) {
     queue.delete(item.key);
     pendingKeys.add(item.key);

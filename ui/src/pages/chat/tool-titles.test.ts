@@ -1,6 +1,8 @@
 // Control UI tests cover tool-title request eligibility and the title store.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import {
+  configureToolTitleFetcher,
   getToolCallTitle,
   resetToolTitlesForTest,
   resolveToolTitleRequest,
@@ -76,5 +78,34 @@ describe("getToolCallTitle", () => {
     setToolTitleForTest("some-key", "Never shown");
 
     expect(getToolCallTitle("read", { path: "/repo/a.ts" })).toBeUndefined();
+  });
+});
+
+describe("title fetch batching", () => {
+  afterEach(() => {
+    configureToolTitleFetcher({ client: null, sessionKey: null, onTitlesChanged: null });
+    resetToolTitlesForTest();
+    vi.useRealTimers();
+  });
+
+  it("sends queued items with the session captured at schedule time", async () => {
+    vi.useFakeTimers();
+    const requests: Array<{ sessionKey: string }> = [];
+    const client = {
+      request: vi.fn(async (_method: string, params: unknown) => {
+        requests.push(params as { sessionKey: string });
+        return { titles: {} };
+      }),
+    } as unknown as GatewayBrowserClient;
+
+    // Pane A schedules, then pane B re-renders (and reconfigures) before the
+    // debounce fires; the request must keep pane A's session.
+    configureToolTitleFetcher({ client, sessionKey: "agent:a:main", onTitlesChanged: null });
+    getToolCallTitle("bash", { command: "pnpm run build --filter ui" });
+    configureToolTitleFetcher({ client, sessionKey: "agent:b:main", onTitlesChanged: null });
+    getToolCallTitle("bash", { command: "pnpm test ui/src/pages/chat" });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(requests.map((request) => request.sessionKey)).toEqual(["agent:a:main", "agent:b:main"]);
   });
 });

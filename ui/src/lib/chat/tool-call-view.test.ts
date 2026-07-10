@@ -248,6 +248,20 @@ describe("resolveToolCallView", () => {
     expect(resolveToolCallView(source).kind).toBe("generic");
   });
 
+  it("rebuilds the cached view when result details arrive on the same args", () => {
+    const args = { path: "/repo/a.md", edits: [{ oldText: "x", newText: "y" }] };
+
+    const before = resolveToolCallView({ name: "edit", args });
+    const after = resolveToolCallView({
+      name: "edit",
+      args,
+      details: { diff: "+12 hello", patch: "" },
+    });
+
+    expect(before.diff?.[0]?.lineNo).toBeUndefined();
+    expect(after.diff?.[0]).toMatchObject({ kind: "add", lineNo: 12, text: "hello" });
+  });
+
   it("caches views per args object identity", () => {
     const source = { name: "edit", args: { path: "/repo/a.ts", oldText: "x", newText: "y" } };
 
