@@ -3,10 +3,17 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import {
+  loadTranscriptEvents,
+  replaceSessionEntry,
+} from "../../config/sessions/session-accessor.js";
+import { formatSqliteSessionFileMarker } from "../../config/sessions/sqlite-marker.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
+import { createTestUserTurnTranscriptTarget } from "../../sessions/user-turn-transcript.test-support.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
 import {
-  clearFollowupQueue,
+  admitFollowupRunLifecycle,
+  completeFollowupRunLifecycle,
   enqueueFollowupRun,
   FollowupRunDeferredError,
   refreshQueuedFollowupSession,
@@ -17,17 +24,111 @@ import {
   createQueueTestRun as createRun,
   installQueueRuntimeErrorSilencer,
 } from "./queue.test-helpers.js";
-import { resolveFollowupAuthorizationKey } from "./queue/drain.js";
-import { getExistingFollowupQueue } from "./queue/state.js";
+import { resolveFollowupDeliveryContextKey } from "./queue/drain.js";
+import { clearFollowupQueue, getExistingFollowupQueue } from "./queue/state.js";
 
 installQueueRuntimeErrorSilencer();
 
 describe("followup queue collect routing", () => {
+  it("marks exclusive admission without onAbandoned and isolates collect identity", () => {
+    // Failure window: cancel-only used to be inferred from missing onAbandoned,
+    // so exclusive admission without onAbandoned shared collect identity.
+    const exclusiveNoAbandon = createRun({ prompt: "exclusive a" });
+    exclusiveNoAbandon.turnAdoptionLifecycle = {
+      admission: "exclusive",
+      onAdopted: async () => {},
+    };
+    const exclusiveSibling = createRun({ prompt: "exclusive b" });
+    exclusiveSibling.turnAdoptionLifecycle = {
+      admission: "exclusive",
+      onAdopted: async () => {},
+    };
+    const cancelOnly = createRun({ prompt: "cancel-only" });
+    cancelOnly.turnAdoptionLifecycle = {
+      admission: "cancel-only",
+      ownerKey: "gw:owner",
+      onAdopted: async () => {},
+    };
+    const cancelOnlyShared = createRun({ prompt: "cancel-only shared" });
+    cancelOnlyShared.turnAdoptionLifecycle = {
+      admission: "cancel-only",
+      ownerKey: "gw:owner",
+      onAdopted: async () => {},
+    };
+
+    const exclusiveA = resolveFollowupDeliveryContextKey(exclusiveNoAbandon);
+    const exclusiveB = resolveFollowupDeliveryContextKey(exclusiveSibling);
+    expect(exclusiveA).not.toEqual(exclusiveB);
+
+    const cancelA = resolveFollowupDeliveryContextKey(cancelOnly);
+    const cancelB = resolveFollowupDeliveryContextKey(cancelOnlyShared);
+    expect(cancelA).toEqual(cancelB);
+  });
+
+  it("retries lifecycle admission after a callback rejection", async () => {
+    const onAdmitted = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("admission failed"))
+      .mockResolvedValueOnce();
+    const run = createRun({ prompt: "retry admission" });
+    run.turnAdoptionLifecycle = {
+      onAdopted: onAdmitted,
+      admission: "exclusive",
+      onAbandoned: () => {},
+    };
+
+    await expect(admitFollowupRunLifecycle(run)).rejects.toThrow("admission failed");
+    await expect(admitFollowupRunLifecycle(run)).resolves.toBeUndefined();
+    await expect(admitFollowupRunLifecycle(run)).resolves.toBeUndefined();
+
+    expect(onAdmitted).toHaveBeenCalledTimes(2);
+  });
+
+  it("serializes completion behind rejected admission and blocks later admission", async () => {
+    const admissionStarted = createDeferred<void>();
+    const releaseAdmission = createDeferred<void>();
+    const admissionError = new Error("admission failed");
+    const events: string[] = [];
+    const onAdmitted = vi.fn(async () => {
+      events.push("admission-started");
+      admissionStarted.resolve();
+      await releaseAdmission.promise;
+      events.push("admission-rejected");
+      throw admissionError;
+    });
+    const onComplete = vi.fn(() => {
+      events.push("complete");
+    });
+    const run = createRun({ prompt: "complete during admission" });
+    run.turnAdoptionLifecycle = {
+      onAdopted: onAdmitted,
+      onSettled: onComplete,
+      admission: "exclusive",
+      onAbandoned: () => {},
+    };
+
+    const admission = admitFollowupRunLifecycle(run);
+    await admissionStarted.promise;
+
+    completeFollowupRunLifecycle(run);
+    expect(onComplete).not.toHaveBeenCalled();
+
+    releaseAdmission.resolve();
+    await expect(admission).rejects.toBe(admissionError);
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+
+    await expect(admitFollowupRunLifecycle(run)).rejects.toThrow(
+      "followup run lifecycle completed before admission",
+    );
+    expect(onAdmitted).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["admission-started", "admission-rejected", "complete"]);
+  });
+
   it("does not enqueue when the external lifecycle rejects the run identity", () => {
     const key = `test-rejected-lifecycle-${Date.now()}`;
     const onEnqueued = vi.fn(() => false);
     const run = createRun({ prompt: "duplicate owner" });
-    run.queuedLifecycle = { onEnqueued };
+    run.turnAdoptionLifecycle = { onAdopted: async () => {}, onDeferred: onEnqueued };
 
     const enqueued = enqueueFollowupRun(key, run, {
       mode: "followup",
@@ -691,7 +792,7 @@ describe("followup queue collect routing", () => {
             originatingTo: "channel:A",
             originatingChatType: "channel",
           }),
-          queuedLifecycle: { onComplete },
+          turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: onComplete },
         },
         settings,
       );
@@ -726,7 +827,11 @@ describe("followup queue collect routing", () => {
         key,
         {
           ...createRun({ prompt: "rejected" }),
-          queuedLifecycle: { onEnqueued, onComplete },
+          turnAdoptionLifecycle: {
+            onAdopted: async () => {},
+            onDeferred: onEnqueued,
+            onSettled: onComplete,
+          },
         },
         settings,
       ),
@@ -1459,6 +1564,48 @@ describe("followup queue collect routing", () => {
     expect(calls[2]?.originatingChatType).toBe("channel");
   });
 
+  it("does not deliver a context group again after concurrent overflow summarizes it", async () => {
+    const key = `test-collect-overflow-stale-context-${Date.now()}`;
+    const calls: FollowupRun[] = [];
+    const firstStarted = createDeferred<void>();
+    const releaseFirst = createDeferred<void>();
+    const settings: QueueSettings = {
+      mode: "collect",
+      debounceMs: 0,
+      cap: 2,
+      dropPolicy: "summarize",
+    };
+    const createContextRun = (prompt: string, chatType: "direct" | "channel") =>
+      createRun({
+        prompt,
+        originatingChannel: "slack",
+        originatingTo: "same-target",
+        originatingChatType: chatType,
+      });
+
+    enqueueFollowupRun(key, createContextRun("context A", "direct"), settings);
+    enqueueFollowupRun(key, createContextRun("context B", "channel"), settings);
+
+    scheduleFollowupDrain(key, async (run) => {
+      calls.push(run);
+      if (calls.length === 1) {
+        firstStarted.resolve();
+        await releaseFirst.promise;
+      }
+    });
+    await firstStarted.promise;
+
+    enqueueFollowupRun(key, createContextRun("context C", "channel"), settings);
+    enqueueFollowupRun(key, createContextRun("context D", "channel"), settings);
+    releaseFirst.resolve();
+
+    await vi.waitFor(() => expect(getExistingFollowupQueue(key)).toBeUndefined());
+    const contextBCalls = calls.filter((run) => run.prompt.includes("context B"));
+
+    expect(contextBCalls).toHaveLength(1);
+    expect(contextBCalls[0]?.prompt).toContain("[Queue overflow] Dropped 1 message due to cap.");
+  });
+
   it("retries split overflow summaries after transient failure", async () => {
     const key = `test-collect-overflow-split-retry-${Date.now()}`;
     const prompts: string[] = [];
@@ -1481,7 +1628,7 @@ describe("followup queue collect routing", () => {
           originatingTo: "same-target",
           originatingChatType: "direct",
         }),
-        queuedLifecycle: { onComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: onComplete },
       },
       settings,
     );
@@ -1808,7 +1955,7 @@ describe("followup queue collect routing", () => {
     };
     const controller = new AbortController();
     const begin = () => () => undefined;
-    const lifecycle = { onComplete: () => undefined };
+    const lifecycle = { onAdopted: async () => {}, onSettled: () => undefined };
 
     enqueueFollowupRun(
       key,
@@ -1828,7 +1975,7 @@ describe("followup queue collect routing", () => {
     first.currentInboundContext = { text: "room event body" };
     first.abortSignal = controller.signal;
     first.deliveryCorrelations = [{ begin }];
-    first.queuedLifecycle = lifecycle;
+    first.turnAdoptionLifecycle = lifecycle;
     enqueueFollowupRun(
       key,
       createRun({
@@ -1849,7 +1996,7 @@ describe("followup queue collect routing", () => {
     expect(calls[0]?.currentInboundContext?.text).toBe("room event body");
     expect(calls[0]?.abortSignal).toBe(controller.signal);
     expect(calls[0]?.deliveryCorrelations?.[0]?.begin).toBe(begin);
-    expect(calls[0]?.queuedLifecycle).toBe(lifecycle);
+    expect(calls[0]?.turnAdoptionLifecycle).toBe(lifecycle);
     expect(calls[1]?.prompt).toBe("second");
   });
 
@@ -2237,7 +2384,7 @@ describe("followup queue collect routing", () => {
             originatingChannel: "webchat",
             originatingTo: "session:main",
           }),
-          queuedLifecycle: { ownerKey },
+          turnAdoptionLifecycle: { onAdopted: async () => {}, ownerKey },
         },
         settings,
       );
@@ -2938,7 +3085,6 @@ describe("followup queue collect routing", () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-overflow-session-"));
     const storePath = path.join(tempDir, "sessions.json");
     const oldTranscriptPath = path.join(tempDir, "old-session.jsonl");
-    const newTranscriptPath = path.join(tempDir, "new-session.jsonl");
     const key = `test-overflow-summary-session-rotation-${Date.now()}`;
     const calls: FollowupRun[] = [];
     const done = createDeferred<void>();
@@ -2950,15 +3096,12 @@ describe("followup queue collect routing", () => {
     };
 
     try {
-      await fs.writeFile(
-        storePath,
-        JSON.stringify({
-          "agent:agent:main": {
-            sessionId: "new-session",
-            sessionFile: newTranscriptPath,
-            updatedAt: Date.now(),
-          },
-        }),
+      await replaceSessionEntry(
+        { storePath, sessionKey: "agent:agent:main" },
+        {
+          sessionId: "new-session",
+          updatedAt: Date.now(),
+        },
       );
       const first = createRun({ prompt: "first" });
       first.run.sessionId = "old-session";
@@ -2979,11 +3122,27 @@ describe("followup queue collect routing", () => {
       const recorder = calls[0]?.userTurnTranscriptRecorder;
       expect(recorder).toBeDefined();
       const persisted = await recorder?.persistFallback();
-      expect(await fs.realpath(persisted?.sessionFile ?? "")).toBe(
-        await fs.realpath(newTranscriptPath),
+      expect(persisted?.sessionFile).toBe(
+        formatSqliteSessionFileMarker({
+          agentId: "agent",
+          sessionId: "new-session",
+          storePath,
+        }),
       );
-      await expect(fs.readFile(newTranscriptPath, "utf8")).resolves.toContain(
-        "[Queue overflow] Dropped 1 message due to cap.",
+      await expect(
+        loadTranscriptEvents({
+          agentId: "agent",
+          sessionId: "new-session",
+          sessionKey: "agent:agent:main",
+          storePath,
+        }),
+      ).resolves.toContainEqual(
+        expect.objectContaining({
+          message: expect.objectContaining({
+            content: expect.stringContaining("[Queue overflow] Dropped 1 message due to cap."),
+          }),
+          type: "message",
+        }),
       );
       await expect(fs.stat(oldTranscriptPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
@@ -3011,7 +3170,7 @@ describe("followup queue collect routing", () => {
       {
         ...createRun({ prompt: "aborted" }),
         abortSignal: controller.signal,
-        queuedLifecycle: { onComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: onComplete },
       },
       settings,
     );
@@ -3300,7 +3459,7 @@ describe("followup queue collect routing", () => {
         currentInboundContext: { text: "live context" },
         abortSignal: controller.signal,
         deliveryCorrelations: [{ begin }],
-        queuedLifecycle: { onComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: onComplete },
       },
       settings,
     );
@@ -3318,7 +3477,7 @@ describe("followup queue collect routing", () => {
     expect(calls[1]?.currentInboundAudio).toBe(true);
     expect(calls[1]?.currentInboundContext?.text).toBe("live context");
     expect(calls[1]?.abortSignal).toBe(controller.signal);
-    expect(calls[1]?.queuedLifecycle?.onComplete).toBe(onComplete);
+    expect(calls[1]?.turnAdoptionLifecycle?.onSettled).toBe(onComplete);
     expect(calls[1]?.deliveryCorrelations?.[0]?.begin).toBe(begin);
   });
 
@@ -3390,7 +3549,7 @@ describe("followup queue collect routing", () => {
         currentInboundEventKind: "room_event",
         currentInboundContext: { text: "dropped context" },
         abortSignal: controller.signal,
-        queuedLifecycle: { onComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: onComplete },
       },
       settings,
     );
@@ -3426,9 +3585,10 @@ describe("followup queue collect routing", () => {
         {
           ...createRun({ prompt }),
           abortSignal: new AbortController().signal,
-          queuedLifecycle: {
+          turnAdoptionLifecycle: {
+            onAdopted: async () => {},
             onCancellationRetired: sourceCancellationRetirements[index],
-            onComplete: sourceCompletions[index],
+            onSettled: sourceCompletions[index],
           },
         },
         settings,
@@ -3440,12 +3600,12 @@ describe("followup queue collect routing", () => {
       calls.push(run);
       if (calls.length === 1) {
         expect(run.prompt).toContain("[Queue overflow] Dropped 2 messages due to cap.");
-        run.queuedLifecycle?.onAdmitted?.();
+        await run.turnAdoptionLifecycle?.onAdopted?.();
         expect(sourceCancellationRetirements[0]).toHaveBeenCalledTimes(1);
         expect(sourceCancellationRetirements[1]).not.toHaveBeenCalled();
         expect(sourceCompletions[0]).not.toHaveBeenCalled();
         expect(sourceCompletions[1]).not.toHaveBeenCalled();
-        run.queuedLifecycle?.onComplete?.();
+        run.turnAdoptionLifecycle?.onSettled?.();
         expect(sourceCompletions[0]).toHaveBeenCalledTimes(1);
         expect(sourceCompletions[1]).toHaveBeenCalledTimes(1);
         return;
@@ -3458,7 +3618,62 @@ describe("followup queue collect routing", () => {
     expect(calls[1]?.prompt).toBe("live followup");
   });
 
-  it("completes summarized room-event lifecycle when overflow summary delivery fails", async () => {
+  it("admits one lifecycle-owned overflow source before delivery", async () => {
+    const key = `test-overflow-summary-single-admission-${Date.now()}`;
+    const events: string[] = [];
+    const done = createDeferred<void>();
+    const sourceComplete = vi.fn(() => {
+      events.push("source-complete");
+    });
+    const settings: QueueSettings = {
+      mode: "followup",
+      debounceMs: 0,
+      cap: 1,
+      dropPolicy: "summarize",
+    };
+
+    enqueueFollowupRun(
+      key,
+      {
+        ...createRun({ prompt: "dropped lifecycle source" }),
+        turnAdoptionLifecycle: {
+          onAdopted: async () => {
+            events.push("source-admitted");
+          },
+          onSettled: sourceComplete,
+          admission: "exclusive",
+          onAbandoned: () => {},
+        },
+      },
+      settings,
+    );
+    enqueueFollowupRun(key, createRun({ prompt: "live followup" }), settings);
+
+    scheduleFollowupDrain(key, async (run) => {
+      if (run.prompt.includes("[Queue overflow]")) {
+        events.push("summary-started");
+        expect(run.turnAdoptionLifecycle?.onAdopted).toEqual(expect.any(Function));
+        await run.turnAdoptionLifecycle?.onAdopted?.();
+        events.push("model");
+        run.turnAdoptionLifecycle?.onSettled?.();
+        return;
+      }
+      events.push("live-followup");
+      done.resolve();
+    });
+    await done.promise;
+
+    expect(sourceComplete).toHaveBeenCalledTimes(1);
+    expect(events).toEqual([
+      "summary-started",
+      "source-admitted",
+      "model",
+      "source-complete",
+      "live-followup",
+    ]);
+  });
+
+  it("keeps one onComplete-only overflow source retryable after delivery fails", async () => {
     const key = `test-overflow-summary-lifecycle-failure-${Date.now()}`;
     const calls: FollowupRun[] = [];
     const firstAttempt = createDeferred<void>();
@@ -3468,6 +3683,7 @@ describe("followup queue collect routing", () => {
     let attempts = 0;
     const runFollowup = async (run: FollowupRun) => {
       calls.push(run);
+      expect(run.turnAdoptionLifecycle).toBeUndefined();
       attempts += 1;
       if (attempts === 1) {
         firstAttempt.resolve();
@@ -3489,7 +3705,7 @@ describe("followup queue collect routing", () => {
         ...createRun({ prompt: "dropped ambient" }),
         currentInboundEventKind: "room_event",
         currentInboundContext: { text: "dropped context" },
-        queuedLifecycle: { onComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: onComplete },
       },
       settings,
     );
@@ -3506,7 +3722,7 @@ describe("followup queue collect routing", () => {
     expect(getExistingFollowupQueue(key)?.summarySources[0]?.currentInboundEventKind).toBe(
       "room_event",
     );
-    expect(getExistingFollowupQueue(key)?.summarySources[0]?.queuedLifecycle).toBeDefined();
+    expect(getExistingFollowupQueue(key)?.summarySources[0]?.turnAdoptionLifecycle).toBeDefined();
     expect(getExistingFollowupQueue(key)?.summarySources[0]?.currentInboundContext).toBeUndefined();
 
     scheduleFollowupDrain(key, runFollowup);
@@ -3538,7 +3754,7 @@ describe("followup queue collect routing", () => {
       {
         ...createRun({ prompt: "first" }),
         abortSignal: new AbortController().signal,
-        queuedLifecycle: { onComplete: firstComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: firstComplete },
       },
       settings,
     );
@@ -3547,7 +3763,7 @@ describe("followup queue collect routing", () => {
       {
         ...createRun({ prompt: "second" }),
         abortSignal: new AbortController().signal,
-        queuedLifecycle: { onComplete: secondComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: secondComplete },
       },
       settings,
     );
@@ -3563,6 +3779,70 @@ describe("followup queue collect routing", () => {
     expect(secondComplete).toHaveBeenCalledTimes(1);
   });
 
+  it("runs distinct collected admission lifecycles independently when one retries", async () => {
+    const key = `test-collect-admission-isolation-${Date.now()}`;
+    const events: string[] = [];
+    const done = createDeferred<void>();
+    const secondAdmissionError = new Error("second admission failed");
+    const settings: QueueSettings = { mode: "collect", debounceMs: 0 };
+
+    const first = createRun({ prompt: "first" });
+    first.turnAdoptionLifecycle = {
+      onAdopted: async () => {
+        events.push("first-admitted");
+      },
+      admission: "exclusive",
+      onAbandoned: () => {},
+    };
+    const second = createRun({ prompt: "second" });
+    second.turnAdoptionLifecycle = {
+      onAdopted: vi
+        .fn<() => Promise<void>>()
+        .mockImplementationOnce(async () => {
+          events.push("second-rejected");
+          throw secondAdmissionError;
+        })
+        .mockImplementationOnce(async () => {
+          events.push("second-admitted");
+        }),
+      admission: "exclusive",
+      onAbandoned: () => {},
+    };
+
+    enqueueFollowupRun(key, first, settings);
+    enqueueFollowupRun(key, second, settings);
+
+    scheduleFollowupDrain(key, async (run) => {
+      const prompt = run.prompt.includes("first") ? "first" : "second";
+      events.push(`run:${prompt}`);
+      try {
+        await admitFollowupRunLifecycle(run);
+      } catch (error) {
+        events.push(`error:${prompt}`);
+        throw error;
+      }
+      events.push(`model:${prompt}`);
+      if (prompt === "second") {
+        done.resolve();
+      }
+    });
+
+    await done.promise;
+
+    expect(events).toEqual([
+      "run:first",
+      "first-admitted",
+      "model:first",
+      "run:second",
+      "second-rejected",
+      "error:second",
+      "run:second",
+      "second-admitted",
+      "model:second",
+    ]);
+    expect(second.turnAdoptionLifecycle.onAdopted).toHaveBeenCalledTimes(2);
+  });
+
   it("collects transcript-owned turns under one aggregate recorder", async () => {
     const key = `test-collect-transcript-owner-${Date.now()}`;
     const calls: FollowupRun[] = [];
@@ -3574,7 +3854,7 @@ describe("followup queue collect routing", () => {
     const createRecorder = (text: string, mediaPath: string) =>
       createUserTurnTranscriptRecorder({
         input: { text, media: [{ path: mediaPath, contentType: "image/png" }] },
-        target: { transcriptPath: "/tmp/session.jsonl" },
+        target: createTestUserTurnTranscriptTarget(),
         updateMode: "none",
       });
     const firstRecorder = createRecorder("first transcript", "/tmp/first.png");
@@ -3594,7 +3874,7 @@ describe("followup queue collect routing", () => {
           currentInboundContext: { text: "shared gateway context", promptJoiner: " " },
           deliveryCorrelations: [deliveryCorrelation],
           abortSignal: new AbortController().signal,
-          queuedLifecycle: { onComplete },
+          turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: onComplete },
         },
         settings,
       );
@@ -3624,10 +3904,11 @@ describe("followup queue collect routing", () => {
     const message = await calls[0]?.userTurnTranscriptRecorder?.resolveMessage();
     expect(message?.content).toContain("first transcript");
     expect(message?.content).toContain("second transcript");
-    expect((message as unknown as { MediaPaths?: string[] } | undefined)?.MediaPaths).toEqual([
-      "/tmp/first.png",
-      "/tmp/second.png",
-    ]);
+    expect(
+      (message as unknown as { __openclaw?: { media?: Array<{ path?: string }> } } | undefined)?.[
+        "__openclaw"
+      ]?.media?.map((fact) => fact.path),
+    ).toEqual(["/tmp/first.png", "/tmp/second.png"]);
     await vi.waitFor(() => expect(firstComplete).toHaveBeenCalledTimes(1));
     expect(secondComplete).toHaveBeenCalledTimes(1);
   });
@@ -3678,7 +3959,7 @@ describe("followup queue collect routing", () => {
     const createRecorder = (text: string) =>
       createUserTurnTranscriptRecorder({
         input: { text },
-        target: { transcriptPath: "/tmp/session.jsonl" },
+        target: createTestUserTurnTranscriptTarget(),
         updateMode: "none",
       });
 
@@ -3695,9 +3976,10 @@ describe("followup queue collect routing", () => {
           transcriptPrompt: `${prompt} transcript`,
           userTurnTranscriptRecorder: createRecorder(`${prompt} transcript`),
           abortSignal,
-          queuedLifecycle: {
+          turnAdoptionLifecycle: {
+            onAdopted: async () => {},
             onCancellationRetired: sourceCancellationRetirements[index],
-            onComplete: sourceCompletions[index],
+            onSettled: sourceCompletions[index],
           },
         },
         settings,
@@ -3709,7 +3991,7 @@ describe("followup queue collect routing", () => {
       if (calls.length === 1) {
         expect(run.abortSignal).toBeDefined();
         expect(run.abortSignal).not.toBe(survivor.signal);
-        run.queuedLifecycle?.onAdmitted?.();
+        await run.turnAdoptionLifecycle?.onAdopted?.();
         expect(sourceCancellationRetirements[0]).toHaveBeenCalledTimes(1);
         expect(sourceCancellationRetirements[1]).not.toHaveBeenCalled();
         expect(sourceCompletions[0]).not.toHaveBeenCalled();
@@ -3743,7 +4025,7 @@ describe("followup queue collect routing", () => {
     scheduleFollowupDrain(key, async (run) => {
       expect(run.abortSignal).toBeUndefined();
       expect(run.queueAbortSignal?.aborted).toBe(false);
-      run.queuedLifecycle?.onAdmitted?.();
+      await run.turnAdoptionLifecycle?.onAdopted?.();
       clearFollowupQueue(key);
       expect(run.queueAbortSignal?.aborted).toBe(true);
       done.resolve();
@@ -3765,7 +4047,7 @@ describe("followup queue collect routing", () => {
       const enqueueSource = (prompt: string, onComplete: () => void, abortSignal?: AbortSignal) => {
         const source: FollowupRun = {
           ...createRun({ prompt }),
-          queuedLifecycle: { onComplete },
+          turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: onComplete },
         };
         if (abortSignal) {
           source.abortSignal = abortSignal;
@@ -3827,7 +4109,7 @@ describe("followup queue collect routing", () => {
       {
         ...createRun({ prompt: "owner A summary" }),
         abortSignal: new AbortController().signal,
-        queuedLifecycle: { onComplete: summarizedComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: summarizedComplete },
       },
       settings,
     );
@@ -3836,7 +4118,7 @@ describe("followup queue collect routing", () => {
       {
         ...createRun({ prompt: "owner B live" }),
         abortSignal: aborted.signal,
-        queuedLifecycle: { onComplete: abortedComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: abortedComplete },
       },
       settings,
     );
@@ -3880,7 +4162,7 @@ describe("followup queue collect routing", () => {
       {
         ...createRun({ prompt: "elided and cancelled" }),
         abortSignal: elided.signal,
-        queuedLifecycle: { onComplete: elidedComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: elidedComplete },
       },
       settings,
     );
@@ -3914,7 +4196,7 @@ describe("followup queue collect routing", () => {
       key,
       {
         ...createRun({ prompt: "elided source" }),
-        queuedLifecycle: { onComplete: elidedComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: elidedComplete },
       },
       settings,
     );
@@ -3922,7 +4204,7 @@ describe("followup queue collect routing", () => {
       key,
       {
         ...createRun({ prompt: "retained source" }),
-        queuedLifecycle: { onComplete: retainedComplete },
+        turnAdoptionLifecycle: { onAdopted: async () => {}, onSettled: retainedComplete },
       },
       settings,
     );
@@ -3933,7 +4215,7 @@ describe("followup queue collect routing", () => {
       if (calls.length === 1) {
         expect(run.prompt).toContain("Dropped 2 messages");
         expect(run.prompt).toContain("retained source");
-        run.queuedLifecycle?.onAdmitted?.();
+        await run.turnAdoptionLifecycle?.onAdopted?.();
         expect(getExistingFollowupQueue(key)?.summaryElisions).toEqual([]);
         expect(getExistingFollowupQueue(key)?.droppedCount).toBe(0);
         throw new Error("admitted summary failure");
@@ -3947,20 +4229,100 @@ describe("followup queue collect routing", () => {
     expect(elidedComplete).toHaveBeenCalledOnce();
     expect(retainedComplete).toHaveBeenCalledOnce();
   });
+
+  it("runs distinct overflow admission lifecycles independently when one retries", async () => {
+    const key = `test-overflow-admission-isolation-${Date.now()}`;
+    const events: string[] = [];
+    const done = createDeferred<void>();
+    const secondAdmissionError = new Error("second overflow admission failed");
+    const settings: QueueSettings = {
+      mode: "followup",
+      debounceMs: 0,
+      cap: 1,
+      dropPolicy: "summarize",
+    };
+
+    const first = createRun({ prompt: "first dropped" });
+    first.turnAdoptionLifecycle = {
+      onAdopted: async () => {
+        events.push("first-admitted");
+      },
+      admission: "exclusive",
+      onAbandoned: () => {},
+    };
+    const second = createRun({ prompt: "second dropped" });
+    second.turnAdoptionLifecycle = {
+      onAdopted: vi
+        .fn<() => Promise<void>>()
+        .mockImplementationOnce(async () => {
+          events.push("second-rejected");
+          throw secondAdmissionError;
+        })
+        .mockImplementationOnce(async () => {
+          events.push("second-admitted");
+        }),
+      admission: "exclusive",
+      onAbandoned: () => {},
+    };
+
+    enqueueFollowupRun(key, first, settings);
+    enqueueFollowupRun(key, second, settings);
+    enqueueFollowupRun(key, createRun({ prompt: "live followup" }), settings);
+
+    scheduleFollowupDrain(key, async (run) => {
+      if (run.prompt.includes("[Queue overflow]")) {
+        events.push("summary-run");
+        try {
+          await admitFollowupRunLifecycle(run);
+        } catch (error) {
+          events.push("summary-error");
+          throw error;
+        }
+        events.push("summary-model");
+        return;
+      }
+      events.push("live-followup");
+      done.resolve();
+    });
+
+    await done.promise;
+
+    expect(events).toEqual([
+      "summary-run",
+      "first-admitted",
+      "summary-model",
+      "summary-run",
+      "second-rejected",
+      "summary-error",
+      "summary-run",
+      "second-admitted",
+      "summary-model",
+      "live-followup",
+    ]);
+    expect(second.turnAdoptionLifecycle.onAdopted).toHaveBeenCalledTimes(2);
+  });
 });
 
-describe("resolveFollowupAuthorizationKey", () => {
+function resolveDeliveryKeyWithRunOverrides(
+  item: FollowupRun,
+  overrides: Partial<FollowupRun["run"]>,
+): string {
+  return resolveFollowupDeliveryContextKey({
+    ...item,
+    run: { ...item.run, ...overrides },
+  });
+}
+
+describe("followup authorization delivery context", () => {
   it("changes when sender ownership changes", () => {
-    const run = createRun({ prompt: "one" }).run;
+    const run = createRun({ prompt: "one" });
     expect(
-      resolveFollowupAuthorizationKey({
-        ...run,
+      resolveDeliveryKeyWithRunOverrides(run, {
         senderId: "user-1",
         senderIsOwner: false,
       }),
     ).not.toBe(
-      resolveFollowupAuthorizationKey({
-        ...run,
+      resolveDeliveryKeyWithRunOverrides(run, {
         senderId: "user-1",
         senderIsOwner: true,
       }),
@@ -3968,16 +4330,14 @@ describe("resolveFollowupAuthorizationKey", () => {
   });
 
   it("changes when exec defaults change", () => {
-    const run = createRun({ prompt: "one" }).run;
+    const run = createRun({ prompt: "one" });
     expect(
-      resolveFollowupAuthorizationKey({
-        ...run,
+      resolveDeliveryKeyWithRunOverrides(run, {
         senderId: "user-1",
         bashElevated: { enabled: false, allowed: true, defaultLevel: "off" },
       }),
     ).not.toBe(
-      resolveFollowupAuthorizationKey({
-        ...run,
+      resolveDeliveryKeyWithRunOverrides(run, {
         senderId: "user-1",
         bashElevated: { enabled: true, allowed: true, defaultLevel: "on" },
         execOverrides: { ask: "always" },
@@ -3986,33 +4346,29 @@ describe("resolveFollowupAuthorizationKey", () => {
   });
 
   it("changes when the approval reviewer device changes", () => {
-    const run = createRun({ prompt: "one" }).run;
+    const run = createRun({ prompt: "one" });
     expect(
-      resolveFollowupAuthorizationKey({
-        ...run,
+      resolveDeliveryKeyWithRunOverrides(run, {
         approvalReviewerDeviceId: "device-a",
       }),
     ).not.toBe(
-      resolveFollowupAuthorizationKey({
-        ...run,
+      resolveDeliveryKeyWithRunOverrides(run, {
         approvalReviewerDeviceId: "device-b",
       }),
     );
   });
 
   it("does not change when only sender display fields change", () => {
-    const run = createRun({ prompt: "one" }).run;
+    const run = createRun({ prompt: "one" });
     expect(
-      resolveFollowupAuthorizationKey({
-        ...run,
+      resolveDeliveryKeyWithRunOverrides(run, {
         senderId: "user-1",
         senderName: "Guest",
         senderUsername: "guest",
         senderIsOwner: false,
       }),
     ).toBe(
-      resolveFollowupAuthorizationKey({
-        ...run,
+      resolveDeliveryKeyWithRunOverrides(run, {
         senderId: "user-1",
         senderName: "Guest User",
         senderUsername: "guest-renamed",
@@ -4021,3 +4377,4 @@ describe("resolveFollowupAuthorizationKey", () => {
     );
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

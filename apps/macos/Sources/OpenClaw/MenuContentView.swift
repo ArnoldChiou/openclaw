@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Foundation
+import KeyboardShortcuts
 import Observation
 import OpenClawKit
 import SwiftUI
@@ -10,10 +11,10 @@ struct MenuContent: View {
     @Bindable var state: AppState
     let updater: UpdaterProviding?
     @Bindable private var updateStatus: UpdateStatus
-    private let gatewayManager = GatewayProcessManager.shared
     private let healthStore = HealthStore.shared
     private let heartbeatStore = HeartbeatStore.shared
     private let controlChannel = ControlChannel.shared
+    private let dashboardManager = DashboardManager.shared
     private let activityStore = WorkActivityStore.shared
     private let nodesStore = NodesStore.shared
     @Bindable private var pairingPrompter = NodePairingApprovalPrompter.shared
@@ -24,7 +25,7 @@ struct MenuContent: View {
     @State private var micRefreshTask: Task<Void, Never>?
     @State private var browserControlEnabled = true
     @AppStorage(cameraEnabledKey) private var cameraEnabled: Bool = false
-    @AppStorage(appLogLevelKey) private var appLogLevelRaw: String = AppLogLevel.default.rawValue
+    @AppStorage(appLogLevelKey) private var appLogLevelRaw: String = Logger.Level.info.rawValue
     @AppStorage(debugFileLogEnabledKey) private var appFileLoggingEnabled: Bool = false
 
     init(state: AppState, updater: UpdaterProviding?) {
@@ -36,7 +37,7 @@ struct MenuContent: View {
     private var execApprovalModeBinding: Binding<ExecApprovalQuickMode> {
         Binding(
             get: { self.state.execApprovalMode },
-            set: { self.state.execApprovalMode = $0 })
+            set: { self.state.updateExecApprovalMode($0) })
     }
 
     var body: some View {
@@ -82,12 +83,34 @@ struct MenuContent: View {
             Toggle(isOn: self.$cameraEnabled) {
                 Label("Allow Camera", systemImage: "camera")
             }
-            Picker(selection: self.execApprovalModeBinding) {
-                ForEach(ExecApprovalQuickMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
+            switch self.state.execApprovalPolicyLoadState {
+            case .available:
+                Picker(selection: self.execApprovalModeBinding) {
+                    ForEach(ExecApprovalQuickMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                } label: {
+                    Label("Exec Approvals", systemImage: "terminal")
                 }
-            } label: {
-                Label("Exec Approvals", systemImage: "terminal")
+            case .loading:
+                Label("Loading Exec Approvals…", systemImage: "terminal")
+                    .foregroundStyle(.secondary)
+            case .unavailable:
+                Button {
+                    self.state.retryExecApprovalModeRead()
+                } label: {
+                    Label("Retry Exec Approvals", systemImage: "arrow.clockwise")
+                }
+            }
+            if let error = self.state.execApprovalLoadError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let error = self.state.execApprovalMutationError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
             Toggle(isOn: Binding(get: { self.state.canvasEnabled }, set: { self.state.canvasEnabled = $0 })) {
                 Label("Allow Canvas", systemImage: "rectangle.and.pencil.and.ellipsis")
@@ -115,6 +138,14 @@ struct MenuContent: View {
                 AppNavigationActions.openChat()
             } label: {
                 Label("Open Chat", systemImage: "bubble.left.and.bubble.right")
+            }
+            if self.state.quickChatEnabled {
+                Button {
+                    QuickChatController.shared.toggle()
+                } label: {
+                    Label("Quick Chat", systemImage: "text.bubble")
+                }
+                .globalKeyboardShortcut(.toggleQuickChat)
             }
             if self.state.canvasEnabled {
                 Button {
@@ -171,14 +202,9 @@ struct MenuContent: View {
     }
 
     private var connectionLabel: String {
-        switch self.state.connectionMode {
-        case .unconfigured:
-            "OpenClaw Not Configured"
-        case .remote:
-            "Remote OpenClaw Active"
-        case .local:
-            "OpenClaw Active"
-        }
+        DashboardGatewayMenuModel.connectionLabel(
+            mode: self.state.connectionMode,
+            entries: self.dashboardManager.gatewayEntries)
     }
 
     private func loadBrowserControlEnabled() async {
@@ -257,7 +283,7 @@ struct MenuContent: View {
                 }
                 Menu {
                     Picker("Verbosity", selection: self.$appLogLevelRaw) {
-                        ForEach(AppLogLevel.allCases) { level in
+                        ForEach(Logger.Level.allCases, id: \.rawValue) { level in
                             Text(level.title).tag(level.rawValue)
                         }
                     }
@@ -327,8 +353,12 @@ struct MenuContent: View {
         guard self.state.connectionMode != .unconfigured else { return nil }
         guard case .connected = self.controlChannel.state else { return nil }
 
-        let deviceId = DeviceIdentityStore.loadOrCreate(
-            profile: MacNodeModeCoordinator.nodeIdentityProfile).deviceId
+        guard let identity = DeviceIdentityStore.loadOrCreatePersisted(
+            profile: MacNodeModeCoordinator.nodeIdentityProfile)
+        else {
+            return ("Mac identity unavailable", .red)
+        }
+        let deviceId = identity.deviceId
         if let entry = self.nodesStore.nodes.first(where: { $0.nodeId == deviceId }) {
             guard entry.isConnected else {
                 return ("Mac capabilities offline", .orange)

@@ -66,6 +66,8 @@ const browserCommandGroupDefinitions: readonly BrowserCommandGroupDefinition[] =
       command("focus", "Focus a tab by tab reference"),
       command("close", "Close a tab (tab reference optional)"),
       command("profiles", "List all browser profiles"),
+      command("system-profiles", "List Chrome-family profiles available for cookie import"),
+      command("import-profile", "Import cookies from a macOS Chrome-family profile"),
       command("create-profile", "Create a new browser profile"),
       command("delete-profile", "Delete a browser profile"),
       command("doctor", "Check browser plugin readiness", [
@@ -106,6 +108,7 @@ const browserCommandGroupDefinitions: readonly BrowserCommandGroupDefinition[] =
       command("fill", "Fill a form with JSON field descriptors"),
       command("wait", "Wait for time, selector, URL, load state, or JS conditions"),
       command("evaluate", "Evaluate a function against the page or a ref"),
+      command("batch", "Run a batch of browser actions in one call"),
     ],
     register: async (args) => {
       const module = await import("./browser-cli-actions-input.js");
@@ -114,6 +117,7 @@ const browserCommandGroupDefinitions: readonly BrowserCommandGroupDefinition[] =
   },
   {
     placeholders: [
+      command("extract", "Answer a question from the current page"),
       command("console", "Get recent console messages"),
       command("pdf", "Save page as PDF"),
       command("responsebody", "Wait for a network response and return its body"),
@@ -238,12 +242,7 @@ function resolveBrowserLazySubcommand(argv: string[]): string | null {
 }
 
 function resolveBrowserParentOpts(cmd: Command): BrowserParentOpts {
-  for (let current: Command | null | undefined = cmd; current; current = current.parent) {
-    if (current.name() === "browser") {
-      return current.opts() as BrowserParentOpts;
-    }
-  }
-  return cmd.parent?.opts?.() as BrowserParentOpts;
+  return cmd.optsWithGlobals<BrowserParentOpts>();
 }
 
 function registerLazyBrowserCommands(
