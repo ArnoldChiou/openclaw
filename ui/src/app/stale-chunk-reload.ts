@@ -9,6 +9,7 @@
 // service worker, so reloading against the freshly served index.html is the
 // only recovery path there.
 import { CONTROL_UI_BUILD_INFO } from "../build-info.ts";
+import { t } from "../i18n/index.ts";
 
 const RELOAD_GUARD_STORAGE_KEY = "openclaw.controlUi.staleChunkReloadBuildId";
 // Bounds document probes across rapid re-renders of the same error state.
@@ -49,7 +50,10 @@ export function isStaleChunkImportError(error: unknown): boolean {
 }
 
 function reloadControlUiDocument(): void {
-  window.location.reload();
+  const url = new URL(window.location.href);
+  // The pre-app mount recovery strips this one-shot cache buster before bootstrap.
+  url.searchParams.set("openclaw_mount_recovery", String(Date.now()));
+  window.location.replace(url.href);
 }
 
 function sessionStorageOrNull(): Pick<Storage, "getItem" | "setItem"> | null {
@@ -289,11 +293,10 @@ export function installMissingStylesheetRecovery(
       fontSize: "14px",
     });
     const message = document.createElement("span");
-    // Intentional English: this failure surface mirrors the inline index.html fallback.
-    message.textContent = "Styles failed to load, so the page may look broken.";
+    message.textContent = t("lazyView.stylesFailed");
     const reloadButton = document.createElement("button");
     reloadButton.type = "button";
-    reloadButton.textContent = "Reload";
+    reloadButton.textContent = t("common.reload");
     Object.assign(reloadButton.style, {
       border: "0",
       borderRadius: "4px",

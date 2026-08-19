@@ -1,12 +1,24 @@
 // Control UI module implements app tool stream behavior.
+import { asNullableObjectRecord as readRecord } from "@openclaw/normalization-core/record-coerce";
+import {
+  normalizeNullableString as toTrimmedString,
+  normalizeLowercaseStringOrEmpty,
+} from "@openclaw/normalization-core/string-coerce";
 import { stripInlineDirectiveTagsForDelivery } from "../../../../src/utils/directive-tags.js";
 import type { ExecApprovalRequest } from "../../app/exec-approval.ts";
-import type { ChatStreamSegment } from "../../lib/chat/chat-types.ts";
+import type {
+  ChatGuardianNotice,
+  ChatQueueItem,
+  ChatStreamSegment,
+} from "../../lib/chat/chat-types.ts";
+import type { DiffStat } from "../../lib/chat/tool-call-diff.ts";
+import { formatUiError, formatUiExternalText } from "../../lib/format-error.ts";
 import { formatUnknownText, truncateText } from "../../lib/format.ts";
 import type { SessionCapability } from "../../lib/sessions/index.ts";
 import { uiSessionEventMatches } from "../../lib/sessions/session-key.ts";
-import { normalizeLowercaseStringOrEmpty } from "../../lib/string-coerce.ts";
 import type { ChatRunStartupState } from "./chat-run-startup.ts";
+import { rolloverChatStream } from "./stream-causal-boundary.ts";
+import { buildToolStreamIdentity } from "./tool-stream-identity.ts";
 
 const TOOL_STREAM_LIMIT = 50;
 const TOOL_STREAM_THROTTLE_MS = 80;
@@ -42,7 +54,10 @@ export type ToolStreamEntry = {
   output?: string;
   /** Structured result details (e.g. edit diff) captured from the result event. */
   details?: unknown;
+  /** Monotonic edit counts received while the tool arguments stream. */
+  liveDiffStat?: DiffStat;
   isError?: boolean;
+  exitCode?: number;
   /** True once a result event landed, even when the output text is empty. */
   resultReceived?: boolean;
   startedAt: number;
@@ -50,7 +65,7 @@ export type ToolStreamEntry = {
   message: Record<string, unknown>;
 };
 
-type ToolStreamHost = {
+export type ToolStreamHost = {
   sessionKey: string;
   assistantAgentId?: string | null;
   agentsList?: { defaultId?: string | null } | null;
@@ -63,22 +78,16 @@ type ToolStreamHost = {
   chatStreamSegments: ChatStreamSegment[];
   toolStreamById: Map<string, ToolStreamEntry>;
   toolStreamOrder: string[];
+  activityEventSeqById?: Map<string, number>;
   chatToolMessages: Record<string, unknown>[];
+  guardianNotices?: ChatGuardianNotice[];
   toolStreamSyncTimer: number | null;
-  planStatus?: PlanStatus | null;
   knownAgentRunIds?: Set<string>;
   waitingApprovalStatuses?: Map<string, WaitingApprovalStatus>;
   waitingApprovalResolvedIds?: Set<string>;
+  requestUpdate?: () => void;
   sessions: Pick<SessionCapability, "setModelOverride">;
 };
-
-function toTrimmedString(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
 
 function resolveModelLabel(provider: unknown, model: unknown): string | null {
   const modelValue = toTrimmedString(model);
@@ -123,7 +132,8 @@ function parseFallbackAttemptSummaries(value: unknown): string[] {
   }
   return value
     .map((entry) => toTrimmedString(entry))
-    .filter((entry): entry is string => Boolean(entry));
+    .filter((entry): entry is string => Boolean(entry))
+    .map((entry) => formatUiError(entry));
 }
 
 function parseFallbackAttempts(value: unknown): FallbackAttempt[] {
@@ -141,12 +151,13 @@ function parseFallbackAttempts(value: unknown): FallbackAttempt[] {
     if (!provider || !model) {
       continue;
     }
-    const reason =
+    const reason = formatUiError(
       toTrimmedString(item.reason)?.replace(/_/g, " ") ??
-      toTrimmedString(item.code) ??
-      (typeof item.status === "number" ? `HTTP ${item.status}` : null) ??
-      toTrimmedString(item.error) ??
-      "error";
+        toTrimmedString(item.code) ??
+        (typeof item.status === "number" ? `HTTP ${item.status}` : null) ??
+        toTrimmedString(item.error) ??
+        "error",
+    );
     out.push({ provider, model, reason });
   }
   return out;
@@ -209,8 +220,18 @@ function formatToolOutput(value: unknown): string | null {
   return `${truncated.text}\n\n… truncated (${truncated.total} chars, showing first ${truncated.text.length}).`;
 }
 
-function readRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+function readLiveDiffStat(value: unknown): DiffStat | undefined {
+  const diff = readRecord(value);
+  const added = diff?.added;
+  const removed = diff?.removed;
+  return typeof added === "number" &&
+    Number.isInteger(added) &&
+    added >= 0 &&
+    typeof removed === "number" &&
+    Number.isInteger(removed) &&
+    removed >= 0
+    ? { added, removed }
+    : undefined;
 }
 
 function resolveSessionStatusModelOverride(result: unknown): string | null | undefined {
@@ -260,6 +281,7 @@ function buildToolStreamMessage(entry: ToolStreamEntry): Record<string, unknown>
       text: entry.output ?? "",
       ...(entry.details !== undefined ? { details: entry.details } : {}),
       ...(entry.isError !== undefined ? { isError: entry.isError } : {}),
+      ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
     });
   }
   return {
@@ -274,6 +296,9 @@ function buildToolStreamMessage(entry: ToolStreamEntry): Record<string, unknown>
     // so historical output-less calls (aborted runs) stay inert.
     __openclawToolStreamLive: true,
     __openclawToolStreamResultReceived: entry.resultReceived === true,
+    ...(entry.resultReceived !== true && entry.liveDiffStat
+      ? { __openclawToolStreamDiffStat: entry.liveDiffStat }
+      : {}),
     __openclawToolStreamReceivedAt: entry.receivedAt,
   };
 }
@@ -311,10 +336,11 @@ function scheduleToolStreamSync(host: ToolStreamHost, force = false) {
   if (host.toolStreamSyncTimer != null) {
     return;
   }
-  host.toolStreamSyncTimer = window.setTimeout(
-    () => flushToolStreamSync(host),
-    TOOL_STREAM_THROTTLE_MS,
-  );
+  host.toolStreamSyncTimer = window.setTimeout(() => {
+    flushToolStreamSync(host);
+    // The initial event rendered before this deferred projection existed.
+    host.requestUpdate?.();
+  }, TOOL_STREAM_THROTTLE_MS);
 }
 
 export function resetToolStream(host: ToolStreamHost) {
@@ -324,13 +350,41 @@ export function resetToolStream(host: ToolStreamHost) {
   }
   host.toolStreamById.clear();
   host.toolStreamOrder = [];
+  host.activityEventSeqById?.clear();
   host.chatToolMessages = [];
   host.chatStreamSegments = [];
-  host.planStatus = null;
   host.knownAgentRunIds?.clear();
   host.waitingApprovalStatuses?.clear();
   // Resolution can beat the overlay queue update. Keep tombstones across transient stream resets
   // until snapshot reconciliation observes the approval leaving the queue.
+}
+
+function activityEventIdentity(payload: AgentEventPayload): string | null {
+  if (payload.stream === "tool") {
+    const toolCallId = toTrimmedString(payload.data?.toolCallId);
+    return toolCallId ? `tool:${payload.runId}:${toolCallId}` : null;
+  }
+  if (payload.stream === "item" && payload.data?.kind === "preamble") {
+    const itemId =
+      toTrimmedString(payload.data?.itemId) ?? toTrimmedString(payload.data?.id) ?? "latest";
+    return `preamble:${payload.runId}:${itemId}`;
+  }
+  return null;
+}
+
+function acceptActivityEvent(host: ToolStreamHost, payload: AgentEventPayload): boolean {
+  const identity = activityEventIdentity(payload);
+  if (!identity) {
+    return true;
+  }
+  const seq = Number.isSafeInteger(payload.seq) ? payload.seq : 0;
+  const previous = host.activityEventSeqById?.get(identity);
+  if (previous !== undefined && seq <= previous) {
+    return false;
+  }
+  const sequences = (host.activityEventSeqById ??= new Map());
+  sequences.set(identity, seq);
+  return true;
 }
 
 export type CompactionStatus = {
@@ -348,16 +402,6 @@ export type FallbackStatus = {
   reason?: string;
   attempts: string[];
   occurredAt: number;
-};
-
-export type PlanStatus = {
-  /** Owning run: run-scoped terminal cleanup must not clear another run's plan. */
-  runId?: string;
-  explanation?: string;
-  steps: Array<{
-    step: string;
-    status: "pending" | "in_progress" | "completed";
-  }>;
 };
 
 export type WaitingApprovalStatus = {
@@ -382,6 +426,27 @@ export function resolveActiveRunOutputTokens(params: {
     }
   }
   return null;
+}
+
+export function resolveChatProjectionRunId(params: {
+  localRunId?: string | null;
+  activeRunIds?: readonly string[];
+  queue?: readonly ChatQueueItem[];
+}): string | null {
+  if (params.localRunId) {
+    return params.localRunId;
+  }
+  const activeRunIds = new Set(params.activeRunIds ?? []);
+  // A session row can lag local completion. Restore its run identity only when
+  // the durable outbox independently proves that the same send is reconnecting.
+  return (
+    params.queue?.find(
+      (item) =>
+        item.sendState === "waiting-reconnect" &&
+        typeof item.sendRunId === "string" &&
+        activeRunIds.has(item.sendRunId),
+    )?.sendRunId ?? null
+  );
 }
 
 type WaitingApprovalSnapshotHost = Pick<
@@ -442,17 +507,11 @@ export function reconcileWaitingApprovalsFromSnapshot(
   return changed;
 }
 
-type PlanHost = ToolStreamHost & {
-  planStatus?: PlanStatus | null;
-  requestUpdate?: () => void;
-};
-
 type CompactionHost = ToolStreamHost & {
   compactionStatus?: CompactionStatus | null;
   compactionClearTimer?: number | null;
   fallbackStatus?: FallbackStatus | null;
   fallbackClearTimer?: number | null;
-  requestUpdate?: () => void;
 };
 
 const COMPACTION_TOAST_DURATION_MS = 5000;
@@ -693,7 +752,8 @@ function handleLifecycleFallbackEvent(host: CompactionHost, payload: AgentEventP
     return;
   }
 
-  const reason = toTrimmedString(data.reasonSummary) ?? toTrimmedString(data.reason);
+  const rawReason = toTrimmedString(data.reasonSummary) ?? toTrimmedString(data.reason);
+  const reason = rawReason ? formatUiError(rawReason) : null;
   const attempts = (() => {
     const summaries = parseFallbackAttemptSummaries(data.attemptSummaries);
     if (summaries.length > 0) {
@@ -701,7 +761,7 @@ function handleLifecycleFallbackEvent(host: CompactionHost, payload: AgentEventP
     }
     return parseFallbackAttempts(data.attempts).map((attempt) => {
       const modelRef = resolveModelLabel(attempt.provider, attempt.model);
-      return `${modelRef ?? `${attempt.provider}/${attempt.model}`}: ${attempt.reason}`;
+      return `${modelRef ?? `${attempt.provider}/${attempt.model}`}: ${formatUiExternalText(attempt.reason)}`;
     });
   })();
 
@@ -724,6 +784,7 @@ function handleLifecycleFallbackEvent(host: CompactionHost, payload: AgentEventP
   host.fallbackClearTimer = window.setTimeout(() => {
     host.fallbackStatus = null;
     host.fallbackClearTimer = null;
+    host.requestUpdate?.();
   }, FALLBACK_TOAST_DURATION_MS);
 }
 
@@ -793,6 +854,11 @@ function handlePreambleProgressEvent(host: ToolStreamHost, payload: AgentEventPa
   if (!progress) {
     return false;
   }
+  // Preambles belong to the visible run; a sibling run must never replace,
+  // clear, or persist its commentary into this transcript.
+  if (!resolveAcceptedSession(host, payload, { allowSessionScopedWhenIdle: true }).accepted) {
+    return true;
+  }
   if (progress.itemId && !progress.text.trim()) {
     host.chatStreamSegments = host.chatStreamSegments.filter(
       (segment) => segment.itemId !== progress.itemId,
@@ -808,7 +874,7 @@ function handlePreambleProgressEvent(host: ToolStreamHost, payload: AgentEventPa
       return true;
     }
     host.chatStreamSegments = host.chatStreamSegments.map((segment, index) =>
-      index === existingIndex ? { ...segment, text: progress.text } : segment,
+      index === existingIndex ? { ...segment, text: progress.text, runId: payload.runId } : segment,
     );
     return true;
   }
@@ -820,77 +886,57 @@ function handlePreambleProgressEvent(host: ToolStreamHost, payload: AgentEventPa
     ...host.chatStreamSegments,
     {
       text: progress.text,
-      ts: Date.now(),
+      ts: payload.ts,
+      runId: payload.runId,
       ...(progress.itemId ? { itemId: progress.itemId } : {}),
     },
   ];
   return true;
 }
 
-function parsePlanSteps(value: unknown): PlanStatus["steps"] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  const steps: PlanStatus["steps"] = [];
-  // Plan contract allows at most one in_progress step; demote extras so the
-  // collapsed summary has one unambiguous current step (matches iOS/Android).
-  let hasActiveStep = false;
-  for (const entry of value) {
-    if (typeof entry === "string") {
-      const step = toTrimmedString(entry);
-      if (step) {
-        steps.push({ step, status: "pending" });
-      }
-      continue;
-    }
-    const item = readRecord(entry);
-    const step = toTrimmedString(item?.step);
-    const status = item?.status;
-    if (!step || (status !== "pending" && status !== "in_progress" && status !== "completed")) {
-      continue;
-    }
-    const normalizedStatus = status === "in_progress" && hasActiveStep ? "pending" : status;
-    hasActiveStep ||= status === "in_progress";
-    steps.push({ step, status: normalizedStatus });
-  }
-  return steps;
-}
-
-export function normalizePlanSnapshot(
-  snapshot: { steps?: unknown; explanation?: unknown },
-  runIdValue?: unknown,
-): PlanStatus | null {
-  const steps = parsePlanSteps(snapshot.steps);
-  if (steps.length === 0) {
-    return null;
-  }
-  const explanation = toTrimmedString(snapshot.explanation);
-  const runId = toTrimmedString(runIdValue);
-  return {
-    ...(runId ? { runId } : {}),
-    ...(explanation ? { explanation } : {}),
-    steps,
-  };
-}
-
-function handlePlanEvent(host: PlanHost, payload: AgentEventPayload) {
-  // Plan snapshots are run-owned: a stale or spawned-run event in the same
-  // session must not overwrite (or clear) the active run's checklist. Mirrors
-  // the compaction/fallback acceptance policy (session-scoped when idle).
-  if (!resolveAcceptedSession(host, payload, { allowSessionScopedWhenIdle: true }).accepted) {
-    return;
+function handleGuardianEvent(host: ToolStreamHost, payload: AgentEventPayload): boolean {
+  if (payload.stream !== "codex_app_server.guardian") {
+    return false;
   }
   const data = payload.data ?? {};
-  if (data.phase !== "update") {
-    return;
+  const phase = toTrimmedString(data.phase);
+  const status = toTrimmedString(data.status);
+  const kind =
+    phase === "warning"
+      ? "warning"
+      : phase === "completed" && (status === "approved" || status === "denied")
+        ? status
+        : null;
+  if (!kind) {
+    return true;
   }
-  host.planStatus = normalizePlanSnapshot(data, payload.runId);
-  host.requestUpdate?.();
+  const reviewId = toTrimmedString(data.reviewId) ?? String(payload.seq);
+  const command = toTrimmedString(data.command);
+  const riskLevel = toTrimmedString(data.riskLevel);
+  const rationale = toTrimmedString(data.rationale);
+  const message = toTrimmedString(data.message);
+  const notice: ChatGuardianNotice = {
+    key: `guardian:${payload.runId}:${reviewId}:${kind}`,
+    runId: payload.runId,
+    timestamp: typeof payload.ts === "number" ? payload.ts : Date.now(),
+    kind,
+    ...(command ? { command } : {}),
+    ...(riskLevel ? { riskLevel } : {}),
+    ...(rationale ? { rationale } : {}),
+    ...(message ? { message } : {}),
+  };
+  const current = host.guardianNotices ?? [];
+  const existingIndex = current.findIndex((candidate) => candidate.key === notice.key);
+  host.guardianNotices =
+    existingIndex === -1
+      ? [...current.slice(-49), notice]
+      : current.map((candidate, index) => (index === existingIndex ? notice : candidate));
+  return true;
 }
 
-export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPayload) {
+export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPayload): boolean {
   if (!payload) {
-    return;
+    return false;
   }
 
   // Filter the shared activity stream by session first. Chat-linked events use
@@ -898,7 +944,13 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
   // active chat run; individual run-owned projections apply their own match.
   const sessionKey = typeof payload.sessionKey === "string" ? payload.sessionKey : undefined;
   if (sessionKey && !uiSessionEventMatches(host, sessionKey, toTrimmedString(payload.agentId))) {
-    return;
+    return false;
+  }
+  // History can replay an older active-run snapshot after newer live activity.
+  // Fence each tool/preamble identity by Gateway sequence so restore fills gaps
+  // without regressing a result or newer progress already rendered by this pane.
+  if (!acceptActivityEvent(host, payload)) {
+    return false;
   }
   if (payload.stream === "lifecycle" || payload.stream === "tool") {
     const runId = toTrimmedString(payload.runId);
@@ -908,13 +960,17 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
   }
 
   if (handleUsageEvent(host, payload)) {
-    return;
+    return true;
+  }
+
+  if (handleGuardianEvent(host, payload)) {
+    return true;
   }
 
   // Handle compaction events
   if (payload.stream === "compaction") {
     handleCompactionEvent(host as CompactionHost, payload);
-    return;
+    return true;
   }
 
   if (payload.stream === "lifecycle") {
@@ -928,38 +984,40 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
       host.chatRunUsageById = usageByRun;
     }
     if (handleLifecycleApprovalEvent(host, payload)) {
-      return;
+      return true;
     }
     handleLifecycleCompactionEvent(host as CompactionHost, payload);
     handleLifecycleFallbackEvent(host as CompactionHost, payload);
-    return;
+    return true;
   }
 
   if (payload.stream === "fallback") {
     handleLifecycleFallbackEvent(host as CompactionHost, payload);
-    return;
+    return true;
   }
 
   if (handlePreambleProgressEvent(host, payload)) {
-    return;
-  }
-
-  if (payload.stream === "plan") {
-    handlePlanEvent(host as PlanHost, payload);
-    return;
+    return true;
   }
 
   if (payload.stream !== "tool") {
-    return;
+    return false;
   }
 
   const data = payload.data ?? {};
   const toolCallId = typeof data.toolCallId === "string" ? data.toolCallId : "";
   if (!toolCallId) {
-    return;
+    return false;
   }
-  const name = typeof data.name === "string" ? data.name : "tool";
+  const toolStreamIdentity = buildToolStreamIdentity(payload.runId, toolCallId);
+  let entry = host.toolStreamById.get(toolStreamIdentity);
   const phase = typeof data.phase === "string" ? data.phase : "";
+  // A started call owns its concrete identity even when later events omit or
+  // contradict it; an unnamed placeholder can still adopt its first real name.
+  const name =
+    phase !== "start" && entry?.name && entry.name !== "tool"
+      ? entry.name
+      : (toTrimmedString(data.name) ?? entry?.name ?? "tool");
   if (phase === "start" && payload.runId === host.chatRunId) {
     host.chatRunStartup = { state: "activity", runId: payload.runId };
   }
@@ -973,28 +1031,21 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
   const resultDetails = phase === "result" ? readRecord(data.result)?.details : undefined;
   const resultIsError =
     phase === "result" && typeof data.isError === "boolean" ? data.isError : undefined;
+  const resultRecord = phase === "result" ? readRecord(data.result) : undefined;
+  const resultExitCode = resultRecord?.exitCode;
+  const exitCode =
+    typeof resultExitCode === "number" && Number.isInteger(resultExitCode)
+      ? resultExitCode
+      : undefined;
+  const liveDiffStat = phase === "input_delta" ? readLiveDiffStat(data.diff) : undefined;
   if (name === "session_status" && phase === "result") {
     syncSessionStatusModelOverride(host, data);
   }
 
   const now = Date.now();
-  let entry = host.toolStreamById.get(toolCallId);
   if (!entry) {
-    // Commit any in-progress streaming text as a segment so it renders
-    // above the tool card instead of below it.
-    if (
-      host.chatRunId &&
-      payload.runId === host.chatRunId &&
-      host.chatStream &&
-      host.chatStream.trim().length > 0
-    ) {
-      host.chatStreamSegments = [
-        ...host.chatStreamSegments,
-        { text: host.chatStream, ts: now, toolCallId },
-      ];
-      host.chatStream = null;
-      host.chatStreamStartedAt = null;
-    }
+    // Commit in-progress text so it remains causally above the tool card.
+    rolloverChatStream(host, { runId: payload.runId, toolCallId, timestamp: now });
     entry = {
       toolCallId,
       runId: payload.runId,
@@ -1004,13 +1055,15 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
       output: output || undefined,
       ...(resultDetails !== undefined ? { details: resultDetails } : {}),
       ...(resultIsError !== undefined ? { isError: resultIsError } : {}),
+      ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(liveDiffStat ? { liveDiffStat } : {}),
       ...(phase === "result" ? { resultReceived: true } : {}),
       startedAt: typeof payload.ts === "number" ? payload.ts : now,
       receivedAt: now,
       message: {},
     };
-    host.toolStreamById.set(toolCallId, entry);
-    host.toolStreamOrder.push(toolCallId);
+    host.toolStreamById.set(toolStreamIdentity, entry);
+    host.toolStreamOrder.push(toolStreamIdentity);
   } else {
     entry.name = name;
     if (args !== undefined) {
@@ -1025,7 +1078,14 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
     if (resultIsError !== undefined) {
       entry.isError = resultIsError;
     }
+    if (exitCode !== undefined) {
+      entry.exitCode = exitCode;
+    }
+    if (liveDiffStat) {
+      entry.liveDiffStat = liveDiffStat;
+    }
     if (phase === "result") {
+      entry.liveDiffStat = undefined;
       entry.resultReceived = true;
     }
   }
@@ -1033,5 +1093,6 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
   entry.message = buildToolStreamMessage(entry);
   trimToolStream(host);
   scheduleToolStreamSync(host, phase === "result");
+  return true;
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -11,13 +11,11 @@ import { PlaywrightDiffScreenshotter, type DiffScreenshotter } from "./browser.j
 import { resolveDiffImageRenderOptions } from "./config.js";
 import { DiffRenderInputError, renderDiffDocument } from "./render.js";
 import type { DiffArtifactStore } from "./store.js";
-import type {
-  DiffArtifactContext,
-  DiffRenderOptions,
-  DiffRenderTarget,
-  DiffToolDefaults,
-} from "./types.js";
 import {
+  type DiffArtifactContext,
+  type DiffRenderOptions,
+  type DiffRenderTarget,
+  type DiffToolDefaults,
   DIFF_IMAGE_QUALITY_PRESETS,
   DIFF_LAYOUTS,
   DIFF_MODES,
@@ -128,7 +126,7 @@ export function createDiffsTool(params: {
     name: "diffs",
     label: "Diffs",
     description:
-      "Create a read-only diff viewer from before/after text or a unified patch. Returns a gateway viewer URL for canvas use and can also render the same diff to a PNG or PDF.",
+      "Create a read-only diff viewer from before/after text or a unified patch. Returns a gateway viewer URL for interactive viewing and can also render the same diff to a PNG or PDF.",
     parameters: DiffsToolSchema,
     execute: async (_toolCallId, rawParams) => {
       const toolParams = rawParams as DiffsToolParams;
@@ -240,7 +238,8 @@ export function createDiffsTool(params: {
       const viewerUrl = buildViewerUrl({
         config: params.api.config,
         viewerPath: artifact.viewerPath,
-        baseUrl: normalizeBaseUrl(toolParams.baseUrl) ?? params.viewerBaseUrl,
+        baseUrl: normalizeBaseUrl(toolParams.baseUrl),
+        viewerBaseUrl: params.viewerBaseUrl,
       });
 
       const baseDetails = {
@@ -374,7 +373,7 @@ function buildFileArtifactMessage(params: {
 }): string {
   const lines = params.viewerUrl ? [`Diff viewer: ${params.viewerUrl}`] : [];
   lines.push(`Diff ${params.format.toUpperCase()} generated at: ${params.filePath}`);
-  lines.push("Use the `message` tool with `path` or `filePath` to send this file.");
+  lines.push("To send this file, use an available file-sending tool to send it as an attachment.");
   return lines.join("\n");
 }
 

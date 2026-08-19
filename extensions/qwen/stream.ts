@@ -6,8 +6,10 @@ import { normalizeProviderId } from "openclaw/plugin-sdk/provider-model-shared";
 import {
   createPayloadPatchStreamWrapper,
   isOpenAICompatibleThinkingEnabled,
+  normalizeOpenAICompatibleReasoningReplay,
   setQwenChatTemplateThinking,
 } from "openclaw/plugin-sdk/provider-stream-shared";
+import { asOptionalRecord as asPayloadRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   isQwenTokenPlanDeepSeekV4ModelId,
   isQwenTokenPlanGlmModelId,
@@ -24,12 +26,6 @@ type QwenTokenPlanThinkingContract =
   | { family: "deepseek-v4" }
   | { family: "kimi" }
   | { family: "glm"; supportsMax: boolean };
-
-function asPayloadRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
 
 function resolveQwenThinkingLevel(
   thinkingLevel: QwenThinkingLevel,
@@ -104,28 +100,11 @@ function patchTokenPlanDeepSeekV4Payload(
   delete payload.thinking;
   if (!enableThinking) {
     delete payload.reasoning_effort;
-    if (Array.isArray(payload.messages)) {
-      for (const message of payload.messages) {
-        if (message && typeof message === "object") {
-          delete (message as Record<string, unknown>).reasoning_content;
-        }
-      }
-    }
+    normalizeOpenAICompatibleReasoningReplay(payload, { thinkingEnabled: false });
     return;
   }
   payload.reasoning_effort = thinkingLevel === "xhigh" || thinkingLevel === "max" ? "max" : "high";
-  if (!Array.isArray(payload.messages)) {
-    return;
-  }
-  for (const message of payload.messages) {
-    if (!message || typeof message !== "object") {
-      continue;
-    }
-    const record = message as Record<string, unknown>;
-    if (record.role === "assistant" && !("reasoning_content" in record)) {
-      record.reasoning_content = "";
-    }
-  }
+  normalizeOpenAICompatibleReasoningReplay(payload, { thinkingEnabled: true });
 }
 
 function patchTokenPlanKimiPayload(
@@ -134,22 +113,12 @@ function patchTokenPlanKimiPayload(
 ): void {
   delete payload.thinking;
   delete payload.reasoning_effort;
-  if (!enableThinking || !Array.isArray(payload.messages)) {
-    return;
-  }
-  for (const message of payload.messages) {
-    if (!message || typeof message !== "object") {
-      continue;
-    }
-    const record = message as Record<string, unknown>;
-    if (
-      record.role === "assistant" &&
-      Array.isArray(record.tool_calls) &&
-      record.tool_calls.length > 0 &&
-      !("reasoning_content" in record)
-    ) {
-      record.reasoning_content = "";
-    }
+  if (enableThinking) {
+    normalizeOpenAICompatibleReasoningReplay(payload, {
+      thinkingEnabled: true,
+      shouldBackfillAssistantMessage: (message) =>
+        Array.isArray(message.tool_calls) && message.tool_calls.length > 0,
+    });
   }
 }
 

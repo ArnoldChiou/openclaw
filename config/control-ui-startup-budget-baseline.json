@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 321792,
-  "reason": "multi-gateway footer subtitle plus accumulated main drift since last record; owner-approved landing (PR #114059); recorded on Linux (CI truth)",
-  "updatedAt": "2026-07-26"
+  "startupJsGzipBytes": 344429,
+  "reason": "Channel conversation avatars (PR #125668): lead-slot render branch + row plumbing on top of the 344395 B main baseline; avatar element itself is code-split out of startup",
+  "updatedAt": "2026-08-18"
 }

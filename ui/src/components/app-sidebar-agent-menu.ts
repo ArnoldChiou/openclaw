@@ -2,7 +2,9 @@
 // component inside the TS LOC ratchet.
 import { html, nothing } from "lit";
 import { ref } from "lit/directives/ref.js";
+import type { AgentIdentityResult } from "../api/types.ts";
 import { titleForRoute, type NavigationRouteId } from "../app-navigation.ts";
+import { pathForAgentPanel } from "../app-route-paths.ts";
 import type { ApplicationNavigationOptions } from "../app/context.ts";
 import type { ThemeMode } from "../app/theme.ts";
 import { t } from "../i18n/index.ts";
@@ -10,6 +12,10 @@ import { normalizeAgentLabel } from "../lib/agents/display.ts";
 import { buildExternalLinkRel, EXTERNAL_LINK_TARGET } from "../lib/external-link.ts";
 import { openExternalUrlSafe } from "../lib/open-external-url.ts";
 import { normalizeAgentId } from "../lib/sessions/session-key.ts";
+import {
+  DEBUG_OVERLAY_SHORTCUT_LABEL,
+  requestDebugOverlayToggle,
+} from "../pages/debug/debug-overlay-contract.ts";
 import { renderAgentSelectAvatar, renderAgentSelectCopy } from "./agent-select.ts";
 import { icons, type IconName } from "./icons.ts";
 import "./sidebar-build-chip.ts";
@@ -46,6 +52,15 @@ const AGENT_VALUE_PREFIX = "agent:";
 const COMMAND_VALUE_PREFIX = "command:";
 const LINK_VALUE_PREFIX = "link:";
 
+// Nested overlays bubble lifecycle events through the dropdown. Only the
+// owner's completed hide may remove its menu or consume its Escape state.
+function closeMenuAfterOwnDropdownHide(event: Event, onClose: (restoreFocus?: boolean) => void) {
+  if (event.target !== event.currentTarget) {
+    return;
+  }
+  onClose(consumeDropdownKeyboardDismissal(event));
+}
+
 type AgentMenuAgent = {
   id: string;
   name?: string;
@@ -54,9 +69,11 @@ type AgentMenuAgent = {
 
 type SidebarAgentMenuParams = {
   position: { x: number; top: number } | null;
+  basePath: string;
   activeId: string;
   activeName: string;
   agents: readonly AgentMenuAgent[];
+  identities: ReadonlyMap<string, AgentIdentityResult>;
   filter: string;
   pinnedAgentIds: readonly string[];
   connected: boolean;
@@ -99,6 +116,7 @@ function sidebarAgentMenuRows(params: {
   activeId: string;
   filter: string;
   pinnedAgentIds: readonly string[];
+  identities: ReadonlyMap<string, AgentIdentityResult>;
 }) {
   const { agents, activeId } = params;
   const availableIds = new Set(agents.map((agent) => normalizeAgentId(agent.id)));
@@ -121,7 +139,7 @@ function sidebarAgentMenuRows(params: {
       const agentId = normalizeAgentId(entry.id);
       return (
         agentId.toLowerCase().includes(query) ||
-        normalizeAgentLabel(entry).toLowerCase().includes(query)
+        normalizeAgentLabel(entry, params.identities.get(agentId)).toLowerCase().includes(query)
       );
     });
     return { rows, showFilter: true };
@@ -147,7 +165,8 @@ function sidebarAgentMenuRows(params: {
 
 function renderAgentRow(agent: AgentMenuAgent, params: SidebarAgentMenuParams) {
   const agentId = normalizeAgentId(agent.id);
-  const label = normalizeAgentLabel(agent);
+  const identity = params.identities.get(agentId) ?? null;
+  const label = normalizeAgentLabel(agent, identity);
   const active = agentId === params.activeId;
   const unread = active ? 0 : params.agentUnreadCount(agentId);
   const approvals = params.agentApprovalCount(agentId);
@@ -165,7 +184,7 @@ function renderAgentRow(agent: AgentMenuAgent, params: SidebarAgentMenuParams) {
       aria-checked=${String(active)}
       ${ref((element) => syncDropdownItemRadio(element, active))}
     >
-      <span slot="icon">${renderAgentSelectAvatar(option)}</span>
+      <span slot="icon">${renderAgentSelectAvatar(option, identity)}</span>
       ${renderAgentSelectCopy(option)}
       ${approvals > 0
         ? html`<span
@@ -259,7 +278,9 @@ export function renderSidebarAgentMenu(params: SidebarAgentMenuParams) {
               params.onAskCapabilities(activeId);
               break;
             case `${COMMAND_VALUE_PREFIX}agent-settings`:
-              params.onNavigate("agents", { search: `?agent=${encodeURIComponent(activeId)}` });
+              params.onNavigate("agents", {
+                pathname: pathForAgentPanel(activeId, null, params.basePath),
+              });
               break;
             case `${COMMAND_VALUE_PREFIX}new-agent`:
               params.onNavigate("custodian", { search: "?intent=new-agent" });
@@ -275,7 +296,7 @@ export function renderSidebarAgentMenu(params: SidebarAgentMenuParams) {
         }}
         @keydown=${(event: KeyboardEvent) =>
           trackDropdownKeyboardDismissal(event, params.onTabAway)}
-        @wa-after-hide=${(event: Event) => params.onClose(consumeDropdownKeyboardDismissal(event))}
+        @wa-after-hide=${(event: Event) => closeMenuAfterOwnDropdownHide(event, params.onClose)}
       >
         <button
           slot="trigger"
@@ -397,7 +418,7 @@ export function renderSidebarIdentityMenu(params: SidebarIdentityMenuParams) {
               params.onNavigate("profile", { hash: "#settings-profile-identity" });
               break;
             case `${COMMAND_VALUE_PREFIX}settings`:
-              params.onNavigate("config");
+              params.onNavigate("appearance");
               break;
             case `${COMMAND_VALUE_PREFIX}usage`:
               params.onNavigate("usage");
@@ -408,6 +429,9 @@ export function renderSidebarIdentityMenu(params: SidebarIdentityMenuParams) {
             case `${COMMAND_VALUE_PREFIX}apps`:
               params.onNavigate("apps");
               break;
+            case `${COMMAND_VALUE_PREFIX}debug-overlay`:
+              requestDebugOverlayToggle();
+              break;
             case `${COMMAND_VALUE_PREFIX}retry-connect`:
               params.onRetryConnect?.();
               break;
@@ -415,7 +439,7 @@ export function renderSidebarIdentityMenu(params: SidebarIdentityMenuParams) {
         }}
         @keydown=${(event: KeyboardEvent) =>
           trackDropdownKeyboardDismissal(event, params.onTabAway)}
-        @wa-after-hide=${(event: Event) => params.onClose(consumeDropdownKeyboardDismissal(event))}
+        @wa-after-hide=${(event: Event) => closeMenuAfterOwnDropdownHide(event, params.onClose)}
       >
         <button
           slot="trigger"
@@ -446,14 +470,21 @@ export function renderSidebarIdentityMenu(params: SidebarIdentityMenuParams) {
           class="sidebar-customize-menu__item sidebar-pair-mobile"
           value="command:pair-mobile"
           ?disabled=${!params.canPairDevice}
-          title=${params.canPairDevice ? nothing : t("nodes.pairing.adminRequired")}
+          title=${params.canPairDevice ? nothing : t("devices.pairing.adminRequired")}
         >
           <span slot="icon" class="nav-item__icon" aria-hidden="true">${icons.smartphone}</span>
-          <span class="sidebar-customize-menu__text">${t("nodes.pairing.button")}</span>
+          <span class="sidebar-customize-menu__text">${t("devices.pairing.button")}</span>
         </wa-dropdown-item>
         <wa-dropdown-item class="sidebar-customize-menu__item" value="command:apps">
           <span slot="icon" class="nav-item__icon" aria-hidden="true">${icons.layoutGrid}</span>
           <span class="sidebar-customize-menu__text">${t("agentChip.getApps")}</span>
+        </wa-dropdown-item>
+        <wa-dropdown-item class="sidebar-customize-menu__item" value="command:debug-overlay">
+          <span slot="icon" class="nav-item__icon" aria-hidden="true">${icons.activity}</span>
+          <span class="sidebar-customize-menu__text">${t("debug.overlay.title")}</span>
+          <span slot="details" class="session-menu__shortcut" aria-hidden="true"
+            >${DEBUG_OVERLAY_SHORTCUT_LABEL}</span
+          >
         </wa-dropdown-item>
         <wa-dropdown-item
           class="sidebar-customize-menu__item sidebar-identity-menu__help"

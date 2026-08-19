@@ -2,13 +2,14 @@
  * Shared token/cost formatting and pricing lookup helpers for CLI, TUI, gateway, and status output.
  * Keep this module synchronous; request paths call it while rendering usage summaries.
  */
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   listAgentEntries,
   resolveAgentDir,
-  resolveDefaultAgentId,
+  tryResolveDefaultAgentId,
 } from "../agents/agent-scope-config.js";
 import { modelKey, normalizeModelRef, normalizeProviderId } from "../agents/model-selection.js";
 import type { NormalizedUsage } from "../agents/usage.js";
@@ -16,6 +17,7 @@ import { resolveStateDir } from "../config/paths.js";
 import type { ModelProviderConfig } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { tryReadJsonSync } from "../infra/json-files.js";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
 import {
   modelCatalogPricingFingerprint,
   resolveCatalogModelPricing,
@@ -292,12 +294,7 @@ function loadModelsJsonCostIndex(options?: {
         normalizedEntries: null,
         rawEntries: null,
       };
-      if (modelsJsonCostCacheByAgentDir.size >= MODELS_JSON_COST_CACHE_LIMIT) {
-        const oldestAgentDir = modelsJsonCostCacheByAgentDir.keys().next().value;
-        if (oldestAgentDir !== undefined) {
-          modelsJsonCostCacheByAgentDir.delete(oldestAgentDir);
-        }
-      }
+      pruneMapToMaxSize(modelsJsonCostCacheByAgentDir, MODELS_JSON_COST_CACHE_LIMIT - 1);
       modelsJsonCostCacheByAgentDir.set(agentDir, modelsJsonCostCache);
     }
 
@@ -320,7 +317,8 @@ function resolveCostAgentDir(config?: OpenClawConfig, agentDir?: string): string
     return agentDir;
   }
   if (config && listAgentEntries(config).length > 0) {
-    return resolveAgentDir(config, resolveDefaultAgentId(config));
+    const defaultAgentId = tryResolveDefaultAgentId(config);
+    return defaultAgentId ? resolveAgentDir(config, defaultAgentId) : undefined;
   }
   // Config-less and pricing-only lookups are shipped APIs for the historical
   // main models.json. Full runtime configs resolve their roster default above.
@@ -529,7 +527,7 @@ export function resolveModelCostConfigFingerprint(
   agentDir?: string,
 ): string {
   const resolvedAgentDir = resolveCostAgentDir(config, agentDir);
-  return stableCostFingerprintValue({
+  const serialized = stableCostFingerprintValue({
     configuredRaw: serializeCostIndex(
       getProviderCostIndex(config?.models?.providers, { allowPluginNormalization: false }),
     ),
@@ -545,6 +543,7 @@ export function resolveModelCostConfigFingerprint(
     ),
     catalogPricing: modelCatalogPricingFingerprint(config),
   });
+  return createHash("sha256").update(serialized).digest("hex");
 }
 
 /**
@@ -563,17 +562,6 @@ export function resolveModelCostConfig(params: {
     return undefined;
   }
   const agentDir = resolveCostAgentDir(params.config, params.agentDir);
-  if (params.allowPluginNormalization !== false) {
-    const catalogPricing = resolveCatalogModelPricing({
-      config: params.config,
-      provider: params.provider ?? "",
-      model: params.model ?? "",
-    });
-    if (catalogPricing) {
-      return normalizeResolvedPricing(catalogPricing);
-    }
-  }
-
   // Favor direct configured keys first so local pricing/status lookups stay
   // synchronous and do not drag plugin/provider discovery into the hot path.
   const rawModelsJsonCost = loadModelsJsonCostIndex({
@@ -609,6 +597,15 @@ export function resolveModelCostConfig(params: {
         return configuredCost;
       }
     }
+  }
+
+  const catalogPricing = resolveCatalogModelPricing({
+    config: params.config,
+    provider: params.provider ?? "",
+    model: params.model ?? "",
+  });
+  if (catalogPricing) {
+    return normalizeResolvedPricing(catalogPricing);
   }
 
   const hostedPricing = resolveHostedModelPricing({

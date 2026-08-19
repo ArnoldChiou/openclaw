@@ -23,6 +23,8 @@ type SubagentRunParams = {
   lane?: string;
   lightContext?: boolean;
   deliver?: boolean;
+  /** Deliver the completion to the authenticated requester of the current hook invocation. */
+  completionDelivery?: "current-requester";
   idempotencyKey?: string;
   cwd?: string;
 };
@@ -35,6 +37,8 @@ type PluginManagedWorktree = {
 
 type SubagentRunResult = {
   runId: string;
+  /** Canonical accepted session identity. Optional for explicit/custom runtimes. */
+  sessionKey?: string;
   runtime?: {
     harness: string;
     provider: string;
@@ -74,10 +78,16 @@ type RuntimeNodeListResult = {
   nodes: Array<{
     nodeId: string;
     displayName?: string;
+    platform?: string;
+    clientId?: string;
     remoteIp?: string;
     connected?: boolean;
+    connectedAtMs?: number;
+    lastSeenAtMs?: number;
     caps?: string[];
     commands?: string[];
+    /** True only for the node host installed alongside this Gateway. */
+    gatewayLocal?: boolean;
     /** Advertised commands currently permitted by Gateway node-command policy. */
     invocableCommands?: string[];
     nodePluginTools?: NodePluginToolDescriptor[];
@@ -90,6 +100,9 @@ type RuntimeNodeInvokeParams = {
   params?: unknown;
   timeoutMs?: number;
   idempotencyKey?: string;
+  sessionKey?: string;
+  /** Cancel the invocation and any work already dispatched to a first-party node. */
+  signal?: AbortSignal;
   /** Requested Gateway scopes. Honored only for bundled or trusted official plugins. */
   scopes?: OperatorScope[];
 };
@@ -174,6 +187,8 @@ export type PluginRuntime = PluginRuntimeCore & {
 };
 
 export type CreatePluginRuntimeOptions = {
+  dispatchReplyFromConfig?: PluginRuntime["channel"]["reply"]["dispatchReplyFromConfig"];
+  gateway?: PluginRuntime["gateway"];
   subagent?: PluginRuntime["subagent"];
   nodes?: PluginRuntime["nodes"];
   allowGatewaySubagentBinding?: boolean;

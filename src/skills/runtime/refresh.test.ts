@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { withEnvAsync } from "../../test-utils/env.js";
 import {
   bumpSkillsSnapshotVersion,
   getSkillsSnapshotVersion,
@@ -129,6 +130,28 @@ describe("ensureSkillsWatcher", () => {
       expect(ignored?.("/tmp/workspace/skills/my-skill/SKILL.md", {})).toBe(true);
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not watch home-scoped personal skills for a non-default state directory", async () => {
+    const createdRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-watch-isolated-"));
+    const root = await fs.realpath(createdRoot);
+    try {
+      await withEnvAsync(
+        {
+          HOME: root,
+          OPENCLAW_HOME: undefined,
+          OPENCLAW_STATE_DIR: path.join(root, "scratch-state"),
+        },
+        async () => {
+          refreshModule.ensureSkillsWatcher({ workspaceDir: path.join(root, "workspace") });
+          const calls = watchMock.mock.calls as unknown as Array<[string]>;
+          const targets = calls.map(([target]) => target);
+          expect(targets).not.toContain(path.join(os.homedir(), ".agents", "skills"));
+        },
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -738,6 +761,38 @@ describe("ensureSkillsWatcher", () => {
           changedPath: "/tmp/workspace/skills/demo/SKILL.md",
         },
       ]);
+    },
+  );
+
+  it.each(["add", "change", "unlink"] as const)(
+    "refreshes the owning snapshot when an execution-directory skill emits %s",
+    async (event) => {
+      vi.useFakeTimers();
+      const workspaceDir = "/tmp/agent-workspace";
+      const executionSkillsDir = "/tmp/execution-workspace/skills";
+      const seen: SkillsChangeEvent[] = [];
+      refreshModule.registerSkillsChangeListener((change) => {
+        seen.push(change);
+      });
+      refreshModule.ensureSkillsWatcher({ workspaceDir, executionSkillsDir });
+      const versionBefore = getSkillsSnapshotVersion(workspaceDir);
+      const callPaths = (watchMock.mock.calls as unknown as Array<[string]>).map(([target]) =>
+        target.replaceAll("\\", "/"),
+      );
+      const executionWatcherIndex = callPaths.indexOf(executionSkillsDir);
+      const changedPath = `${executionSkillsDir}/demo/SKILL.md`;
+
+      expect(executionWatcherIndex).toBeGreaterThanOrEqual(0);
+      createdWatchers[executionWatcherIndex]?.emit("all", event, changedPath);
+      await vi.advanceTimersByTimeAsync(250);
+
+      const versionAfter = getSkillsSnapshotVersion(workspaceDir);
+      expect(shouldRefreshSnapshotForVersion(versionBefore, versionAfter)).toBe(true);
+      expect(seen).toContainEqual({
+        workspaceDir,
+        reason: "watch",
+        changedPath,
+      });
     },
   );
 

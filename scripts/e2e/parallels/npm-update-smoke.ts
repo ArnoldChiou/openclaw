@@ -11,7 +11,10 @@ import {
   clampTimerTimeoutMs,
   finiteSecondsToTimerSafeMilliseconds,
 } from "@openclaw/normalization-core/number-coercion";
-import { formatDurationCompact } from "../../../src/infra/format-time/format-duration.ts";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { readStringValue } from "@openclaw/normalization-core/string-coerce";
+import prettyMilliseconds from "pretty-ms";
+import { stripLeadingPackageManagerSeparator } from "../../lib/arg-utils.mts";
 import {
   die,
   ensureValue,
@@ -61,6 +64,7 @@ interface NpmUpdateOptions {
   registryPackageTarballs: string[];
   freshTargetSpec?: string;
   hostIp?: string;
+  macosSnapshotHint?: string;
   macosVm?: string;
   packageSpec: string;
   targetTarball?: string;
@@ -96,6 +100,11 @@ interface SpawnLoggedOptions {
   timeoutKillGraceMs?: number;
   timeoutLabel?: string;
   timeoutMs?: number;
+}
+
+interface MacosUpdateExec {
+  execArgs: string[];
+  ownerUser: string;
 }
 
 interface NpmUpdateSummary {
@@ -390,6 +399,8 @@ Options:
   --platform <list>           Comma-separated platforms to run: all, macos, windows, linux.
                              Default: all
   --macos-vm <name>           Explicit Parallels macOS VM name.
+  --macos-snapshot-hint <hint>
+                             Snapshot name substring/fuzzy match passed to macOS fresh lanes.
   --provider <openai|anthropic|minimax>
   --model <provider/model>    Override the model used for agent-turn smoke checks.
   --host-ip <ip>             Override Parallels host IP.
@@ -409,6 +420,7 @@ export function parseArgs(argv: string[]): NpmUpdateOptions {
     registryPackageTarballs: [],
     freshTargetSpec: undefined,
     json: false,
+    macosSnapshotHint: undefined,
     macosVm: undefined,
     modelId: undefined,
     packageSpec: "",
@@ -465,6 +477,10 @@ export function parseArgs(argv: string[]): NpmUpdateOptions {
         options.macosVm = ensureValue(args, i, arg);
         i++;
         break;
+      case "--macos-snapshot-hint":
+        options.macosSnapshotHint = ensureValue(args, i, arg);
+        i++;
+        break;
       case "--provider":
         options.provider = parseProvider(ensureValue(args, i, arg));
         i++;
@@ -510,16 +526,22 @@ export function parseArgs(argv: string[]): NpmUpdateOptions {
   return options;
 }
 
-function stripLeadingPackageManagerSeparator(argv: string[]): string[] {
-  return argv[0] === "--" ? argv.slice(1) : argv;
-}
-
 function platformRecord<T>(value: T): Record<Platform, T> {
   return { linux: value, macos: value, windows: value };
 }
 
 function formatDuration(durationMs: number): string {
-  return formatDurationCompact(durationMs, { spaced: true }) ?? "0ms";
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    return "0ms";
+  }
+  const roundedMs = Math.round(durationMs);
+  if (roundedMs < 1000) {
+    return prettyMilliseconds(roundedMs);
+  }
+  return prettyMilliseconds(Math.round(durationMs / 1000) * 1000, {
+    hideYear: true,
+    unitCount: 2,
+  });
 }
 
 function readHarnessCheckoutVersion(): string {
@@ -541,14 +563,6 @@ function parseOpenClawPackageSpecVersion(spec: string): string {
   return resolveOpenClawRegistryVersion(value) || "";
 }
 
-function readString(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 export function parseRegistryPackageMetadata(raw: string): {
   gitHead: string;
   tarball: string;
@@ -565,9 +579,9 @@ export function parseRegistryPackageMetadata(raw: string): {
     }
     const dist = isRecord(parsed.dist) ? parsed.dist : {};
     return {
-      gitHead: readString(parsed.gitHead),
-      tarball: readString(parsed["dist.tarball"]) || readString(dist.tarball),
-      version: readString(parsed.version),
+      gitHead: readStringValue(parsed.gitHead) ?? "",
+      tarball: readStringValue(parsed["dist.tarball"]) || readStringValue(dist.tarball) || "",
+      version: readStringValue(parsed.version) ?? "",
     };
   } catch {
     return { gitHead: "", tarball: "", version: "" };
@@ -605,6 +619,7 @@ export class NpmUpdateSmoke {
   private targetRegistryUrl = "";
   private macosVm = macosVmDefault;
   private linuxVm = linuxVmDefault;
+  private options: NpmUpdateOptions;
 
   private freshStatus = platformRecord("skip");
   private freshTargetStatus = platformRecord("skip");
@@ -612,7 +627,8 @@ export class NpmUpdateSmoke {
   private updateVersion = platformRecord("skip");
   private timings: NpmUpdateSummary["timings"] = [];
 
-  constructor(private options: NpmUpdateOptions) {
+  constructor(options: NpmUpdateOptions) {
+    this.options = options;
     this.auth = resolveProviderAuth({
       apiKeyEnv: options.apiKeyEnv,
       modelId: options.modelId,
@@ -691,7 +707,7 @@ export class NpmUpdateSmoke {
   private async runFreshBaselines(): Promise<void> {
     const jobs: Job[] = [];
     if (this.options.platforms.has("macos")) {
-      jobs.push(this.spawnFresh("macOS", "macos", ["--vm", this.macosVm]));
+      jobs.push(this.spawnFresh("macOS", "macos", this.macosFreshArgs()));
     }
     if (this.options.platforms.has("windows")) {
       jobs.push(this.spawnFresh("Windows", "windows", []));
@@ -713,7 +729,7 @@ export class NpmUpdateSmoke {
         this.spawnFresh(
           "macOS",
           "macos",
-          ["--vm", this.macosVm],
+          this.macosFreshArgs(),
           {},
           this.freshTargetSpec,
           "fresh-target",
@@ -740,6 +756,16 @@ export class NpmUpdateSmoke {
       );
     }
     await this.finishFreshJobs("fresh-target", "fresh target", jobs, this.freshTargetStatus);
+  }
+
+  private macosFreshArgs(): string[] {
+    return [
+      "--vm",
+      this.macosVm,
+      ...(this.options.macosSnapshotHint
+        ? ["--snapshot-hint", this.options.macosSnapshotHint]
+        : []),
+    ];
   }
 
   private async finishFreshJobs(
@@ -1138,26 +1164,24 @@ export class NpmUpdateSmoke {
     timeoutMs: number,
     ctx: UpdateJobContext,
   ): Promise<void> {
+    const macosUpdateExec = this.resolveMacosUpdateExec(ctx);
     const scriptPath = this.writeGuestScript(
       this.macosVm,
       script,
       "openclaw-parallels-npm-update-macos",
+      { execArgs: macosUpdateExec.execArgs, mode: "700" },
     );
-    const macosExecArgs = this.resolveMacosUpdateExecArgs(ctx);
-    const sudoUserArgIndex = macosExecArgs.indexOf("-u");
-    const sudoUser =
-      sudoUserArgIndex >= 0 && sudoUserArgIndex + 1 < macosExecArgs.length
-        ? macosExecArgs[sudoUserArgIndex + 1]
-        : "";
-    if (sudoUser) {
-      run("prlctl", ["exec", this.macosVm, "/usr/sbin/chown", sudoUser, scriptPath], {
+    run(
+      "prlctl",
+      ["exec", this.macosVm, "/usr/sbin/chown", macosUpdateExec.ownerUser, scriptPath],
+      {
         timeoutMs: 30_000,
-      });
-    }
+      },
+    );
     try {
       const status = await this.runStreamingToJobLog(
         "prlctl",
-        ["exec", this.macosVm, ...macosExecArgs, "/bin/bash", scriptPath],
+        ["exec", this.macosVm, ...macosUpdateExec.execArgs, "/bin/bash", scriptPath],
         timeoutMs,
         ctx,
       );
@@ -1169,7 +1193,7 @@ export class NpmUpdateSmoke {
     }
   }
 
-  private resolveMacosUpdateExecArgs(ctx: UpdateJobContext): string[] {
+  private resolveMacosUpdateExec(ctx: UpdateJobContext): MacosUpdateExec {
     const guestPath =
       "/opt/homebrew/bin:/opt/homebrew/opt/node/bin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
     const currentUser = run("prlctl", ["exec", this.macosVm, "--current-user", "whoami"], {
@@ -1179,7 +1203,10 @@ export class NpmUpdateSmoke {
     });
     const user = currentUser.stdout.trim().replaceAll("\r", "").split("\n").at(-1) ?? "";
     if (currentUser.status === 0 && /^[A-Za-z0-9._-]+$/.test(user)) {
-      return ["--current-user", "/usr/bin/env", `PATH=${guestPath}`];
+      return {
+        execArgs: ["--current-user", "/usr/bin/env", `PATH=${guestPath}`],
+        ownerUser: user,
+      };
     }
 
     const fallbackUser = this.resolveMacosDesktopUser();
@@ -1192,17 +1219,20 @@ export class NpmUpdateSmoke {
       `desktop user unavailable via Parallels --current-user; using root sudo fallback for ${fallbackUser}\n`,
     );
     const home = this.resolveMacosDesktopHome(fallbackUser);
-    return [
-      "/usr/bin/sudo",
-      "-H",
-      "-u",
-      fallbackUser,
-      "/usr/bin/env",
-      `HOME=${home}`,
-      `USER=${fallbackUser}`,
-      `LOGNAME=${fallbackUser}`,
-      `PATH=${guestPath}`,
-    ];
+    return {
+      execArgs: [
+        "/usr/bin/sudo",
+        "-H",
+        "-u",
+        fallbackUser,
+        "/usr/bin/env",
+        `HOME=${home}`,
+        `USER=${fallbackUser}`,
+        `LOGNAME=${fallbackUser}`,
+        `PATH=${guestPath}`,
+      ],
+      ownerUser: fallbackUser,
+    };
   }
 
   private resolveMacosDesktopUser(): string {
@@ -1303,9 +1333,16 @@ export class NpmUpdateSmoke {
     }
   }
 
-  private writeGuestScript(vm: string, script: string, prefix: string): string {
+  private writeGuestScript(
+    vm: string,
+    script: string,
+    prefix: string,
+    options: { execArgs?: string[]; mode?: "700" | "755" } = {},
+  ): string {
+    const execArgs = options.execArgs ?? [];
+    const mode = options.mode ?? "755";
     const scriptPath = `/tmp/${prefix}-${randomUUID()}.sh`;
-    const write = run("prlctl", ["exec", vm, "/usr/bin/tee", scriptPath], {
+    const write = run("prlctl", ["exec", vm, ...execArgs, "/usr/bin/tee", scriptPath], {
       check: false,
       input: script,
       quiet: true,
@@ -1315,7 +1352,7 @@ export class NpmUpdateSmoke {
       throw new Error(`failed to write guest script ${scriptPath}: ${write.stderr.trim()}`);
     }
     try {
-      const chmod = run("prlctl", ["exec", vm, "/bin/chmod", "755", scriptPath], {
+      const chmod = run("prlctl", ["exec", vm, ...execArgs, "/bin/chmod", mode, scriptPath], {
         check: false,
         quiet: true,
         timeoutMs: 30_000,

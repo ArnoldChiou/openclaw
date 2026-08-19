@@ -72,7 +72,6 @@ type QaSuiteCliOptions = QaScenarioRunCliOptions & {
   thinking?: QaSuiteCommandOptions["thinking"];
   cliAuthMode?: QaSuiteCommandOptions["cliAuthMode"];
   parityPack?: QaSuiteCommandOptions["parityPack"];
-  pack?: QaSuiteCommandOptions["pack"];
   scenario?: QaSuiteCommandOptions["scenarioIds"];
   enablePlugin?: QaSuiteCommandOptions["enabledPluginIds"];
   image?: QaSuiteCommandOptions["image"];
@@ -436,7 +435,7 @@ export function registerQaLabCli(program: Command) {
       false,
     )
     .option("--fail-fast", "Stop after the first failed QA scenario")
-    .option("--fast", "Enable provider fast mode where supported", false);
+    .option("--fast", "Enable provider fast mode where supported");
   qaRun.action(async (opts: QaRunCliOptions, command: Command) => {
     validateQaRunMode(opts, command);
     if (opts.qaProfile?.trim()) {
@@ -481,10 +480,6 @@ export function registerQaLabCli(program: Command) {
       "CLI backend auth mode for live Claude CLI runs: auto, api-key, or subscription",
     )
     .option("--parity-pack <name>", 'Preset scenario pack; currently only "agentic" is supported')
-    .option(
-      "--pack <id>",
-      'Scenario pack id; currently "personal-agent" and "observability" are supported',
-    )
     .option("--scenario <id>", "Run only the named QA scenario (repeatable)", collectString, [])
     .option(
       "--enable-plugin <id>",
@@ -502,7 +497,7 @@ export function registerQaLabCli(program: Command) {
       false,
     )
     .option("--fail-fast", "Stop after the first failed QA scenario")
-    .option("--fast", "Enable provider fast mode where supported", false)
+    .option("--fast", "Enable provider fast mode where supported")
     .option(
       "--thinking <level>",
       "Suite thinking default: off|minimal|low|medium|high|xhigh|adaptive|max",
@@ -535,7 +530,6 @@ export function registerQaLabCli(program: Command) {
         thinking: opts.thinking,
         cliAuthMode: opts.cliAuthMode,
         parityPack: opts.parityPack,
-        pack: opts.pack,
         scenarioIds: opts.scenario,
         enabledPluginIds: opts.enablePlugin,
         concurrency: opts.concurrency,
@@ -744,7 +738,7 @@ export function registerQaLabCli(program: Command) {
     .option("--provider-mode <mode>", formatQaProviderModeHelp(), DEFAULT_QA_LIVE_PROVIDER_MODE)
     .option("--model <ref>", "Primary provider/model ref (defaults by provider mode)")
     .option("--alt-model <ref>", "Alternate provider/model ref")
-    .option("--fast", "Enable provider fast mode where supported", false)
+    .option("--fast", "Enable provider fast mode where supported")
     .option("--timeout-ms <ms>", "Override agent.wait timeout", (value: string) =>
       parseQaCliPositiveIntegerOption(value, "--timeout-ms"),
     )

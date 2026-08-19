@@ -1,9 +1,12 @@
 import type { ReactiveController, ReactiveControllerHost } from "lit";
-import type { ChatAttachment } from "../../lib/chat/chat-types.ts";
+import { disposeSelectedSessionMessageSubscription } from "./chat-history.ts";
 import { subscribeChatOutboxProjection } from "./chat-queue.ts";
+import { stopChatRealtimeTalk } from "./chat-realtime.ts";
 import type { ChatPageHost } from "./chat-state-host.ts";
 import { invalidateImageLightbox } from "./chat-state-page.ts";
 import { cancelChatStreamRenderFrame } from "./chat-state-render.ts";
+import { ChatAttachmentReadLifecycle } from "./components/chat-attachments.ts";
+import { releaseChatMediaResourceSubscriber } from "./components/chat-message-media.ts";
 import { clearSessionWorkspaceTimers } from "./components/chat-session-workspace.ts";
 import {
   ChatComposerPersistence,
@@ -13,23 +16,19 @@ import {
 import type { AfterCommitEffect, RenderLifecycle } from "./render-lifecycle.ts";
 import { cancelChatScroll, scheduleCommittedChatScroll } from "./scroll.ts";
 
-type PendingCreatedSessionComposer = {
-  sessionKey: string;
-  chatMessage: string;
-  chatAttachments: ChatAttachment[];
-};
-
 type ChatRenderLifecycleScope = {
   connectionEpoch: number;
   cancellations: Set<() => void>;
 };
 
 export class ChatStateController<TState extends ChatPageHost> implements ReactiveController {
+  readonly attachmentReads: ChatAttachmentReadLifecycle;
   private readonly composerPersistence: ChatComposerPersistence;
   private stateValue: TState | undefined;
   private previousChatLoading = false;
   private previousChatMessages: unknown[] = [];
   private previousChatToolMessages: Record<string, unknown>[] = [];
+  private previousGuardianNotices: ChatPageHost["guardianNotices"] = [];
   private previousChatStream: string | null = null;
   private previousRealtimeConversation: ChatPageHost["realtimeTalkConversation"] = [];
   private scrollAfterUpdate = false;
@@ -37,13 +36,15 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
   private forceScrollAfterUpdate = false;
   private chatThreadResizeObserver: ResizeObserver | null = null;
   private chatThreadResizeTarget: Element | null = null;
-  private pendingCreatedSessionComposer: PendingCreatedSessionComposer | null = null;
   private readonly cleanups: Array<() => void> = [];
   private renderLifecycleConnected = false;
   private renderLifecycleConnectionEpoch = 0;
   private renderLifecycleScope: ChatRenderLifecycleScope | undefined;
 
   constructor(private readonly host: ReactiveControllerHost) {
+    this.attachmentReads = new ChatAttachmentReadLifecycle(() =>
+      this.stateValue?.requestUpdate?.(),
+    );
     this.composerPersistence = new ChatComposerPersistence(() => this.stateValue);
     host.addController(this);
   }
@@ -69,14 +70,19 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
 
   attach(state: TState) {
     if (this.stateValue && this.stateValue !== state) {
+      disposeSelectedSessionMessageSubscription(this.stateValue);
+      releaseChatMediaResourceSubscriber(this.stateValue.requestUpdate);
+      this.attachmentReads.abortReads();
       this.composerPersistence.stop();
       cancelChatStreamRenderFrame(this.stateValue);
       cancelChatScroll(this.stateValue);
+      stopChatRealtimeTalk(this.stateValue);
     }
     this.stateValue = state;
     this.previousChatLoading = state.chatLoading;
     this.previousChatMessages = state.chatMessages;
     this.previousChatToolMessages = state.chatToolMessages;
+    this.previousGuardianNotices = state.guardianNotices;
     this.previousChatStream = state.chatStream;
     this.previousRealtimeConversation = state.realtimeTalkConversation;
     const renderLifecycle = state.renderLifecycle;
@@ -102,6 +108,9 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
       const result = navigateInputHistory(input);
       if (result.handled) {
         this.composerPersistence.schedule();
+        // A history recall mutates chatMessage directly; without invalidating,
+        // the composer textarea stays empty until an unrelated event re-renders.
+        state.renderLifecycle.invalidate();
       }
       return result;
     };
@@ -218,6 +227,7 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
     const messagesChanged =
       this.previousChatMessages !== state.chatMessages ||
       this.previousChatToolMessages !== state.chatToolMessages ||
+      this.previousGuardianNotices !== state.guardianNotices ||
       this.previousRealtimeConversation !== state.realtimeTalkConversation;
     const streamChanged = this.previousChatStream !== state.chatStream;
     const loadingChanged = this.previousChatLoading !== state.chatLoading;
@@ -226,6 +236,7 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
     this.previousChatLoading = state.chatLoading;
     this.previousChatMessages = state.chatMessages;
     this.previousChatToolMessages = state.chatToolMessages;
+    this.previousGuardianNotices = state.guardianNotices;
     this.previousChatStream = state.chatStream;
     this.previousRealtimeConversation = state.realtimeTalkConversation;
     if (!messagesChanged && !streamChanged && !loadingChanged) {
@@ -299,41 +310,12 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
     this.composerPersistence.start();
   }
 
-  persistComposerForRouteSwitch(): ChatComposerPersistResult {
+  persistComposerForEviction(): ChatComposerPersistResult {
     return this.composerPersistence.persistForRouteSwitchResult();
   }
 
-  composerScopeForRouteSwitch(): StoredChatOutboxScope | null {
+  composerScopeForEviction(): StoredChatOutboxScope | null {
     return this.composerPersistence.scopeForRouteSwitch();
-  }
-
-  adoptComposerRoute() {
-    this.composerPersistence.adoptCurrentRoute();
-  }
-
-  captureCreatedSessionComposer(sessionKey: string) {
-    const state = this.stateValue;
-    if (!state) {
-      return;
-    }
-    this.pendingCreatedSessionComposer = {
-      sessionKey,
-      chatMessage: state.chatMessage,
-      chatAttachments: state.chatAttachments,
-    };
-  }
-
-  restoreCreatedSessionComposer(sessionKey: string | null | undefined): boolean {
-    const state = this.stateValue;
-    const pending = this.pendingCreatedSessionComposer;
-    if (!state || !pending || pending.sessionKey !== sessionKey) {
-      return false;
-    }
-    this.pendingCreatedSessionComposer = null;
-    state.chatMessage = pending.chatMessage;
-    state.chatAttachments = pending.chatAttachments;
-    this.composerPersistence.persistNow();
-    return true;
   }
 
   private stopChatEffects() {
@@ -345,19 +327,13 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
     }
     const state = this.stateValue;
     if (state) {
+      disposeSelectedSessionMessageSubscription(state);
+      releaseChatMediaResourceSubscriber(state.requestUpdate);
       cancelChatStreamRenderFrame(state);
       cancelChatScroll(state);
       invalidateImageLightbox(state);
       clearSessionWorkspaceTimers(state);
-    }
-    state?.realtimeTalkSession?.stop();
-    if (state) {
-      state.realtimeTalkSession = null;
-      state.realtimeTalkVideoStream = null;
-      state.realtimeTalkCameraDevices = [];
-      state.realtimeTalkVideoCapable = false;
-      state.realtimeTalkVideoPending = false;
-      state.realtimeTalkCameraError = false;
+      stopChatRealtimeTalk(state);
       state.resetToolStream?.();
     }
   }
@@ -365,6 +341,7 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
   hostDisconnected() {
     this.renderLifecycleConnected = false;
     this.cancelRenderLifecycleScope();
+    this.attachmentReads.abortReads();
     // Flush while stateValue still points at the active session. Composer
     // persistence is owned here so controller registration order cannot lose it.
     this.composerPersistence.stop();
@@ -373,6 +350,5 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
     this.scrollAfterUpdate = false;
     this.scrollContentChangedAfterUpdate = false;
     this.forceScrollAfterUpdate = false;
-    this.pendingCreatedSessionComposer = null;
   }
 }

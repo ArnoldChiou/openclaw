@@ -1,8 +1,10 @@
 // Imported by dispatch-from-config.test.ts to keep its mocked suite in one Vitest module graph.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { readAgentRunTerminalOutcome } from "../../channels/turn/agent-run-terminal-outcome.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { createApprovalNativeRouteReporter } from "../../infra/approval-native-route-coordinator.js";
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
+import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import type { MsgContext } from "../templating.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import {
@@ -406,15 +408,56 @@ describe("dispatchReplyFromConfig", () => {
     });
     const replyResolver = vi.fn(async () => ({ text: "hi" }) as ReplyPayload);
 
-    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+    const result = await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
 
     expect(replyResolver).not.toHaveBeenCalled();
+    expect(readAgentRunTerminalOutcome(result)).toBeUndefined();
     expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
       text: "⚙️ Agent was aborted.",
     });
     expect(hookMocks.runner.runMessageReceived).toHaveBeenCalledOnce();
     expect(internalHookMocks.triggerInternalHook).toHaveBeenCalledOnce();
     expect(sessionBindingMocks.touch).toHaveBeenCalledWith("binding-fast-abort");
+  });
+
+  it("fast-resolves /approve before acquiring the active session operation", async () => {
+    setNoAbort();
+    mocks.tryFastApproveFromMessage.mockResolvedValue({
+      handled: true,
+      reply: { text: "✅ Approval allow-once submitted." },
+    });
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(async () => ({ text: "should not run" }) as ReplyPayload);
+    const ctx = buildTestCtx({
+      Provider: "imessage",
+      Surface: "imessage",
+      Body: "/approve exec-1 allow-once",
+      BodyForCommands: "/approve exec-1 allow-once",
+      CommandBody: "/approve exec-1 allow-once",
+      CommandSource: "text",
+      CommandAuthorized: true,
+      CommandTurn: {
+        kind: "text-slash",
+        source: "text",
+        authorized: true,
+        commandName: "approve",
+        body: "/approve exec-1 allow-once",
+      },
+      SessionKey: "agent:main:imessage:direct:peer",
+    });
+
+    await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+    expect(mocks.tryFastApproveFromMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "main",
+        sessionKey: "agent:main:imessage:direct:peer",
+      }),
+    );
+    expect(replyResolver).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
+      text: "✅ Approval allow-once submitted.",
+    });
   });
 
   it("reports when a fast abort is rejected during finalization", async () => {
@@ -934,7 +977,7 @@ describe("dispatchReplyFromConfig", () => {
       [sourceStorePath]: { [sourceSessionKey]: sourceEntry },
       [targetStorePath]: { [boundSessionKey]: targetEntry },
     };
-    sessionStoreMocks.resolveStorePath.mockImplementation(
+    sessionStoreMocks.resolveSessionStorePathCore.mockImplementation(
       (_configuredPath?: unknown, options?: { agentId?: string }) =>
         options?.agentId === "opencode" ? targetStorePath : sourceStorePath,
     );
@@ -1014,10 +1057,39 @@ describe("dispatchReplyFromConfig", () => {
       SessionKey: sourceSessionKey,
       BodyForAgent: "continue",
     });
+    const preparedLookup = vi.fn(async ({ agentId }: { agentId: string }) => {
+      if (agentId !== "main") {
+        throw new Error(`unexpected prepared reply dispatch owner ${agentId}`);
+      }
+      return Object.freeze({
+        agentId: "main",
+        agentDir: "/tmp/main-agent",
+        workspaceDir: "/tmp/main-workspace",
+        config: cfg,
+        modelCatalog: { entries: [], routeVariants: [] },
+        inboundPluginRegistry: createTestRegistry([]),
+      });
+    });
+    const runtimeLoaders = await import("./dispatch-from-config.runtime-loaders.js");
+    const preparedLoader = vi.spyOn(runtimeLoaders, "loadPreparedModelRuntime").mockResolvedValue({
+      loadPublishedGatewayReplyDispatchRuntime: preparedLookup,
+    } as never);
 
-    const result = await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+    let result: Awaited<ReturnType<typeof dispatchReplyFromConfig>>;
+    try {
+      result = await dispatchReplyFromConfig({
+        ctx,
+        cfg,
+        dispatcher,
+        replyResolver,
+        usePublishedModelRuntime: true,
+      });
+    } finally {
+      preparedLoader.mockRestore();
+    }
 
     expect(result.queuedFinal).toBe(true);
+    expect(preparedLookup).toHaveBeenCalledWith({ agentId: "main" });
     expect(sessionBindingMocks.resolveByConversation).toHaveBeenCalledWith({
       channel: "discord",
       accountId: "default",
@@ -1353,6 +1425,8 @@ describe("dispatchReplyFromConfig", () => {
           channelLabel: channel === "discord" ? "Discord" : "Signal",
           accountId: "default",
           requestGateway: async <T>() => ({ ok: true }) as T,
+          shouldHandle: () => true,
+          classifyRoute: () => "unbound",
         })
       : undefined;
     reporter?.start();
@@ -1401,6 +1475,8 @@ describe("dispatchReplyFromConfig", () => {
       channelLabel: "Signal",
       accountId: "default",
       requestGateway: async <T>() => ({ ok: true }) as T,
+      shouldHandle: () => true,
+      classifyRoute: () => "unbound",
     });
     reporter.start();
     try {

@@ -1,4 +1,5 @@
 import { sanitizeForLog } from "../../../packages/terminal-core/src/ansi.js";
+import { resolveSessionAuthProfileOverrideSource } from "../../config/sessions/auth-profile-override-provenance.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import { emitAgentEvent } from "../../infra/agent-events.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
@@ -14,6 +15,7 @@ import {
 } from "../../tasks/task-status-access.js";
 import { createTrajectoryRuntimeRecorder } from "../../trajectory/runtime.js";
 import { resolveMessageChannel } from "../../utils/message-channel.js";
+import type { PreparedAgentRunAdmission } from "../admitted-run-context.js";
 import {
   clearAutoFallbackPrimaryProbeSelection,
   entryMatchesAutoFallbackPrimaryProbe,
@@ -28,7 +30,10 @@ import { resolveFastModeState } from "../fast-mode.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../harness/hook-helpers.js";
 import { prepareInternalSessionEffectsSession } from "../internal-session-effects.js";
 import { LiveSessionModelSwitchError } from "../live-model-switch.js";
+import { findModelInCatalog, modelSupportsInput } from "../model-catalog-lookup.js";
 import { modelKey, resolveThinkingDefault } from "../model-selection.js";
+import { resolveConfiguredThinkingDefault } from "../model-thinking-default.js";
+import { createModelVisibilityPolicy } from "../model-visibility-policy.js";
 import type { AgentRunSessionTarget } from "../run-session-target.js";
 import {
   isAgentRunDirectAbortReason,
@@ -36,7 +41,10 @@ import {
   resolveAgentRunErrorLifecycleFields,
 } from "../run-termination.js";
 import { resolveSessionRuntimeOverrideForProvider } from "../session-runtime-compat.js";
+import { measureAgentStartup } from "../startup-timing.js";
 import {
+  hasResolvedThinkingCatalogEntry,
+  normalizeThinkingCatalogProviders,
   resolveCandidateThinkingLevel,
   resolveEffectiveAgentRuntime,
 } from "../thinking-runtime.js";
@@ -44,19 +52,20 @@ import {
   createAgentAttemptLifecycleCallbacks,
   type AgentAttemptLifecycleState,
 } from "./attempt-callbacks.js";
+import { persistAgentSession } from "./attempt-execution.shared.js";
 import { createAgentCommandLifecycle } from "./lifecycle.js";
 import { normalizeAgentCommandModelRef } from "./model-ref.js";
 import type { EmbeddedModelSelection } from "./model-selection.js";
 import type { PreparedAgentCommandExecution } from "./prepare.js";
 import { loadAttemptExecutionRuntime, type AgentAttemptResult } from "./runtime-loaders.js";
-import { persistSessionEntry, resolveInternalSessionEffectsSource } from "./session-helpers.js";
+import { resolveInternalSessionEffectsSource } from "./session-helpers.js";
 import type { EmbeddedSessionState } from "./session-preparation.js";
 import type { AgentCommandOpts } from "./types.js";
-
 const log = createSubsystemLogger("agents/agent-command");
 const MAX_LIVE_SWITCH_RETRIES = 5;
 
 export async function runEmbeddedAgentAttempt(params: {
+  preparedRunAdmission: PreparedAgentRunAdmission;
   prepared: PreparedAgentCommandExecution;
   opts: AgentCommandOpts;
   sessionEntry?: SessionEntry;
@@ -99,7 +108,6 @@ export async function runEmbeddedAgentAttempt(params: {
     storedProviderOverride,
     hasStoredAutoFallbackProvenance,
     autoFallbackPrimaryProbe,
-    thinkingCatalog,
     immutableThinkLevel,
     sessionFile,
   } = params.modelSelection;
@@ -112,6 +120,8 @@ export async function runEmbeddedAgentAttempt(params: {
     storedModelOverrideSource,
     effectiveTurnThinkLevel,
   } = params.modelSelection;
+  let thinkingCatalog = params.modelSelection.thinkingCatalog;
+  let attemptedThinkingCatalogHydration = false;
   let sessionEntry = params.sessionEntry;
   let lifecycleGeneration = params.lifecycleGeneration;
 
@@ -131,6 +141,16 @@ export async function runEmbeddedAgentAttempt(params: {
       })
     : undefined;
   params.trackInternalModelRunTarget(internalSessionTarget);
+  const attemptSessionTarget =
+    internalSessionTarget ??
+    (sessionKey && storePath
+      ? {
+          agentId: sessionAgentId,
+          sessionId,
+          sessionKey,
+          storePath,
+        }
+      : undefined);
   const attemptSessionFile = internalSessionTarget?.sessionFile ?? sessionFile;
 
   const startedAt = Date.now();
@@ -146,28 +166,32 @@ export async function runEmbeddedAgentAttempt(params: {
     params.opts.suppressPromptPersistence === true ||
     (params.opts.transcriptMessage === "" && !hasTranscriptMedia);
   const recorderTranscriptText = transcriptBody || undefined;
-  const userTurnTranscriptRecorder = createUserTurnTranscriptRecorder({
-    ...(!suppressUserTurnPersistence && (recorderTranscriptText || hasTranscriptMedia)
-      ? {
-          input: {
-            text: recorderTranscriptText,
-            ...(hasTranscriptMedia ? { media: transcriptMedia } : {}),
-          },
-        }
-      : {}),
-    target: {
-      sessionId: internalSessionTarget?.sessionId ?? sessionId,
-      agentId: internalSessionTarget?.agentId ?? sessionAgentId,
-      sessionKey: internalSessionTarget?.sessionKey ?? sessionKey ?? sessionId,
-      sessionEntry: internalSessionTarget?.sessionEntry ?? sessionEntry,
-      sessionStore: params.suppressVisibleSessionEffects ? undefined : sessionStore,
-      storePath: internalSessionTarget?.storePath ?? storePath,
-      cwd: cwd ?? workspaceDir,
-      config: cfg,
-    },
-    beforeMessageWrite: runAgentHarnessBeforeMessageWriteHook,
-    errorContext: "agent command user turn transcript",
-  });
+  const userTurnTranscriptRecorder =
+    (internalSessionTarget ? undefined : params.opts.userTurnTranscriptRecorder) ??
+    createUserTurnTranscriptRecorder({
+      ...(!suppressUserTurnPersistence && (recorderTranscriptText || hasTranscriptMedia)
+        ? {
+            input: {
+              text: recorderTranscriptText,
+              ...(hasTranscriptMedia ? { media: transcriptMedia } : {}),
+              senderIsOwner: params.opts.senderIsOwner,
+              ...(params.opts.inputProvenance ? { provenance: params.opts.inputProvenance } : {}),
+            },
+          }
+        : {}),
+      target: {
+        sessionId: internalSessionTarget?.sessionId ?? sessionId,
+        agentId: internalSessionTarget?.agentId ?? sessionAgentId,
+        sessionKey: internalSessionTarget?.sessionKey ?? sessionKey ?? sessionId,
+        sessionEntry: internalSessionTarget?.sessionEntry ?? sessionEntry,
+        sessionStore: params.suppressVisibleSessionEffects ? undefined : sessionStore,
+        storePath: internalSessionTarget?.storePath ?? storePath,
+        cwd: cwd ?? workspaceDir,
+        config: cfg,
+      },
+      beforeMessageWrite: runAgentHarnessBeforeMessageWriteHook,
+      errorContext: "agent command user turn transcript",
+    });
   if (suppressUserTurnPersistence) {
     userTurnTranscriptRecorder.markBlocked();
   }
@@ -178,7 +202,11 @@ export async function runEmbeddedAgentAttempt(params: {
     abortSignal: params.opts.abortSignal,
     state: attemptLifecycleState,
   });
-  const attemptExecutionRuntime = await loadAttemptExecutionRuntime();
+  const attemptExecutionRuntime = await measureAgentStartup(
+    "attempt-runtime-import",
+    () => loadAttemptExecutionRuntime(),
+    { config: cfg },
+  );
   const messageChannel = resolveMessageChannel(
     runContext.messageChannel,
     params.opts.replyChannel ?? params.opts.channel,
@@ -236,8 +264,13 @@ export async function runEmbeddedAgentAttempt(params: {
           cfg,
           provider,
           model,
+          requestedRouteResolution: params.modelSelection.requestedRouteResolution,
           agentDir,
           fallbacksOverride: effectiveFallbacksOverride,
+          userLockedAuthProfileId:
+            resolveSessionAuthProfileOverrideSource(sessionEntryForAttempt) === "user"
+              ? sessionEntryForAttempt?.authProfileOverride
+              : undefined,
           ...modelManifestContext,
         },
         identity: {
@@ -281,7 +314,7 @@ export async function runEmbeddedAgentAttempt(params: {
             }
             const nextSessionEntry = { ...sessionEntry };
             clearAutoFallbackPrimaryProbeSelection(nextSessionEntry);
-            sessionEntry = await persistSessionEntry({
+            sessionEntry = await persistAgentSession({
               sessionStore,
               sessionKey,
               storePath,
@@ -348,8 +381,51 @@ export async function runEmbeddedAgentAttempt(params: {
             sessionKey,
             sessionEntry: attemptSessionEntry,
           });
-          const candidateRequestedThinkLevel =
+          const candidateConfiguredThinkLevel =
             immutableThinkLevel ??
+            resolveConfiguredThinkingDefault({
+              cfg,
+              provider: providerOverride,
+              model: modelOverride,
+            });
+          if (
+            pluginsEnabled &&
+            candidateConfiguredThinkLevel !== "off" &&
+            !attemptedThinkingCatalogHydration &&
+            !hasResolvedThinkingCatalogEntry({
+              catalog: thinkingCatalog,
+              provider: providerOverride,
+              model: modelOverride,
+            })
+          ) {
+            attemptedThinkingCatalogHydration = true;
+            const { loadProviderScopedThinkingCatalog } =
+              await import("../model-catalog.runtime.js");
+            const runtimeCatalog = normalizeThinkingCatalogProviders(
+              await loadProviderScopedThinkingCatalog({
+                config: cfg,
+                provider: providerOverride,
+                model: modelOverride,
+                agentId: sessionAgentId,
+                workspaceDir,
+              }),
+            );
+            const allowedRuntimeCatalog = createModelVisibilityPolicy({
+              cfg,
+              catalog: runtimeCatalog,
+              defaultProvider,
+              defaultModel,
+              agentId: sessionAgentId,
+              allowManifestNormalization: true,
+              allowPluginNormalization: true,
+              ...modelManifestContext,
+            }).allowedCatalog;
+            if (allowedRuntimeCatalog.length > 0) {
+              thinkingCatalog = allowedRuntimeCatalog;
+            }
+          }
+          const candidateRequestedThinkLevel =
+            candidateConfiguredThinkLevel ??
             resolveThinkingDefault({
               cfg,
               provider: providerOverride,
@@ -371,8 +447,13 @@ export async function runEmbeddedAgentAttempt(params: {
             }) ?? candidateRequestedThinkLevel;
           effectiveTurnThinkLevel = candidateThinkLevel;
           return attemptExecutionRuntime.runAgentAttempt({
+            preparedRunAdmission: params.preparedRunAdmission,
             providerOverride,
             modelOverride,
+            modelHasVision: modelSupportsInput(
+              findModelInCatalog(thinkingCatalog ?? [], providerOverride, modelOverride),
+              "image",
+            ),
             configuredAuthProfileId,
             modelFallbacksOverride: effectiveFallbacksOverride,
             originalProvider: provider,
@@ -381,7 +462,7 @@ export async function runEmbeddedAgentAttempt(params: {
             agentHarnessRuntimeOverride,
             sessionId,
             sessionKey,
-            ...(internalSessionTarget ? { sessionTarget: internalSessionTarget } : {}),
+            ...(attemptSessionTarget ? { sessionTarget: attemptSessionTarget } : {}),
             sessionAgentId,
             sessionFile: attemptSessionFile,
             workspaceDir,
@@ -413,6 +494,7 @@ export async function runEmbeddedAgentAttempt(params: {
             storePath: params.suppressVisibleSessionEffects ? undefined : storePath,
             pluginsEnabled,
             ...(manifestMetadataSnapshot ? { metadataSnapshot: manifestMetadataSnapshot } : {}),
+            pluginGeneration: params.prepared.commandRuntimeContext?.pluginGeneration,
             allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
             sessionHasHistory:
               !isNewSession ||
@@ -424,10 +506,11 @@ export async function runEmbeddedAgentAttempt(params: {
               userTurnTranscriptRecorder.isBlocked() ||
               (runOptions.isFallbackRetry && attemptLifecycleState.currentTurnUserMessagePersisted),
             userTurnTranscriptRecorder,
+            contextEngineLogicalTurnLease: runOptions.contextEngineLogicalTurnLease,
+            onContextEngineTurnCandidate: runOptions.onContextEngineTurnCandidate,
             onUserMessagePersisted: attemptLifecycleCallbacks.onUserMessagePersisted,
             onLifecycleGenerationChanged: (nextLifecycleGeneration) => {
               lifecycleGeneration = nextLifecycleGeneration;
-              // Outer cleanup owns the run context, so publish before the attempt can reject.
               params.onLifecycleGenerationChanged(nextLifecycleGeneration);
             },
             onAgentEvent: attemptLifecycleCallbacks.onAgentEvent,
@@ -621,5 +704,3 @@ export async function runEmbeddedAgentAttempt(params: {
     terminal,
   };
 }
-
-export type EmbeddedAgentAttempt = Awaited<ReturnType<typeof runEmbeddedAgentAttempt>>;

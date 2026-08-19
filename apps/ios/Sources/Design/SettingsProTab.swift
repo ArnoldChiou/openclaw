@@ -56,6 +56,7 @@ struct SettingsProTab: View {
     @State var gatewayPassword = ""
     @State var gatewayCredentialFieldStableID: String?
     @State var manualGatewayPortText = ""
+    @State var manualGatewayContextPath: String?
     @State var setupStatusText: String?
     @State var setupAttemptID: UUID?
     @State var stagedGatewaySetupLink: GatewayConnectDeepLink?
@@ -326,10 +327,12 @@ struct SettingsProTab: View {
                             self.pendingForgetGateway = nil
                         }
                     }),
-                titleVisibility: .visible)
-            {
+                titleVisibility: .visible,
+                // The action only schedules Task; dismissal clears state before that task resumes.
+                presenting: self.pendingForgetGateway)
+            { entry in
                 Button(role: .destructive) {
-                    Task { await self.forgetPendingGateway() }
+                    Task { await self.forgetGateway(entry) }
                 } label: {
                     Text("Forget Gateway")
                         .font(OpenClawType.subheadSemiBold)
@@ -340,7 +343,7 @@ struct SettingsProTab: View {
                     Text("Cancel")
                         .font(OpenClawType.subheadSemiBold)
                 }
-            } message: {
+            } message: { _ in
                 // Keep the extraction key contiguous for the native localization inventory.
                 Text(
                     String(

@@ -18,26 +18,11 @@ import { normalizeAgentModelRefForConfig, toAgentModelListLike } from "../../con
 import type { AgentModelEntryConfig } from "../../config/types.agent-defaults.js";
 import type { AgentModelConfig } from "../../config/types.agents-shared.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
+import { inspectModelReference } from "./model-reference-validation.js";
 import { canonicalizeModelCatalogProviderRef } from "./provider-aliases.js";
 
-export const ensureFlagCompatibility = (opts: { json?: boolean; plain?: boolean }) => {
-  if (opts.json && opts.plain) {
-    throw new Error("Choose either --json or --plain, not both.");
-  }
-};
-
-/** Formats token counts as compact K-suffixed labels. */
-export const formatTokenK = (value?: number | null) => {
-  if (!value || !Number.isFinite(value)) {
-    return "-";
-  }
-  // Token counts use decimal-K (/1000), matching formatTokenCount and how
-  // providers advertise context windows (e.g. 200000 -> "200k", not "195k").
-  if (value < 1000) {
-    return `${Math.round(value)}`;
-  }
-  return `${Math.round(value / 1000)}k`;
-};
+export { formatTokenK } from "./list.format.js";
+export { ensureFlagCompatibility } from "./list.options.js";
 
 /** Formats millisecond durations for model command output. */
 export const formatMs = (value?: number | null) => {
@@ -173,7 +158,9 @@ export function resolveModelsTargetAgent(
   agentId: string;
   agentDir: string;
 } {
-  const agentId = resolveKnownAgentId({ cfg, rawAgentId }) ?? resolveDefaultAgentId(cfg);
+  const agentId =
+    resolveKnownAgentId({ cfg, rawAgentId }) ??
+    resolveDefaultAgentId(cfg, { surface: "the model command", hint: "Pass --agent <id>." });
   const agentDir = resolveAgentDir(cfg, agentId);
   return { agentId, agentDir };
 }
@@ -250,21 +237,9 @@ export function applyDefaultModelPrimaryUpdate(params: {
   resolveCfg?: OpenClawConfig;
   modelRaw: string;
   field: "model" | "imageModel";
+  resolvedTarget?: { provider: string; model: string };
 }): OpenClawConfig {
-  const resolved =
-    params.resolveCfg && params.resolveCfg !== params.cfg
-      ? (resolveAuthoredModelAliasTarget({
-          raw: params.modelRaw,
-          cfg: params.cfg,
-        }) ??
-        resolveModelTarget({
-          raw: params.modelRaw,
-          cfg: params.resolveCfg,
-        }))
-      : resolveModelTarget({
-          raw: params.modelRaw,
-          cfg: params.cfg,
-        });
+  const resolved = params.resolvedTarget ?? resolveDefaultModelPrimaryTarget(params);
   const nextModels = {
     ...params.cfg.agents?.defaults?.models,
   } as Record<string, AgentModelEntryConfig>;
@@ -286,6 +261,49 @@ export function applyDefaultModelPrimaryUpdate(params: {
       },
     },
   };
+}
+
+function resolveDefaultModelPrimaryTarget(params: {
+  cfg: OpenClawConfig;
+  resolveCfg?: OpenClawConfig;
+  modelRaw: string;
+}): { provider: string; model: string } {
+  return params.resolveCfg && params.resolveCfg !== params.cfg
+    ? (resolveAuthoredModelAliasTarget({ raw: params.modelRaw, cfg: params.cfg }) ??
+        resolveModelTarget({ raw: params.modelRaw, cfg: params.resolveCfg }))
+    : resolveModelTarget({ raw: params.modelRaw, cfg: params.cfg });
+}
+
+/** Validates and persists one default text/image model selection. */
+export async function updateDefaultModelPrimaryConfig(params: {
+  modelRaw: string;
+  field: "model" | "imageModel";
+}): Promise<{ updated: OpenClawConfig; warning?: string }> {
+  let warning: string | undefined;
+  const updated = await updateConfig((cfg, context) => {
+    const resolvedTarget = resolveDefaultModelPrimaryTarget({
+      cfg,
+      resolveCfg: context.runtimeConfig,
+      modelRaw: params.modelRaw,
+    });
+    const inspection = inspectModelReference({ cfg: context.runtimeConfig, ref: resolvedTarget });
+    if (inspection.status === "unknown-provider") {
+      throw new Error(
+        `Unknown model provider "${inspection.provider}". Install a plugin that declares it or configure it under models.providers before selecting "${inspection.ref}". Config was not changed.`,
+      );
+    }
+    if (inspection.status === "unknown-model") {
+      warning = `Warning: Model "${inspection.ref}" is not in the local model catalog for provider "${inspection.provider}". The provider is installed or configured, so the selection was saved; verify the model ID if it is not a newly released or self-hosted model.`;
+    }
+    return applyDefaultModelPrimaryUpdate({
+      cfg,
+      resolveCfg: context.runtimeConfig,
+      modelRaw: params.modelRaw,
+      field: params.field,
+      resolvedTarget,
+    });
+  });
+  return { updated, ...(warning ? { warning } : {}) };
 }
 
 export { modelKey };

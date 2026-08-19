@@ -28,6 +28,7 @@ export type WorkboardProps = {
   pluginEnabled: boolean | null;
   pluginEnablementError?: string | null;
   agentsList: AgentsListResult | null;
+  defaultAgentId?: string | null;
   sessions: GatewaySessionRow[];
   scopeAgentId?: string | null;
   showAgentFilter?: boolean;
@@ -71,6 +72,7 @@ type LifecycleCopy = readonly [
 ];
 
 const lifecycleCopy = {
+  queued: ["sessionsView.statusQueued", "sessionsView.waitingForConcurrency", "idle"],
   running: ["workboard.lifecycleRunning", "workboard.lifecycleRunningDetail", "live"],
   succeeded: ["workboard.lifecycleDone", "workboard.lifecycleDoneDetail", "done"],
   failed: ["workboard.lifecycleNeedsReview", "workboard.lifecycleNeedsReviewDetail", "blocked"],
@@ -85,7 +87,7 @@ export const formatStatusLabel = (status: WorkboardStatus) => t(`workboard.statu
 export const formatPriorityLabel = (priority: WorkboardPriority) =>
   priority.charAt(0).toUpperCase() + priority.slice(1);
 
-export function formatTime(value: number | undefined): string {
+export function formatWorkboardDate(value: number | undefined): string {
   return value ? formatDateMs(value, { month: "short", day: "numeric" }, "") : "";
 }
 
@@ -110,7 +112,7 @@ export function formatAge(value: number | undefined): string {
   if (!value) {
     return "";
   }
-  return formatDurationCompact(Math.max(0, Date.now() - value), { spaced: true }) ?? "0ms";
+  return formatDurationCompact(Math.max(0, Date.now() - value)) ?? "0ms";
 }
 
 export function canMutate(props: WorkboardProps): boolean {
@@ -186,11 +188,6 @@ export function matchesFilter(
   ]
     .filter((value): value is string => typeof value === "string")
     .some((value) => value.toLowerCase().includes(query));
-}
-
-export function nextPosition(cards: readonly WorkboardCard[], status: WorkboardStatus): number {
-  const positions = cards.filter((card) => card.status === status).map((card) => card.position);
-  return (positions.length ? Math.max(...positions) : 0) + 1000;
 }
 
 export function isWorkboardSessionChoice(session: GatewaySessionRow): boolean {

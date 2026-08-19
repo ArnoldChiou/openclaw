@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULT_SECRET_FILE_MAX_BYTES, tryReadSecretFileSync } from "@openclaw/fs-safe/secret";
 import { execa } from "execa";
+import { coerceErrorMessage as errorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { resolveTrustedOnePasswordCli } from "./onepassword-op-path.js";
 import { resolveOnePasswordSecretReference } from "./onepassword-secret-id.js";
 
@@ -18,7 +19,7 @@ function readStdin() {
     let input = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => {
-      input += chunk;
+      input += String(chunk);
     });
     process.stdin.on("error", reject);
     process.stdin.on("end", () => resolve(input));
@@ -63,10 +64,6 @@ async function resolveOpCommand() {
 
 function opMissingMessage(command) {
   return `1Password CLI "${command}" is not installed or cannot be executed. Install the official 1Password CLI v2, and set CLAW_1PASSWORD_OP to its absolute path.`;
-}
-
-function errorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function resolveOsHome() {
@@ -183,9 +180,11 @@ function opEnvironment(token) {
 }
 
 async function runOpRead(opCommand, token, secretReference) {
+  // Keep execa's default utf8 encoding: secrets are decoded as utf8 anyway, and
+  // Bun's spawn rejects execa's "buffer" encoding option (oven-sh/bun#36049),
+  // surfacing as a masked "Attempted to assign to readonly property." TypeError.
   const subprocess = execa(opCommand, ["read", "--cache=false", "--no-newline", secretReference], {
     cleanup: true,
-    encoding: "buffer",
     env: opEnvironment(token),
     extendEnv: false,
     killDescendants: true,
@@ -223,10 +222,12 @@ async function runOpRead(opCommand, token, secretReference) {
   if (result.exitCode !== 0) {
     throw new Error(`op read failed with exit code ${String(result.exitCode)}.`);
   }
-  if (!(result.stdout instanceof Uint8Array)) {
+  // A missing stdout string means the subprocess never produced output streams
+  // (spawn-level failure with reject:false), not an empty secret.
+  if (typeof result.stdout !== "string") {
     throw new Error("op read could not be started.");
   }
-  return Buffer.from(result.stdout).toString("utf8");
+  return result.stdout;
 }
 
 async function runWithConcurrency(values, limit, task) {

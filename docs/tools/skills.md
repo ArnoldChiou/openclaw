@@ -38,8 +38,8 @@ skill name appears in multiple places, the highest source wins.
 | ----------- | ---------------------- | --------------------------------------- |
 | 1 — highest | Workspace skills       | `<workspace>/skills`                    |
 | 2           | Project agent skills   | `<workspace>/.agents/skills`            |
-| 3           | Personal agent skills  | `~/.agents/skills`                      |
-| 4           | Managed / local skills | `~/.openclaw/skills`                    |
+| 3           | Personal agent skills  | `~/.agents/skills` (default state only) |
+| 4           | Managed / local skills | `<state-dir>/skills`                    |
 | 5           | Bundled skills         | shipped with the install                |
 | 6 — lowest  | Extra directories      | `skills.load.extraDirs` + plugin skills |
 
@@ -81,13 +81,18 @@ files. See [Nodes](/nodes#node-hosted-skills) for pairing and off-switches.
 In multi-agent setups, each agent has its own workspace. Use the path that
 matches your desired visibility:
 
-| Scope          | Path                         | Visible to                  |
-| -------------- | ---------------------------- | --------------------------- |
-| Per-agent      | `<workspace>/skills`         | Only that agent             |
-| Project-agent  | `<workspace>/.agents/skills` | Only that workspace's agent |
-| Personal-agent | `~/.agents/skills`           | All agents on this machine  |
-| Shared managed | `~/.openclaw/skills`         | All agents on this machine  |
-| Extra dirs     | `skills.load.extraDirs`      | All agents on this machine  |
+| Scope          | Path                         | Visible to                     |
+| -------------- | ---------------------------- | ------------------------------ |
+| Per-agent      | `<workspace>/skills`         | Only that agent                |
+| Project-agent  | `<workspace>/.agents/skills` | Only that workspace's agent    |
+| Personal-agent | `~/.agents/skills`           | Agents using the default state |
+| Shared managed | `<state-dir>/skills`         | All agents using that state    |
+| Extra dirs     | `skills.load.extraDirs`      | All agents using that config   |
+
+When `OPENCLAW_STATE_DIR` points somewhere other than the default
+`~/.openclaw`, session skill indexes exclude home-scoped personal or
+compatibility skill roots such as `~/.agents/skills`. Workspace, project,
+bundled, extra, and state-owned managed skills continue to load normally.
 
 ## Agent allowlists
 
@@ -101,11 +106,11 @@ regardless of where they are loaded from.
     defaults: {
       skills: ["github", "weather"], // shared baseline
     },
-    list: [
-      { id: "writer" }, // inherits github, weather
-      { id: "docs", skills: ["docs-search"] }, // replaces defaults entirely
-      { id: "locked-down", skills: [] }, // no skills
-    ],
+    entries: {
+      writer: { default: true }, // inherits github, weather
+      docs: { skills: ["docs-search"] }, // replaces defaults entirely
+      "locked-down": { skills: [] }, // no skills
+    },
   },
 }
 ```
@@ -139,6 +144,36 @@ skill overrides them. Gate a plugin skill's own eligibility via
 
 See [Plugins](/tools/plugin) and [Tools](/tools) for the full plugin system.
 
+## Reference a skill in a prompt
+
+Type `$` in the Control UI composer to search the skills available to the
+current agent. Selecting a result inserts its stable command name, for example
+`$release_notes`, without replacing the rest of your message. A prompt can
+reference more than one skill:
+
+```text
+Use $github and $release_notes to summarize this change for the release.
+```
+
+OpenClaw resolves explicit references from authorized senders on every channel
+and on generic Gateway, CLI, and webhook agent turns. It matches the current
+agent's eligible, user-invocable skills and tells the model to read each
+referenced `SKILL.md` before acting. A single message can reference up to eight
+distinct skills; OpenClaw returns a visible error instead of ignoring extra or
+allowlist-hidden references. The `$` form is composable prompt text. On channel
+messages, `/release_notes ...` remains the standalone command form and may use
+direct tool dispatch when the skill declares `command-dispatch: tool`; generic
+agent turns expand the same leading skill command as model instructions without
+running the channel command dispatcher. Common uppercase shell variables such
+as `$HOME`, `$PATH`, and `$EDITOR` remain ordinary text; use lowercase `$home`,
+`$path`, or `$editor` to reference skills with those names. Escape a reference
+as `\$name` when it should stay literal.
+
+Skills with `disable-model-invocation: true` stay out of the `$` picker and the
+model's normal prompt, so the model cannot select them on its own. An authorized
+explicit `$skill-name` reference still invokes them; the flag only hides the
+skill from model-initiated selection.
+
 ## Skill Workshop
 
 [Skill Workshop](/tools/skill-workshop) is a proposal queue between the agent
@@ -149,6 +184,7 @@ before anything changes.
 ```bash
 openclaw skills workshop list
 openclaw skills workshop inspect <proposal-id>
+openclaw skills workshop evaluate <proposal-id>
 openclaw skills workshop apply <proposal-id>
 ```
 
@@ -324,7 +360,9 @@ metadata:
 ```
 
 <ParamField path="always" type="boolean">
-  When `true`, always include the skill and skip all other gates.
+  When `true`, include the skill whenever its `os` requirement is compatible,
+  bypassing `requires.bins`, `requires.anyBins`, `requires.env`, and
+  `requires.config`.
 </ParamField>
 
 <ParamField path="emoji" type="string">
@@ -336,7 +374,9 @@ metadata:
 </ParamField>
 
 <ParamField path="os" type='("darwin" | "linux" | "win32")[]'>
-  Platform filter. When set, the skill is only eligible on a listed OS.
+  Hard platform filter. When set, the skill is only eligible when the local
+  host or a connected remote runtime matches a listed OS. `always` does not
+  override this filter.
 </ParamField>
 
 <ParamField path="requires.bins" type="string[]">

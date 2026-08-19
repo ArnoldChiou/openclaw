@@ -20,6 +20,7 @@ struct DashboardGatewayCatalogTests {
         let entries = DashboardGatewayCatalog.entries(
             mode: .remote,
             primaryRemoteURL: primaryURL,
+            resolvedRemoteURL: nil,
             resolvedRemoteHostLabel: "studio.example:443",
             profiles: [duplicate, other],
             primaryHealth: .ok)
@@ -33,11 +34,47 @@ struct DashboardGatewayCatalogTests {
         #expect(entries[1].health == .unknown)
     }
 
-    @Test @MainActor func `catalog maps only connected control state to healthy`() {
+    @Test func `catalog deduplicates profile matching resolved SSH endpoint`() throws {
+        let tunnelURL = try #require(URL(string: "ws://127.0.0.1:18789"))
+        let profile = MacGatewayCatalogProfile(
+            profile: MacGatewayProfile(id: "loopback", name: "127.0.0.1", url: tunnelURL),
+            canPromote: true)
+
+        let entries = DashboardGatewayCatalog.entries(
+            mode: .remote,
+            primaryRemoteURL: nil,
+            resolvedRemoteURL: tunnelURL,
+            resolvedRemoteHostLabel: "127.0.0.1:18789",
+            profiles: [profile],
+            primaryHealth: .ok)
+
+        #expect(entries.map(\.id) == ["primary"])
+        #expect(entries[0].name == "127.0.0.1")
+    }
+
+    @Test func `catalog deduplicates configured SSH endpoint before resolution`() throws {
+        let tunnelURL = try #require(URL(string: "ws://127.0.0.1:18789"))
+        let profile = MacGatewayCatalogProfile(
+            profile: MacGatewayProfile(id: "loopback", name: "127.0.0.1", url: tunnelURL),
+            canPromote: true)
+
+        let entries = DashboardGatewayCatalog.entries(
+            mode: .remote,
+            primaryRemoteURL: tunnelURL,
+            resolvedRemoteURL: nil,
+            resolvedRemoteHostLabel: nil,
+            profiles: [profile],
+            primaryHealth: .unknown)
+
+        #expect(entries.map(\.id) == ["primary"])
+        #expect(entries[0].name == "127.0.0.1")
+    }
+
+    @Test @MainActor func `catalog maps live control health`() {
         #expect(DashboardGatewayCatalog.primaryHealth(for: .connected) == .ok)
         #expect(DashboardGatewayCatalog.primaryHealth(for: .disconnected) == .unknown)
         #expect(DashboardGatewayCatalog.primaryHealth(for: .connecting) == .unknown)
-        #expect(DashboardGatewayCatalog.primaryHealth(for: .degraded("offline")) == .unknown)
+        #expect(DashboardGatewayCatalog.primaryHealth(for: .degraded("offline")) == .error)
     }
 
     @Test func `local catalog does not deduplicate a retained remote profile`() throws {
@@ -45,6 +82,7 @@ struct DashboardGatewayCatalogTests {
         let entries = DashboardGatewayCatalog.entries(
             mode: .local,
             primaryRemoteURL: url,
+            resolvedRemoteURL: nil,
             resolvedRemoteHostLabel: "127.0.0.1:18789",
             profiles: [.init(
                 profile: .init(id: "studio", name: "Studio", url: url),
@@ -104,11 +142,38 @@ struct DashboardGatewaysBridgeTests {
         #expect(controller._testTLSParams == params)
         #expect(DashboardWindowController.isExpectedTLSAuthority(
             host: "gateway.example",
+            port: 0,
+            dashboardURL: url))
+        #expect(DashboardWindowController.isExpectedTLSAuthority(
+            host: "gateway.example",
             port: 443,
+            dashboardURL: url))
+        #expect(!DashboardWindowController.isExpectedTLSAuthority(
+            host: "gateway.example",
+            port: 8443,
             dashboardURL: url))
         #expect(!DashboardWindowController.isExpectedTLSAuthority(
             host: "other.example",
             port: 443,
+            dashboardURL: url))
+    }
+
+    @Test func `media capture trust requires the dashboard origin`() throws {
+        let url = try #require(URL(string: "https://gateway.example/control/"))
+        #expect(DashboardWindowController.isTrustedMediaCaptureOrigin(
+            protocol: "https",
+            host: "gateway.example",
+            port: 443,
+            dashboardURL: url))
+        #expect(!DashboardWindowController.isTrustedMediaCaptureOrigin(
+            protocol: "https",
+            host: "other.example",
+            port: 443,
+            dashboardURL: url))
+        #expect(!DashboardWindowController.isTrustedMediaCaptureOrigin(
+            protocol: "http",
+            host: "gateway.example",
+            port: 80,
             dashboardURL: url))
     }
 }
@@ -116,6 +181,42 @@ struct DashboardGatewaysBridgeTests {
 @Suite(.serialized)
 @MainActor
 struct DashboardManagerGatewayTargetTests {
+    @Test func `background configuration keeps the gateway profile registry cold`() async {
+        var catalogReads = 0
+        let manager = DashboardManager._testMake(
+            observeGatewayChanges: true,
+            automaticGatewayProfileRefreshEnabled: false,
+            gatewayEntriesProvider: {
+                catalogReads += 1
+                return []
+            })
+
+        manager.configure(updater: DashboardGatewayTestUpdater())
+        NotificationCenter.default.post(name: MacGatewayProfileStore.didChangeNotification, object: nil)
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+
+        #expect(catalogReads == 0)
+        #expect(manager._testGatewayRefreshObserverCount() == 0)
+    }
+
+    @Test func `interactive configuration retains the gateway profile refresh`() async {
+        var catalogReads = 0
+        let manager = DashboardManager._testMake(
+            gatewayEntriesProvider: {
+                catalogReads += 1
+                return []
+            })
+
+        manager.configure(updater: DashboardGatewayTestUpdater())
+        for _ in 0..<20 where catalogReads == 0 {
+            await Task.yield()
+        }
+
+        #expect(catalogReads == 1)
+    }
+
     @Test func `primary window configuration retains resolved TLS policy`() async throws {
         let state = AppStateStore.shared
         let originalMode = state.connectionMode
@@ -237,6 +338,7 @@ struct DashboardManagerGatewayTargetTests {
                 token: "current",
                 password: nil),
             windowAutosaveName: "OpenClawDashboardWindow-Test-\(UUID().uuidString)")
+        let originalWindow = try #require(controller.window)
         let entries = DashboardGatewayTestEntries.withProfiles(["first", "second"])
         let manager = DashboardManager._testMake(
             profileEndpointProvider: { profileID in
@@ -259,6 +361,7 @@ struct DashboardManagerGatewayTargetTests {
 
         #expect(manager._testMainTarget() == .profile("second"))
         #expect(manager._testController()?.currentURL.port == 60003)
+        #expect(manager._testController()?.window === originalWindow)
     }
 
     @Test func `main menu switch replaces the frontmost dashboard in place`() async throws {
@@ -274,7 +377,8 @@ struct DashboardManagerGatewayTargetTests {
         controller.window?.setFrame(frame, display: false)
         controller.show()
         // CI display bounds clamp window frames during show, so compare replacement against the actual source frame.
-        let sourceFrame = try #require(controller.window).frame
+        let originalWindow = try #require(controller.window)
+        let sourceFrame = originalWindow.frame
         let entries = DashboardGatewayTestEntries.withProfiles(["studio"])
         let manager = DashboardManager._testMake(
             profileEndpointProvider: { profileID in
@@ -293,6 +397,7 @@ struct DashboardManagerGatewayTargetTests {
         #expect(manager.frontmostDashboardTarget == .profile("studio"))
         #expect(manager._testController() !== controller)
         #expect(manager._testController()?.currentURL.port == 60002)
+        #expect(manager._testController()?.window === originalWindow)
         #expect(manager._testController()?.window?.frame == sourceFrame)
     }
 

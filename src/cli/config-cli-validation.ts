@@ -1,8 +1,8 @@
 import { isRecord as isPlainRecord } from "@openclaw/normalization-core/record-coerce";
 import type { ConfigFileSnapshot } from "../config/config.js";
-import { readConfigFileSnapshot } from "../config/config.js";
-import { formatConfigIssueLines } from "../config/issue-format.js";
-import { attachConfigIssueDiagnostics } from "../config/issue-location.js";
+import { readConfigFileSnapshot, readConfigFileSnapshotForWrite } from "../config/config.js";
+import { formatConfigIssueLines, normalizeConfigIssues } from "../config/issue-format.js";
+import { renderConfigValidationIssueLines } from "../config/issue-location.js";
 import { isPluginPackagingRuntimeOutputInvalidConfigSnapshot } from "../config/recovery-policy.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
@@ -12,8 +12,10 @@ import {
   type SecretRef,
 } from "../config/types.secrets.js";
 import { validateConfigObjectRawWithPlugins } from "../config/validation.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { loadPluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
-import { type RuntimeEnv, defaultRuntime } from "../runtime.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
+import { type RuntimeEnv, defaultRuntime, writeRuntimeJson } from "../runtime.js";
 import {
   isPluginIntegrationSecretProviderConfig,
   resolveSecretProviderIntegrationConfig,
@@ -30,6 +32,7 @@ import { formatCliCommand } from "./command-format.js";
 import type { ConfigSetOperation } from "./config-cli-input.js";
 import { formatPluginPackagingRuntimeOutputRecoveryHint } from "./config-recovery-hints.js";
 import type { ConfigSetDryRunError } from "./config-set-dryrun.js";
+import { formatCliJsonFailure } from "./failure-output.js";
 
 function formatInvalidConfigRepairHint(
   snapshot: Pick<ConfigFileSnapshot, "valid" | "issues" | "warnings" | "legacyIssues">,
@@ -40,29 +43,64 @@ function formatInvalidConfigRepairHint(
     : `Run \`${formatCliCommand("openclaw doctor --fix")}\` ${doctorMessage}`;
 }
 
-export async function loadValidConfig(runtime: RuntimeEnv = defaultRuntime) {
-  const snapshot = await readConfigFileSnapshot();
+export function ensureValidConfigSnapshotForCli(
+  snapshot: ConfigFileSnapshot,
+  runtime: RuntimeEnv,
+  options: { json?: boolean } = {},
+): boolean {
   if (snapshot.valid) {
-    return snapshot;
+    return true;
+  }
+  if (options.json) {
+    writeRuntimeJson(runtime, {
+      ...formatCliJsonFailure(`OpenClaw config is invalid: ${shortenHomePath(snapshot.path)}`),
+      issues: normalizeConfigIssues(snapshot.issues),
+    });
+    runtime.exit(1);
+    return false;
   }
   runtime.error(`OpenClaw config is invalid: ${shortenHomePath(snapshot.path)}`);
-  const displayIssues = attachConfigIssueDiagnostics(snapshot.issues, {
-    raw: snapshot.raw,
-    parsed: snapshot.parsed,
-    effective: snapshot.sourceConfig,
-    configPath: snapshot.path,
-    formatPathForDisplay: true,
-    includeReceivedValueHint: true,
-  });
-  for (const line of formatConfigIssueLines(displayIssues, "-", { normalizeRoot: true })) {
+  for (const line of renderConfigValidationIssueLines(snapshot)) {
     runtime.error(line);
   }
   runtime.error(formatInvalidConfigRepairHint(snapshot, "to repair, then retry."));
   runtime.exit(1);
+  return false;
+}
+
+export async function loadValidConfig(
+  runtime: RuntimeEnv = defaultRuntime,
+  options: { observe?: boolean; json?: boolean } = {},
+) {
+  const snapshot =
+    options.observe === false
+      ? await readConfigFileSnapshot({ observe: false })
+      : await readConfigFileSnapshot();
+  ensureValidConfigSnapshotForCli(snapshot, runtime, options);
   return snapshot;
 }
 
+export async function loadValidConfigForWrite(runtime: RuntimeEnv = defaultRuntime) {
+  const prepared = await readConfigFileSnapshotForWrite();
+  ensureValidConfigSnapshotForCli(prepared.snapshot, runtime);
+  return prepared;
+}
+
 export { formatInvalidConfigRepairHint };
+
+export function strictlyValidateConfigSnapshotForCli(
+  snapshot: ConfigFileSnapshot,
+  pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "manifestRegistry">,
+): ConfigFileSnapshot {
+  if (!snapshot.valid) {
+    return snapshot;
+  }
+  const validated = validateConfigObjectRawWithPlugins(snapshot.sourceConfig, {
+    semanticValidation: "strict",
+    pluginMetadataSnapshot,
+  });
+  return validated.ok ? snapshot : { ...snapshot, valid: false, issues: validated.issues };
+}
 
 function collectSecretRefsFromUnknown(value: unknown): SecretRef[] {
   const refs: SecretRef[] = [];
@@ -141,7 +179,7 @@ export async function collectDryRunResolvabilityErrors(params: {
     } catch (err) {
       failures.push({
         kind: "resolvability",
-        message: String(err),
+        message: formatErrorMessage(err),
         ref: `${ref.source}:${ref.provider}:${ref.id}`,
       });
     }
@@ -207,8 +245,14 @@ export function selectDryRunRefsForResolution(params: {
   return { refsToResolve, skippedExecRefs };
 }
 
-export function collectDryRunSchemaErrors(config: OpenClawConfig): ConfigSetDryRunError[] {
-  const validated = validateConfigObjectRawWithPlugins(config);
+function collectStrictConfigErrors(
+  config: OpenClawConfig,
+  pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "manifestRegistry">,
+): ConfigSetDryRunError[] {
+  const validated = validateConfigObjectRawWithPlugins(config, {
+    semanticValidation: "strict",
+    pluginMetadataSnapshot,
+  });
   if (validated.ok) {
     return [];
   }
@@ -216,6 +260,26 @@ export function collectDryRunSchemaErrors(config: OpenClawConfig): ConfigSetDryR
     kind: "schema",
     message,
   }));
+}
+
+export function assertStrictConfigForMutation(
+  config: OpenClawConfig,
+  pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "manifestRegistry">,
+): void {
+  const errors = collectStrictConfigErrors(config, pluginMetadataSnapshot);
+  if (errors.length === 0) {
+    return;
+  }
+  throw new Error(
+    ["Config validation failed.", ...errors.map((error) => `- ${error.message}`)].join("\n"),
+  );
+}
+
+export function collectDryRunSchemaErrors(
+  config: OpenClawConfig,
+  pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "manifestRegistry">,
+): ConfigSetDryRunError[] {
+  return collectStrictConfigErrors(config, pluginMetadataSnapshot);
 }
 
 function touchesSecretProviderCollection(path: readonly string[]): boolean {

@@ -5,8 +5,17 @@ import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
+import {
+  ARCHIVE_LIMIT_ERROR_CODE,
+  ArchiveFormatError,
+  ArchiveLimitError,
+  ArchiveSecurityError,
+  extractArchive,
+} from "../infra/archive.js";
+import { createBackupLinkCache } from "../infra/backup-volatile-stat-cache.js";
 import { formatErrorMessage as errorMessage } from "../infra/errors.js";
 import { root as fsSafeRoot } from "../infra/fs-safe.js";
+import { isPathInside } from "../infra/path-guards.js";
 import {
   cellAuthSecretDir,
   cellNetworkName,
@@ -40,18 +49,7 @@ const MANIFEST_MAX_BYTES = 4 * 1024 * 1024;
 const BACKUP_LEASE_PROBE_INTERVAL_MS = 30_000;
 const RESTORE_VERIFY_TIMEOUT_MS = 60_000;
 const RESTORE_VERIFY_POLL_MS = 1_000;
-
-type BackupLinkCacheKey = `${number}:${number}`;
-
-class BackupLinkCache extends Map<BackupLinkCacheKey, string> {
-  override get(_key: BackupLinkCacheKey): undefined {
-    return undefined;
-  }
-
-  override set(_key: BackupLinkCacheKey, _value: string): this {
-    return this;
-  }
-}
+const RESTORE_EXTRACT_TIMEOUT_MS = 30 * 60_000;
 
 type FleetBackupManifest = {
   schemaVersion: 1;
@@ -123,14 +121,6 @@ async function canonicalizeForContainment(targetPath: string): Promise<string> {
   }
 }
 
-function isWithin(candidate: string, root: string): boolean {
-  const relative = path.relative(root, candidate);
-  return (
-    relative === "" ||
-    (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
-  );
-}
-
 function remapArchivePath(
   entryPath: string,
   manifestPath: string,
@@ -141,11 +131,11 @@ function remapArchivePath(
   if (resolved === manifestPath) {
     return "manifest.json";
   }
-  if (isWithin(resolved, dataTarget)) {
+  if (isPathInside(dataTarget, resolved)) {
     const relative = path.relative(dataTarget, resolved).split(path.sep).join(path.posix.sep);
     return relative ? path.posix.join("data", relative) : "data";
   }
-  if (isWithin(resolved, authTarget)) {
+  if (isPathInside(authTarget, resolved)) {
     const relative = path.relative(authTarget, resolved).split(path.sep).join(path.posix.sep);
     return relative ? path.posix.join("auth", relative) : "auth";
   }
@@ -209,7 +199,7 @@ export async function backupFleetCell(params: {
   );
   const canonicalOutput = await canonicalizeForContainment(archivePath);
   const roots = [dataTarget, authTarget];
-  if (roots.some((root) => isWithin(canonicalOutput, root))) {
+  if (roots.some((root) => isPathInside(root, canonicalOutput))) {
     throw new Error(
       "Fleet backup output must not be written inside the cell data or auth directory.",
     );
@@ -308,7 +298,7 @@ export async function backupFleetCell(params: {
           gzip: true,
           portable: true,
           preservePaths: true,
-          linkCache: new BackupLinkCache(),
+          linkCache: createBackupLinkCache(),
           filter,
           onWriteEntry: (entry) => {
             entry.path = remapArchivePath(entry.path, manifestPath, dataTarget, authTarget);
@@ -414,13 +404,6 @@ function isAllowedRestorePath(rawPath: string): boolean {
   );
 }
 
-function restoreEntryKind(entry: Stats | tar.ReadEntry): "file" | "directory" | "other" {
-  if ("isFile" in entry) {
-    return entry.isFile() ? "file" : entry.isDirectory() ? "directory" : "other";
-  }
-  return entry.type === "File" ? "file" : entry.type === "Directory" ? "directory" : "other";
-}
-
 // Extraction runs as the invoking user, so a root-invoked restore must repair
 // ownership for whichever identity the cell container actually runs as: the
 // explicit non-root user mapping when one exists, else the image default
@@ -485,7 +468,7 @@ export async function restoreFleetCell(params: {
     canonicalizeForContainment(params.record.dataDir),
     canonicalizeForContainment(cellAuthSecretDir(params.stateDir, params.record.tenantId)),
   ]);
-  if (restoreRoots.some((root) => isWithin(canonicalArchive, root))) {
+  if (restoreRoots.some((root) => isPathInside(root, canonicalArchive))) {
     throw new Error(
       "Fleet restore archive must not be stored inside the cell data or auth directory.",
     );
@@ -523,58 +506,78 @@ export async function restoreFleetCell(params: {
   let replacementAttemptId = "";
   try {
     let invalidArchive = false;
-    let totalBytes = 0;
-    let totalEntries = 0;
-    let exceeded = false;
-    let tooManyEntries = false;
+    let totalPathComponents = 0;
+    let tooManyPathComponents = false;
     const maxBytes = params.maxBytes ?? DEFAULT_FLEET_BACKUP_MAX_BYTES;
     const maxEntries = params.maxEntries ?? FLEET_BACKUP_MAX_ENTRIES;
-    await tar.x({
-      file: archivePath,
-      cwd: tempDir,
-      preservePaths: false,
-      preserveOwner: false,
-      strict: true,
-      filter: (entryPath, entry) => {
-        if (exceeded || tooManyEntries) {
-          return false;
-        }
-        // Entry cap complements the byte cap: metadata-only archive bombs stay
-        // under --max-bytes but can exhaust host inodes during extraction.
-        // Count path segments, not entries, so deep paths whose intermediate
-        // directories are created implicitly cannot bypass the budget.
-        totalEntries += entryPath.split("/").filter(Boolean).length;
-        if (totalEntries > maxEntries) {
-          tooManyEntries = true;
-          return false;
-        }
-        const kind = restoreEntryKind(entry);
-        if (kind === "other" || !isAllowedRestorePath(entryPath)) {
-          invalidArchive = true;
-          return false;
-        }
-        if (kind === "file") {
-          totalBytes += entry.size;
-          if (totalBytes > maxBytes) {
-            exceeded = true;
-            return false;
+    try {
+      await extractArchive({
+        archivePath,
+        destDir: tempDir,
+        kind: "tar",
+        tarGzip: true,
+        timeoutMs: RESTORE_EXTRACT_TIMEOUT_MS,
+        entryModes: "clamp",
+        entryFilter: (entry) => {
+          // Preserve Fleet's aggregate component budget in addition to the
+          // per-entry preflight enforced by maxEntryPathComponents.
+          totalPathComponents += entry.path.split("/").filter(Boolean).length;
+          if (totalPathComponents > maxEntries) {
+            tooManyPathComponents = true;
+            return "skip";
           }
-        }
-        return true;
-      },
-    });
-    if (exceeded) {
-      throw new Error(
-        `Fleet restore exceeds the ${maxBytes}-byte limit; raise --max-bytes or use a smaller archive.`,
-      );
-    }
-    if (tooManyEntries) {
-      throw new Error(
-        `Fleet restore exceeds the ${maxEntries}-entry limit; the archive is not a usable fleet cell backup.`,
-      );
-    }
-    if (invalidArchive) {
-      throw new Error("Archive is not a fleet cell backup or was tampered with.");
+          if (
+            (entry.kind !== "file" && entry.kind !== "directory") ||
+            !isAllowedRestorePath(entry.path)
+          ) {
+            invalidArchive = true;
+            return "skip";
+          }
+          return "extract";
+        },
+        onFiltered: "reject-archive",
+        limits: {
+          // The caller already pinned this exact archive path and size; setting
+          // the observed size avoids fs-safe's smaller generic upload default.
+          maxArchiveBytes: Math.max(1, archiveStat.size),
+          maxEntries,
+          maxExtractedBytes: maxBytes,
+          maxEntryBytes: maxBytes,
+          maxEntryPathComponents: maxEntries,
+        },
+      });
+    } catch (error) {
+      if (
+        tooManyPathComponents ||
+        (error instanceof ArchiveLimitError &&
+          (error.code === ARCHIVE_LIMIT_ERROR_CODE.ENTRY_COUNT_EXCEEDS_LIMIT ||
+            error.code === ARCHIVE_LIMIT_ERROR_CODE.ENTRY_PATH_COMPONENTS_EXCEEDS_LIMIT))
+      ) {
+        throw new Error(
+          `Fleet restore exceeds the ${maxEntries}-entry limit; the archive is not a usable fleet cell backup.`,
+          { cause: error },
+        );
+      }
+      if (
+        error instanceof ArchiveLimitError &&
+        (error.code === ARCHIVE_LIMIT_ERROR_CODE.EXTRACTED_SIZE_EXCEEDS_LIMIT ||
+          error.code === ARCHIVE_LIMIT_ERROR_CODE.ENTRY_EXTRACTED_SIZE_EXCEEDS_LIMIT)
+      ) {
+        throw new Error(
+          `Fleet restore exceeds the ${maxBytes}-byte limit; raise --max-bytes or use a smaller archive.`,
+          { cause: error },
+        );
+      }
+      if (
+        invalidArchive ||
+        error instanceof ArchiveSecurityError ||
+        error instanceof ArchiveFormatError
+      ) {
+        throw new Error("Archive is not a fleet cell backup or was tampered with.", {
+          cause: error,
+        });
+      }
+      throw error;
     }
     const safeRoot = await fsSafeRoot(tempDir, {
       symlinks: "reject",

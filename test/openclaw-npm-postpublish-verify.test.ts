@@ -1,9 +1,11 @@
+import { spawnSync } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
 // OpenClaw npm postpublish tests validate postpublish verification behavior.
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { listBundledPluginPackArtifacts } from "../scripts/lib/bundled-plugin-build-entries.mjs";
 import {
   buildPublishedInstallCommandArgs,
   buildPublishedInstallScenarios,
@@ -11,7 +13,6 @@ import {
   collectInstalledBundledExtensionManifestErrors,
   collectInstalledBundledRuntimeSidecarPaths,
   collectInstalledContextEngineRuntimeErrors,
-  collectInstalledPluginSdkZodArtifactErrors,
   collectInstalledRootDependencyManifestErrors,
   collectInstalledPackageErrors,
   fetchRegistryJson,
@@ -24,14 +25,16 @@ import {
   verifyNpmProvenanceAttestation,
   verifyNpmRegistrySignatures,
 } from "../scripts/openclaw-npm-postpublish-verify.ts";
+import { withEnv } from "../src/test-utils/env.js";
 
 const INSTALLED_ROOT_DIST_JS_FILE_SCAN_LIMIT = 10_000;
+const requiredBundledPluginPackPaths = listBundledPluginPackArtifacts();
 
 describe("parseOpenClawNpmPostpublishVerifyArgs", () => {
   it("keeps trusted release verification independent from target app dependencies", () => {
     const source = readFileSync("scripts/openclaw-npm-postpublish-verify.ts", "utf8");
 
-    expect(source).toContain('from "./lib/error-format.mjs"');
+    expect(source).toContain('from "./lib/error-format.mts"');
     expect(source).not.toContain('from "../src/infra/errors.ts"');
   });
 
@@ -565,6 +568,22 @@ describe("collectInstalledPackageErrors", () => {
     return mkdtempSync(join(tmpdir(), "openclaw-postpublish-package-"));
   }
 
+  function writeExpectedBundledExtensionManifests(
+    packageRoot: string,
+    omittedIds: readonly string[] = [],
+  ): void {
+    const omitted = new Set(omittedIds);
+    for (const relativePath of requiredBundledPluginPackPaths) {
+      const match = /^dist\/extensions\/([^/]+)\/package\.json$/u.exec(relativePath);
+      if (!match || omitted.has(match[1] ?? "")) {
+        continue;
+      }
+      const packageJsonPath = join(packageRoot, relativePath);
+      mkdirSync(dirname(packageJsonPath), { recursive: true });
+      writeFileSync(packageJsonPath, "{}\n", "utf8");
+    }
+  }
+
   it("flags version mismatches", () => {
     const errors = collectInstalledPackageErrors({
       expectedVersion: "2026.3.23-2",
@@ -575,6 +594,156 @@ describe("collectInstalledPackageErrors", () => {
     expect(errors[0]).toBe(
       "installed package version mismatch: expected 2026.3.23-2, found 2026.3.23.",
     );
+  });
+
+  it.each(["ollama", "lmstudio"])(
+    "rejects a missing installed bundled %s provider directory",
+    (providerId) => {
+      const packageRoot = makeInstalledPackageRoot();
+
+      try {
+        writeFileSync(join(packageRoot, "package.json"), '{"version":"2026.3.23"}\n', "utf8");
+        writeExpectedBundledExtensionManifests(packageRoot, [providerId]);
+
+        const missingManifestPath = join(
+          packageRoot,
+          "dist",
+          "extensions",
+          providerId,
+          "package.json",
+        );
+        const expectedError = `installed bundled extension manifest missing: ${missingManifestPath}.`;
+
+        expect(collectInstalledBundledExtensionManifestErrors(packageRoot)).toStrictEqual([
+          expectedError,
+        ]);
+        expect(
+          collectInstalledPackageErrors({
+            expectedVersion: "2026.3.23",
+            installedVersion: "2026.3.23",
+            packageRoot,
+          }),
+        ).toContain(expectedError);
+      } finally {
+        rmSync(packageRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects an installed package without its bundled extension root", () => {
+    const packageRoot = makeInstalledPackageRoot();
+
+    try {
+      const errors = collectInstalledBundledExtensionManifestErrors(packageRoot);
+
+      expect(errors).toEqual(
+        expect.arrayContaining(
+          ["ollama", "lmstudio"].map(
+            (providerId) =>
+              `installed bundled extension manifest missing: ${join(
+                packageRoot,
+                "dist",
+                "extensions",
+                providerId,
+                "package.json",
+              )}.`,
+          ),
+        ),
+      );
+      for (const excludedId of ["acpx", "qa-channel", "qa-lab"]) {
+        expect(errors.some((error) => error.includes(join("extensions", excludedId)))).toBe(false);
+      }
+    } finally {
+      rmSync(packageRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps bundled manifest requirements stable after the build filter changes", () => {
+    const packageRoot = makeInstalledPackageRoot();
+
+    try {
+      const expectedErrors = collectInstalledBundledExtensionManifestErrors(packageRoot);
+      const filteredErrors = withEnv({ OPENCLAW_BUNDLED_PLUGIN_BUILD_IDS: "ollama" }, () =>
+        collectInstalledBundledExtensionManifestErrors(packageRoot),
+      );
+
+      expect(filteredErrors).toStrictEqual(expectedErrors);
+      expect(filteredErrors).toEqual(
+        expect.arrayContaining(
+          ["ollama", "lmstudio"].map(
+            (providerId) =>
+              `installed bundled extension manifest missing: ${join(
+                packageRoot,
+                "dist",
+                "extensions",
+                providerId,
+                "package.json",
+              )}.`,
+          ),
+        ),
+      );
+    } finally {
+      rmSync(packageRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("verifies every bundled manifest when the build filter exists before module initialization", () => {
+    const packageRoot = makeInstalledPackageRoot();
+
+    try {
+      const probe = spawnSync(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          "--eval",
+          [
+            'import { collectInstalledBundledExtensionManifestErrors } from "./scripts/openclaw-npm-postpublish-verify.ts";',
+            `process.stdout.write(JSON.stringify(collectInstalledBundledExtensionManifestErrors(${JSON.stringify(packageRoot)})));`,
+          ].join("\n"),
+        ],
+        {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          env: { ...process.env, OPENCLAW_BUNDLED_PLUGIN_BUILD_IDS: "ollama" },
+          timeout: 30_000,
+        },
+      );
+
+      expect(probe.error).toBeUndefined();
+      expect(probe.status, probe.stderr).toBe(0);
+      expect(JSON.parse(probe.stdout)).toEqual(
+        expect.arrayContaining(
+          ["ollama", "lmstudio"].map(
+            (providerId) =>
+              `installed bundled extension manifest missing: ${join(
+                packageRoot,
+                "dist",
+                "extensions",
+                providerId,
+                "package.json",
+              )}.`,
+          ),
+        ),
+      );
+    } finally {
+      rmSync(packageRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not require excluded external or private plugin package manifests", () => {
+    const packageRoot = makeInstalledPackageRoot();
+
+    try {
+      writeExpectedBundledExtensionManifests(packageRoot);
+      for (const excludedId of ["acpx", "qa-channel", "qa-lab"]) {
+        mkdirSync(join(packageRoot, "dist", "extensions", excludedId), { recursive: true });
+      }
+
+      expect(collectInstalledBundledExtensionManifestErrors(packageRoot)).toStrictEqual([]);
+    } finally {
+      rmSync(packageRoot, { recursive: true, force: true });
+    }
   });
 
   it("requires runtime sidecars for bundled extensions included in the package", () => {
@@ -611,6 +780,7 @@ describe("collectInstalledPackageErrors", () => {
 
     try {
       writeFileSync(join(packageRoot, "package.json"), '{"version":"2026.3.23"}\n', "utf8");
+      writeExpectedBundledExtensionManifests(packageRoot);
       mkdirSync(join(packageRoot, "dist", "extensions", "telegram"), { recursive: true });
       writeFileSync(
         join(packageRoot, "dist", "extensions", "telegram", "package.json"),
@@ -664,7 +834,6 @@ describe("collectInstalledAlwaysAllowedRuntimeFacadeErrors", () => {
       expect(collectInstalledAlwaysAllowedRuntimeFacadeErrors(packageRoot)).toEqual([
         "installed package is missing required facade activation runtime: dist/facade-activation-check.runtime.js",
         "installed package allows bundled runtime facade image-generation-core/runtime-api.js but is missing required runtime sidecar: dist/extensions/image-generation-core/runtime-api.js.",
-        "installed package allows bundled runtime facade media-understanding-core/runtime-api.js but is missing required runtime sidecar: dist/extensions/media-understanding-core/runtime-api.js.",
       ]);
     });
   });
@@ -673,7 +842,6 @@ describe("collectInstalledAlwaysAllowedRuntimeFacadeErrors", () => {
     withInstalledPackageRoot((packageRoot) => {
       writeInstalledFile(packageRoot, "dist/facade-activation-check.runtime.js");
       writeInstalledFile(packageRoot, "dist/extensions/image-generation-core/runtime-api.js");
-      writeInstalledFile(packageRoot, "dist/extensions/media-understanding-core/runtime-api.js");
 
       expect(collectInstalledAlwaysAllowedRuntimeFacadeErrors(packageRoot)).toStrictEqual([]);
     });
@@ -733,77 +901,6 @@ describe("collectInstalledContextEngineRuntimeErrors", () => {
     } finally {
       rmSync(packageRoot, { recursive: true, force: true });
     }
-  });
-});
-
-describe("collectInstalledPluginSdkZodArtifactErrors", () => {
-  function withInstalledPackageRoot(run: (packageRoot: string) => void): void {
-    const packageRoot = mkdtempSync(join(tmpdir(), "openclaw-postpublish-zod-sdk-"));
-    try {
-      run(packageRoot);
-    } finally {
-      rmSync(packageRoot, { recursive: true, force: true });
-    }
-  }
-
-  function writeInstalledFile(packageRoot: string, relativePath: string, contents: string): void {
-    const filePath = join(packageRoot, ...relativePath.split("/"));
-    mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, contents, "utf8");
-  }
-
-  it("requires the plugin-sdk zod artifact", () => {
-    withInstalledPackageRoot((packageRoot) => {
-      expect(collectInstalledPluginSdkZodArtifactErrors(packageRoot)).toEqual([
-        "installed package is missing required plugin SDK artifact: dist/plugin-sdk/zod.js",
-      ]);
-    });
-  });
-
-  it("rejects plugin-sdk zod artifacts with a bare zod export", () => {
-    withInstalledPackageRoot((packageRoot) => {
-      writeInstalledFile(
-        packageRoot,
-        "dist/plugin-sdk/zod.js",
-        'import "../zod-D2c0iocA.js";\nexport * from "zod";\n',
-      );
-
-      expect(collectInstalledPluginSdkZodArtifactErrors(packageRoot)).toEqual([
-        "installed package plugin SDK zod artifact must be self-contained but dist/plugin-sdk/zod.js imports zod.",
-      ]);
-    });
-  });
-
-  it("rejects plugin-sdk zod artifacts when a reachable local chunk imports zod", () => {
-    withInstalledPackageRoot((packageRoot) => {
-      writeInstalledFile(
-        packageRoot,
-        "dist/plugin-sdk/zod.js",
-        'export { z } from "../zod-D2c0iocA.js";\n',
-      );
-      writeInstalledFile(
-        packageRoot,
-        "dist/zod-D2c0iocA.js",
-        'import * as zodCore from "zod/v4/core";\nexport const z = zodCore;\n',
-      );
-
-      expect(collectInstalledPluginSdkZodArtifactErrors(packageRoot)).toEqual([
-        "installed package plugin SDK zod artifact must be self-contained but dist/zod-D2c0iocA.js imports zod/v4/core.",
-      ]);
-    });
-  });
-
-  it("accepts plugin-sdk zod artifacts that only import package-local chunks", () => {
-    withInstalledPackageRoot((packageRoot) => {
-      writeInstalledFile(
-        packageRoot,
-        "dist/plugin-sdk/zod.js",
-        'export { z } from "../zod-D2c0iocA.js";\n',
-      );
-      writeInstalledFile(packageRoot, "dist/zod-D2c0iocA.js", "export const z = {};\n");
-
-      expect(collectInstalledPluginSdkZodArtifactErrors(packageRoot)).toEqual([]);
-    });
   });
 });
 
@@ -1081,7 +1178,7 @@ describe("collectInstalledRootDependencyManifestErrors", () => {
     }
   });
 
-  it("refuses unbounded root dist dependency scans", () => {
+  it("excludes bundled extension modules from root dist dependency scans", () => {
     const packageRoot = makeInstalledPackageRoot();
 
     try {
@@ -1089,10 +1186,16 @@ describe("collectInstalledRootDependencyManifestErrors", () => {
         version: "2026.4.22",
         dependencies: {},
       });
-      writeDistJavaScriptFiles(packageRoot, INSTALLED_ROOT_DIST_JS_FILE_SCAN_LIMIT + 1);
+      mkdirSync(join(packageRoot, "dist", "extensions", "telegram"), { recursive: true });
+      writeFileSync(join(packageRoot, "dist", "root-runtime.js"), 'import "root-only";\n', "utf8");
+      writeFileSync(
+        join(packageRoot, "dist", "extensions", "telegram", "runtime-api.js"),
+        'import "extension-only";\n',
+        "utf8",
+      );
 
       expect(collectInstalledRootDependencyManifestErrors(packageRoot)).toEqual([
-        `installed package root dist contains more than ${INSTALLED_ROOT_DIST_JS_FILE_SCAN_LIMIT} JavaScript files; refusing to scan unbounded package contents.`,
+        "installed package root is missing declared runtime dependency 'root-only' for dist importers: root-runtime.js. Add it to package.json dependencies/optionalDependencies.",
       ]);
     } finally {
       rmSync(packageRoot, { recursive: true, force: true });

@@ -223,6 +223,9 @@ func buildOpenClawChatSwarmGroups(
 
 enum SelfContainedSwarmHelpers {
     static func status(_ row: OpenClawChatSessionEntry) -> OpenClawChatSwarmDotStatus? {
+        if row.status == "queued" {
+            return .queued
+        }
         if row.status == "running" || row.hasActiveRun == true {
             return .running
         }
@@ -295,7 +298,10 @@ extension OpenClawChatViewModel {
     func observeSwarmEvent(_ event: OpenClawChatSessionsChangedEvent) -> Bool {
         guard swarmEnabled,
               SelfContainedSwarmHelpers.eventBelongsToParent(event, matchesParent: { candidate in
-                  self.matchesCurrentSessionKey(incoming: candidate, current: self.sessionKey)
+                  self.matchesCurrentSessionKey(
+                      incoming: candidate,
+                      agentId: event.agentId,
+                      current: self.sessionKey)
               })
         else { return false }
         var nextActivity = swarmActivityState

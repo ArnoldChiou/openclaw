@@ -20,6 +20,7 @@ function prompt(status: QuestionPrompt["status"]): QuestionPrompt {
       },
     ],
     sessionKey: "agent:main:main",
+    runId: "run-question",
     createdAtMs: 1_000,
     expiresAtMs: 60_000,
     status,
@@ -33,11 +34,11 @@ function prompt(status: QuestionPrompt["status"]): QuestionPrompt {
   };
 }
 
-function items(question: QuestionPrompt, runActive: boolean) {
+function items(question: QuestionPrompt, runActive: boolean, messages: unknown[] = []) {
   return buildCachedChatItems({
     paneId: `pane-${question.status}`,
     sessionKey: "agent:main:main",
-    messages: [],
+    messages,
     toolMessages: [],
     streamSegments: [],
     stream: null,
@@ -46,9 +47,6 @@ function items(question: QuestionPrompt, runActive: boolean) {
     showToolCalls: true,
     runWorking: runActive,
     runActive,
-    planStatus: runActive
-      ? { steps: [{ step: "Wait for the answer", status: "in_progress" }] }
-      : null,
     questionPrompts: [question],
   });
 }
@@ -63,7 +61,6 @@ describe("question chat items", () => {
     expect(run?.kind).toBe("stream-run");
     expect(run?.kind === "stream-run" ? run.parts.map((part) => part.kind) : []).toEqual([
       "reading-indicator",
-      "plan",
     ]);
   });
 
@@ -71,6 +68,26 @@ describe("question chat items", () => {
     const result = coalesceStreamRuns(items(prompt("expired"), false));
 
     expect(result).toMatchObject([{ kind: "question", questionId: "question-1" }]);
+  });
+
+  it("keeps a terminal question between the surrounding transcript turns", () => {
+    const result = items(prompt("answered"), false, [
+      {
+        role: "user",
+        content: "First prompt",
+        timestamp: 900,
+        __openclaw: { idempotencyKey: "run-question:user" },
+      },
+      { role: "assistant", content: "First reply", timestamp: 1_300 },
+      { role: "user", content: "Next prompt", timestamp: 2_000 },
+    ]);
+
+    expect(result.map((item) => (item.kind === "group" ? item.role : item.kind))).toEqual([
+      "user",
+      "question",
+      "assistant",
+      "user",
+    ]);
   });
 
   it("renders answered and skipped prompts as compact summary lines", () => {

@@ -8,19 +8,20 @@ import {
   validateNodePairRemoveParams,
   validateNodeRenameParams,
 } from "../../../packages/gateway-protocol/src/index.js";
-import {
-  getPairedDevice,
-  listApprovedPairedDeviceRoles,
-  removePairedDeviceRole,
-} from "../../infra/device-pairing.js";
-import { captureNodePairingState } from "../../infra/node-pairing-state.js";
+import { captureNodePairingState } from "../../infra/device-pairing-node-state.js";
 import {
   approveNodePairing,
   getPendingNodePairing,
   listNodePairing,
   rejectNodePairing,
   renamePairedNode,
-} from "../../infra/node-pairing.js";
+} from "../../infra/device-pairing-node.js";
+import {
+  getPairedDevice,
+  listApprovedPairedDeviceRoles,
+  removePairedDeviceRole,
+} from "../../infra/device-pairing.js";
+import { reconcileRevokedDeviceWorker } from "../device-worker-revocation.js";
 import {
   resolveNodePairingCommandAllowlist,
   normalizeDeclaredNodeCommands,
@@ -143,7 +144,11 @@ async function removePairedDeviceBackedNode(params: {
   client: GatewayClient | null;
   context: Pick<
     GatewayRequestContext,
-    "disconnectClientsForDevice" | "invalidateClientsForDevice" | "logGateway"
+    | "disconnectClientsForDevice"
+    | "invalidateClientsForDevice"
+    | "logGateway"
+    | "workerEnvironmentService"
+    | "workerPlacementDispatchService"
   >;
 }): Promise<
   | {
@@ -208,6 +213,7 @@ async function removePairedDeviceBackedNode(params: {
     role: "node",
     reason: "device-pair-removed",
   });
+  await reconcileRevokedDeviceWorker(params.context, removed.deviceId);
   return {
     status: "removed",
     nodeId: removed.deviceId,
@@ -299,9 +305,9 @@ export const nodePairingHandlers: GatewayRequestHandlers = {
       // already admitted under the prior command surface before it can send.
       invalidateNodeWakeState(approvedNode.nodeId);
       const cfg = context.getRuntimeConfig();
-      // Pairing allowlist, matching connect-time reconciliation: approved
-      // dangerous surfaces (e.g. computer.act) stay on the live session so a
-      // later arming works without a reconnect; invoke policy still gates use.
+      // Pairing allowlist matches connect-time reconciliation: approved
+      // dangerous surfaces stay live so persistent enablement does not require
+      // another reconnect; invoke policy still gates use.
       const currentAllowlist = resolveNodePairingCommandAllowlist(cfg, {
         platform: approvedNode.platform,
         deviceFamily: approvedNode.deviceFamily,

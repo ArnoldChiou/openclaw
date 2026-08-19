@@ -136,7 +136,9 @@ export async function runClawsUpdateCommand(
     source = recorded.kind === "package" ? recorded.packageRoot : recorded.manifestPath;
   }
 
-  const loaded = await readClawManifestFile(source);
+  const loaded = await readClawManifestFile(source, {
+    allowLegacyDynamicToolProfile: !opts.from,
+  });
   if (!loaded.ok) {
     const diagnostics = opts.from
       ? loaded.diagnostics
@@ -169,6 +171,7 @@ export async function runClawsUpdateCommand(
   const plan = await buildClawUpdatePlan({
     agentId: target,
     targetManifest: loaded.manifest,
+    targetClawMarkdownBody: loaded.clawMarkdownBody,
     targetOpenClawProfile: loaded.openClawProfile,
     targetSource: loaded.source,
     config,
@@ -198,6 +201,7 @@ export async function runClawsUpdateCommand(
       plan,
       {
         targetManifest: loaded.manifest,
+        targetClawMarkdownBody: loaded.clawMarkdownBody,
         targetOpenClawProfile: loaded.openClawProfile,
         targetSource: loaded.source,
       },
@@ -206,6 +210,7 @@ export async function runClawsUpdateCommand(
         sourceMcpServers: listedMcpServers.mcpServers,
         consentPlanIntegrity: opts.planIntegrity,
         packagePreflight: preflightClawPackage,
+        runtime: opts.json ? { ...runtime, log: () => undefined } : runtime,
         cronGateway: {
           add: async (input) => await callGatewayFromCli("cron.add", {}, input),
           get: async (id) => await callGatewayFromCli("cron.get", {}, { id }),

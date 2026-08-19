@@ -115,7 +115,6 @@ export const AgentDefaultsSchema = z
       .strict()
       .optional(),
     contextLimits: AgentContextLimitsSchema,
-    contextTokens: z.number().int().positive().optional(),
     contextPruning: z
       .object({
         mode: z.union([z.literal("off"), z.literal("cache-ttl")]).optional(),
@@ -139,6 +138,7 @@ export const AgentDefaultsSchema = z
       .optional(),
     compaction: z
       .object({
+        enabled: z.boolean().optional(),
         mode: z.union([z.literal("default"), z.literal("safeguard")]).optional(),
         provider: z.string().optional(),
         thinkingLevel: AgentThinkingLevelSchema.optional(),
@@ -171,7 +171,6 @@ export const AgentDefaultsSchema = z
           })
           .strict()
           .optional(),
-        truncateAfterCompaction: z.boolean().optional(),
         maxActiveTranscriptBytes: NonNegativeByteSizeSchema.optional(),
         notifyUser: z.boolean().optional(),
       })
@@ -202,6 +201,18 @@ export const AgentDefaultsSchema = z
       .safeExtend({ agentId: z.string().trim().min(1).optional() })
       .optional(),
     systemAgent: z
+      .object({
+        agentId: z.string().trim().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    authInheritance: z
+      .object({
+        agentId: z.string().trim().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    sessionStore: z
       .object({
         agentId: z.string().trim().min(1).optional(),
       })

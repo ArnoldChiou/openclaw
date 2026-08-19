@@ -1,7 +1,6 @@
 // Setup gateway config tests cover gateway prompt choices and config output.
 import { describe, expect, it, vi } from "vitest";
 import { createWizardPrompter as buildWizardPrompter } from "../../test/helpers/wizard-prompter.js";
-import { DEFAULT_DANGEROUS_NODE_COMMANDS } from "../gateway/node-command-policy.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { withSecureTestNodeExecPath } from "../secrets/test-node-command.test-support.js";
 import type { WizardPrompter, WizardSelectParams } from "./prompts.js";
@@ -42,7 +41,8 @@ describe("configureGatewayForSetup", () => {
     return buildWizardPrompter({
       select,
       text: vi.fn(async (paramsLocal) => {
-        const value = textQueue.shift() as string;
+        const hasQueuedValue = textQueue.length > 0;
+        const value = hasQueuedValue ? textQueue.shift() : paramsLocal.initialValue;
         const error = typeof value === "string" ? paramsLocal.validate?.(value) : undefined;
         if (error) {
           throw new Error(error);
@@ -70,7 +70,6 @@ describe("configureGatewayForSetup", () => {
       token: undefined,
       password: undefined,
       customBindHost: undefined,
-      tailscaleResetOnExit: false,
     };
   }
 
@@ -104,11 +103,57 @@ describe("configureGatewayForSetup", () => {
     const result = await runGatewayConfig();
 
     expect(result.settings.gatewayToken).toBe("generated-token");
-    expect(result.nextConfig.gateway?.nodes?.commands?.deny).toEqual(
-      DEFAULT_DANGEROUS_NODE_COMMANDS,
+    expect(result.nextConfig.gateway?.nodes?.commands).toBeUndefined();
+  });
+
+  it("seeds advanced gateway prompts from explicit classic options", async () => {
+    const gatewayDefaults = resolveQuickstartGatewayDefaults(
+      {},
+      {
+        gatewayPort: 19511,
+        gatewayBind: "lan",
+        gatewayAuth: "password",
+        gatewayPassword: "manual-gateway-password-placeholder",
+        tailscale: "off",
+      },
     );
-    expect(result.nextConfig.gateway?.nodes?.commands?.deny).not.toContain("screen.snapshot");
-    expect(result.nextConfig.gateway?.nodes?.commands?.deny).toContain("screen.record");
+    const select = vi.fn(async (params: WizardSelectParams<unknown>) => {
+      return params.initialValue ?? params.options[0]?.value;
+    }) as unknown as WizardPrompter["select"];
+    const text = vi.fn(async (params: { initialValue?: string }) => params.initialValue ?? "");
+    const confirm = vi.fn(
+      async (params: { initialValue?: boolean }) => params.initialValue ?? false,
+    );
+    const prompter = buildWizardPrompter({ select, text, confirm });
+
+    const result = await configureGatewayForSetup({
+      flow: "advanced",
+      baseConfig: {},
+      nextConfig: {},
+      localPort: gatewayDefaults.port,
+      quickstartGateway: gatewayDefaults,
+      prompter,
+      runtime: createRuntime(),
+    });
+
+    expect(text).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "Gateway port", initialValue: "19511" }),
+    );
+    expect(select).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "Gateway bind address", initialValue: "lan" }),
+    );
+    expect(select).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "Gateway access protection", initialValue: "password" }),
+    );
+    expect(select).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "Tailscale exposure", initialValue: "off" }),
+    );
+    expect(result.nextConfig.gateway).toMatchObject({
+      port: 19511,
+      bind: "lan",
+      auth: { mode: "password", password: "manual-gateway-password-placeholder" },
+      tailscale: { mode: "off" },
+    });
   });
 
   it.each(["1e3", "0x1000"])("rejects loose gateway port input: %s", async (port) => {
@@ -174,7 +219,6 @@ describe("configureGatewayForSetup", () => {
           token: undefined,
           password: undefined,
           customBindHost: undefined,
-          tailscaleResetOnExit: false,
         },
         prompter,
         runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
@@ -379,6 +423,42 @@ describe("configureGatewayForSetup", () => {
     }
   });
 
+  it("seeds an explicit env token ref into advanced gateway setup", async () => {
+    const previous = process.env.OPENCLAW_GATEWAY_TOKEN;
+    process.env.OPENCLAW_GATEWAY_TOKEN = "token-from-env-ref";
+    try {
+      const gatewayDefaults = resolveQuickstartGatewayDefaults(
+        {},
+        { gatewayPort: 19511, gatewayTokenRefEnv: "OPENCLAW_GATEWAY_TOKEN" },
+      );
+      const result = await configureGatewayForSetup({
+        flow: "advanced",
+        baseConfig: {},
+        nextConfig: {},
+        localPort: gatewayDefaults.port,
+        quickstartGateway: gatewayDefaults,
+        prompter: createPrompter({ selectQueue: [], textQueue: [] }),
+        runtime: createRuntime(),
+      });
+
+      expect(result.nextConfig.gateway?.auth).toEqual({
+        mode: "token",
+        token: {
+          source: "env",
+          provider: "default",
+          id: "OPENCLAW_GATEWAY_TOKEN",
+        },
+      });
+      expect(result.settings.gatewayToken).toBe("token-from-env-ref");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.OPENCLAW_GATEWAY_TOKEN;
+      } else {
+        process.env.OPENCLAW_GATEWAY_TOKEN = previous;
+      }
+    }
+  });
+
   it("persists classic quickstart overrides through gateway safety normalization", async () => {
     const password = ["classic", "gateway", "placeholder"].join("-");
     mocks.getTailnetHostname.mockResolvedValue("test-tailnet.ts.net");
@@ -393,7 +473,6 @@ describe("configureGatewayForSetup", () => {
         gatewayToken: "unused-token",
         gatewayPassword: password,
         tailscale: "funnel",
-        tailscaleResetOnExit: true,
       },
     );
 
@@ -411,7 +490,7 @@ describe("configureGatewayForSetup", () => {
       port: 19001,
       bind: "loopback",
       auth: { mode: "password", password },
-      tailscale: { mode: "funnel", resetOnExit: true },
+      tailscale: { mode: "funnel" },
     });
     expect(result.nextConfig.gateway?.auth?.token).toBeUndefined();
     expect(JSON.stringify(note.mock.calls)).not.toContain(password);

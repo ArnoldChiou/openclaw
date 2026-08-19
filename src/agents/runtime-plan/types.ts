@@ -4,6 +4,7 @@
  * observability decisions shared across embedded-agent hot paths.
  */
 import type { TSchema } from "typebox";
+import type { MessagePresentationAction } from "../../interactive/payload.js";
 import type {
   ModelApi,
   ProviderModelRouteRuntimePolicy,
@@ -13,7 +14,7 @@ import type { AuthProfileStore } from "../auth-profiles/types.js";
 import type { AgentTool } from "../runtime/index.js";
 
 /** Runtime transport selected for one model attempt. */
-export type AgentRuntimeTransport = "sse" | "websocket" | "auto";
+export type AgentRuntimeTransport = "sse" | "websocket" | "websocket-cached" | "auto";
 
 /** Thinking levels accepted by runtime-plan extra-param preparation. */
 type AgentRuntimeThinkLevel =
@@ -49,9 +50,6 @@ type AgentRuntimeFailoverReason =
   | "no_error_details"
   | "unclassified"
   | "unknown";
-
-/** Provider/runtime config object passed through plugin boundaries. */
-type AgentRuntimeConfig = unknown;
 
 /** Provider model descriptor consumed by runtime-plan hooks. */
 type AgentRuntimeModel = {
@@ -90,11 +88,10 @@ type AgentRuntimeTextTransforms = {
 type AgentRuntimeProviderHandle = {
   provider: string;
   modelId?: string | null;
-  config?: AgentRuntimeConfig;
+  config?: unknown;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
   applyAutoEnable?: boolean;
-  bundledProviderVitestCompat?: boolean;
 };
 
 type PreparedAgentRuntimeProviderHandle = AgentRuntimeProviderHandle & {
@@ -104,47 +101,12 @@ type PreparedAgentRuntimeProviderHandle = AgentRuntimeProviderHandle & {
 
 type AgentRuntimeInteractiveButtonStyle = "primary" | "secondary" | "success" | "danger";
 
-type AgentRuntimeMessagePresentationAction =
-  | {
-      type: "command";
-      command: string;
-    }
-  | {
-      type: "callback";
-      value: string;
-    }
-  | {
-      type: "approval";
-      approvalId: string;
-      approvalKind: "exec" | "plugin";
-      decision: "allow-once" | "allow-always" | "deny";
-    }
-  | {
-      type: "question";
-      questionId: string;
-      optionValue: string;
-    }
-  | {
-      type: "url";
-      url: string;
-    }
-  | {
-      type: "web-app";
-      url: string;
-      widgetId?: string;
-    }
-  | {
-      type: "web-app";
-      url?: string;
-      widgetId: string;
-    };
-
 /** Portable action control exposed to agent runtime reply payloads. */
 type AgentRuntimeMessagePresentationButton = {
   /** User-visible button label. */
   label: string;
   /** Typed action sent when pressed. */
-  action?: AgentRuntimeMessagePresentationAction;
+  action?: MessagePresentationAction;
   /** @deprecated Use action. */
   value?: string;
   /** @deprecated Use an action with type "url". */
@@ -166,7 +128,7 @@ type AgentRuntimeMessagePresentationOption = {
   /** User-visible option label. */
   label: string;
   /** Typed action sent when selected. */
-  action?: Extract<AgentRuntimeMessagePresentationAction, { type: "command" | "callback" }>;
+  action?: Extract<MessagePresentationAction, { type: "command" | "callback" | "model-picker" }>;
   /** @deprecated Use action. */
   value?: string;
 };
@@ -277,6 +239,20 @@ type AgentRuntimeReplyPayload = {
   };
   mediaUrl?: string;
   mediaUrls?: string[];
+  attachments?: Array<{
+    type?: "image" | "audio" | "video" | "file";
+    path?: string;
+    url?: string;
+    mediaUrl?: string;
+    filePath?: string;
+    mimeType?: string;
+    name?: string;
+    sizeBytes?: number;
+    durationMs?: number;
+    width?: number;
+    height?: number;
+    trustedLocalMedia?: boolean;
+  }>;
   trustedLocalMedia?: boolean;
   sensitiveMedia?: boolean;
   presentation?: AgentRuntimeMessagePresentation;
@@ -323,7 +299,7 @@ type AgentRuntimeSystemPromptContribution = {
 
 /** Context passed when resolving provider system prompt contributions. */
 type AgentRuntimeSystemPromptContributionContext = {
-  config?: AgentRuntimeConfig;
+  config?: unknown;
   agentDir?: string;
   workspaceDir?: string;
   provider: string;
@@ -458,7 +434,6 @@ type AgentRuntimePreparedMetadataSnapshot = object;
 /** Prepared metadata loader used by tool planning without eager manifest reads. */
 type PreparedOpenClawToolPlanning = {
   metadataSnapshot?: AgentRuntimePreparedMetadataSnapshot;
-  loadMetadataSnapshot?: () => AgentRuntimePreparedMetadataSnapshot;
 };
 
 /** Tool normalization and diagnostics hooks for one runtime attempt. */
@@ -548,7 +523,7 @@ export type AgentRuntimePlan = {
 
 /** Inputs needed to build delivery-only runtime decisions. */
 export type BuildAgentRuntimeDeliveryPlanParams = {
-  config?: AgentRuntimeConfig;
+  config?: unknown;
   workspaceDir?: string;
   agentDir?: string;
   provider: string;
@@ -558,7 +533,7 @@ export type BuildAgentRuntimeDeliveryPlanParams = {
 
 /** Inputs needed to build the full prepared runtime plan. */
 export type BuildAgentRuntimePlanParams = {
-  config?: AgentRuntimeConfig;
+  config?: unknown;
   workspaceDir?: string;
   agentDir?: string;
   provider: string;

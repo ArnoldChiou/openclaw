@@ -1,5 +1,6 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { shouldRouteCompletionThroughRequesterSession } from "../auto-reply/reply/completion-delivery-policy.js";
+import { channelSupportsThreadDelivery } from "../channels/thread-addressing.js";
 import { requestHeartbeat } from "../infra/heartbeat-wake.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import {
@@ -30,7 +31,7 @@ import {
   ensureTaskRegistryReady,
   getPeerTasksForDelivery,
   loadTaskRegistryDeliveryRuntime,
-  log,
+  taskRegistryLog,
   pickPreferredRunIdTask,
   taskDeliveryStates,
   tasks,
@@ -117,21 +118,23 @@ function canDeliverToRequesterOrigin(origin: TaskDeliveryState["requesterOrigin"
   return Boolean(channel && to && isDeliverableMessageChannel(channel));
 }
 
-function canDeliverParentReviewTaskToBoundDiscordThread(task: TaskRecord): boolean {
+function canDeliverParentReviewTaskToThreadOrigin(task: TaskRecord): boolean {
   if (!shouldUseParentReviewTaskTerminalMessage(task)) {
     return false;
   }
   const owner = resolveTaskDeliveryOwner(task);
   const origin = owner.requesterOrigin;
-  const channel = origin?.channel?.trim().toLowerCase();
-  const to = origin?.to?.trim().toLowerCase();
   const threadId = String(origin?.threadId ?? "").trim();
-  // This is a narrow transport exception for explicitly bound Discord threads,
-  // not a general parent-review direct-delivery relaxation.
+  // Parent-review terminal messages may deliver directly only when the requester origin
+  // already names a concrete thread on a transport that declares thread-addressed
+  // delivery; root-level origins keep routing through the parent session.
+  // Deliberately no target-shape parsing here: threadId provenance is the channel's own
+  // route/binding projection, so core trusts the tuple. A stray threadId on a non-thread
+  // target degrades to delivery at that origin's root, and send failures fall back to the
+  // parent-session queue below — the handoff cannot be lost.
   return Boolean(
-    channel === "discord" &&
-    to?.startsWith("channel:") &&
     threadId &&
+    channelSupportsThreadDelivery(origin?.channel) &&
     canDeliverToRequesterOrigin(origin),
   );
 }
@@ -267,7 +270,7 @@ async function maybeDeliverTaskTerminalUpdateUnderAdmission(
       });
     }
     const shouldRouteParentReview = shouldUseParentReviewTaskTerminalMessage(latest);
-    const shouldDeliverParentReviewDirect = canDeliverParentReviewTaskToBoundDiscordThread(latest);
+    const shouldDeliverParentReviewDirect = canDeliverParentReviewTaskToThreadOrigin(latest);
     const canDeliverDirect =
       canDeliverTaskToRequesterOrigin(latest) || shouldDeliverParentReviewDirect;
     const directEventText = formatTaskTerminalMessage(latest);
@@ -287,7 +290,7 @@ async function maybeDeliverTaskTerminalUpdateUnderAdmission(
           lastEventAt: Date.now(),
         });
       } catch (error) {
-        log.warn("Failed to queue background task session delivery", {
+        taskRegistryLog.warn("Failed to queue background task session delivery", {
           taskId,
           ownerKey: latest.ownerKey,
           error,
@@ -306,7 +309,7 @@ async function maybeDeliverTaskTerminalUpdateUnderAdmission(
       }
       const requesterAgentId = parseAgentSessionKey(ownerSessionKey)?.agentId;
       const idempotencyKey = resolveTaskTerminalIdempotencyKey(latest);
-      await sendMessage({
+      const sendResult = await sendMessage({
         channel: owner.requesterOrigin?.channel,
         to: owner.requesterOrigin?.to ?? "",
         accountId: owner.requesterOrigin?.accountId,
@@ -324,6 +327,23 @@ async function maybeDeliverTaskTerminalUpdateUnderAdmission(
       if (!afterSend || !shouldAutoDeliverTaskTerminalUpdate(afterSend)) {
         return afterSend ? cloneTaskRecord(afterSend) : null;
       }
+      if (sendResult.deliveryStatus === "suppressed") {
+        if (sendResult.suppressionReason === "adapter_returned_no_identity") {
+          taskRegistryLog.warn("Background task update delivery was not confirmed", {
+            taskId,
+            ownerKey: ownerSessionKey,
+            requesterOrigin: owner.requesterOrigin,
+            suppressionReason: sendResult.suppressionReason,
+          });
+          return updateTask(taskId, {
+            deliveryStatus: "failed",
+            lastEventAt: Date.now(),
+          });
+        }
+        throw new Error(
+          `background task update suppressed: ${sendResult.suppressionReason ?? "unknown reason"}`,
+        );
+      }
       if (afterSend.terminalOutcome === "blocked") {
         queueBlockedTaskFollowup(afterSend);
       }
@@ -332,7 +352,7 @@ async function maybeDeliverTaskTerminalUpdateUnderAdmission(
         lastEventAt: Date.now(),
       });
     } catch (error) {
-      log.warn("Failed to deliver background task update", {
+      taskRegistryLog.warn("Failed to deliver background task update", {
         taskId,
         ownerKey: ownerSessionKey,
         requesterOrigin: owner.requesterOrigin,
@@ -348,7 +368,7 @@ async function maybeDeliverTaskTerminalUpdateUnderAdmission(
           queueBlockedTaskFollowup(beforeFallback);
         }
       } catch (fallbackError) {
-        log.warn("Failed to queue background task fallback event", {
+        taskRegistryLog.warn("Failed to queue background task fallback event", {
           taskId,
           ownerKey: latest.ownerKey,
           error: fallbackError,
@@ -417,7 +437,7 @@ async function maybeDeliverTaskStateChangeUpdateUnderAdmission(
       latestEvent,
       owner,
     });
-    await sendMessage({
+    const sendResult = await sendMessage({
       channel: owner.requesterOrigin?.channel,
       to: owner.requesterOrigin?.to ?? "",
       accountId: owner.requesterOrigin?.accountId,
@@ -431,6 +451,19 @@ async function maybeDeliverTaskStateChangeUpdateUnderAdmission(
         idempotencyKey,
       },
     });
+    if (sendResult.deliveryStatus === "suppressed") {
+      if (sendResult.suppressionReason !== "adapter_returned_no_identity") {
+        throw new Error(
+          `background task state change suppressed: ${sendResult.suppressionReason ?? "unknown reason"}`,
+        );
+      }
+      taskRegistryLog.warn("Background task state change delivery was not confirmed", {
+        taskId,
+        ownerKey: current.ownerKey,
+        requesterOrigin: owner.requesterOrigin,
+        suppressionReason: sendResult.suppressionReason,
+      });
+    }
     upsertTaskDeliveryState({
       taskId,
       requesterOrigin: deliveryState?.requesterOrigin,
@@ -440,7 +473,7 @@ async function maybeDeliverTaskStateChangeUpdateUnderAdmission(
       lastEventAt: Date.now(),
     });
   } catch (error) {
-    log.warn("Failed to deliver background task state change", {
+    taskRegistryLog.warn("Failed to deliver background task state change", {
       taskId,
       ownerKey: current.ownerKey,
       error,

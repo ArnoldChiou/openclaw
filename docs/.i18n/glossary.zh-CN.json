@@ -180,6 +180,10 @@
     "target": "会话"
   },
   {
+    "source": "Session permission modes",
+    "target": "会话权限模式"
+  },
+  {
     "source": "Pi",
     "target": "Pi"
   },
@@ -386,6 +390,10 @@
   {
     "source": "WeChat",
     "target": "微信"
+  },
+  {
+    "source": "WeCom",
+    "target": "企业微信"
   },
   {
     "source": "Weixin",
@@ -670,6 +678,10 @@
   {
     "source": "Memory overview",
     "target": "记忆概览"
+  },
+  {
+    "source": "QMD memory backend removal",
+    "target": "QMD 记忆后端移除"
   },
   {
     "source": "Active memory",
@@ -1448,6 +1460,34 @@
     "target": "媒体理解"
   },
   {
+    "source": "Media playback",
+    "target": "媒体播放"
+  },
+  {
+    "source": "Image and media support",
+    "target": "图像和媒体支持"
+  },
+  {
+    "source": "Audio and voice notes",
+    "target": "音频和语音消息"
+  },
+  {
+    "source": "Media overview",
+    "target": "媒体概览"
+  },
+  {
+    "source": "Text to speech",
+    "target": "文本转语音"
+  },
+  {
+    "source": "Linux app",
+    "target": "Linux 应用"
+  },
+  {
+    "source": "Inline audio and video playback",
+    "target": "内联音频和视频播放"
+  },
+  {
     "source": "Models CLI reference",
     "target": "模型 CLI 参考"
   },
@@ -1526,6 +1566,10 @@
   {
     "source": "Troubleshooting",
     "target": "故障排查"
+  },
+  {
+    "source": "Update troubleshooting",
+    "target": "更新故障排查"
   },
   {
     "source": "Webhooks",
@@ -1636,6 +1680,26 @@
     "target": "Baseten（Inkling + Model APIs）"
   },
   {
+    "source": "ChromeOS",
+    "target": "ChromeOS"
+  },
+  {
+    "source": "ChromeOS (Crostini)",
+    "target": "ChromeOS (Crostini)"
+  },
+  {
+    "source": "Linux guide",
+    "target": "Linux 指南"
+  },
+  {
+    "source": "Node install guidance",
+    "target": "Node 安装指南"
+  },
+  {
+    "source": "Gateway runbook",
+    "target": "Gateway 运行手册"
+  },
+  {
     "source": "Multi-user mode",
     "target": "多用户模式"
   },
@@ -1646,6 +1710,10 @@
   {
     "source": "Session management",
     "target": "会话管理"
+  },
+  {
+    "source": "Session tools",
+    "target": "会话工具"
   },
   {
     "source": "Presence",
@@ -1662,5 +1730,37 @@
   {
     "source": "Cron CLI",
     "target": "Cron CLI"
+  },
+  {
+    "source": "TOOLS.md retired",
+    "target": "TOOLS.md 已弃用"
+  },
+  {
+    "source": "Automations",
+    "target": "自动化"
+  },
+  {
+    "source": "Automations (cron)",
+    "target": "自动化 (cron)"
+  },
+  {
+    "source": "Daytona",
+    "target": "Daytona"
+  },
+  {
+    "source": "Gateway remote access",
+    "target": "Gateway 远程访问"
+  },
+  {
+    "source": "Updating OpenClaw",
+    "target": "更新 OpenClaw"
+  },
+  {
+    "source": "Connect a machine",
+    "target": "连接机器"
+  },
+  {
+    "source": "Portals",
+    "target": "门户"
   }
 ]

@@ -2,8 +2,12 @@ import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { SessionCatalogSession } from "openclaw/plugin-sdk/session-catalog";
-import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  isRecord,
+  normalizeBoundedOptionalString as readBoundedString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { piAcpSessionStoreRoot, piSessionStore } from "./pi-session-paths.js";
+import { parsePiSessionTimestampMs } from "./pi-session-timestamp.js";
 
 const MAX_DISCOVERY_FILES = 10_000;
 const SUMMARY_SCAN_BATCH_SIZE = 100;
@@ -12,6 +16,8 @@ const MAX_SESSION_BYTES = 32 * 1024 * 1024;
 const MAX_SUMMARY_LINE_BYTES = 1024 * 1024;
 const APPEND_PROOF_EDGE_BYTES = 64 * 1024;
 const IO_CONCURRENCY = 8;
+const PI_FILE_CANDIDATE_CACHE_TTL_MS = 32_000;
+const PI_FILE_CANDIDATE_CACHE_MAX_ENTRIES = 8;
 const SESSION_ID_PATTERN = /^(?!-)[A-Za-z0-9._:-]{1,256}$/u;
 
 type PiSessionSummary = SessionCatalogSession & { file: string; version: number };
@@ -40,10 +46,19 @@ type CachedSummary = PiFileCandidate & {
   appendProof: { head: Buffer; tail: Buffer };
 };
 
+type PiFileCandidateCacheEntry = {
+  expiresAt: number;
+  candidates: Promise<PiFileCandidate[]>;
+};
+
 // Pi owns session-file mutation. The bounded cache resumes append-only metadata
 // scans, avoiding a full reread every time an active transcript grows.
 const summaryCache = new Map<string, CachedSummary>();
 const threadFileCache = new Map<string, string>();
+// Candidate snapshots are valid for one session-root/ACP-root identity for 32s, just beyond stable
+// polling. Root changes or expiry re-walk; rejected scans are removed so transient I/O recovers.
+// Keeping this bounded avoids rescanning every file each poll without retaining obsolete stores.
+const piFileCandidateCache = new Map<string, PiFileCandidateCacheEntry>();
 
 function threadCacheKey(storeRoot: string, threadId: string): string {
   return `${storeRoot}\0${threadId}`;
@@ -71,14 +86,6 @@ function cacheSummary(file: string, value: CachedSummary): void {
     }
     forgetCachedSummary(oldest);
   }
-}
-
-function optionalString(value: unknown, maxLength: number): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed && trimmed.length <= maxLength ? trimmed : undefined;
 }
 
 async function discoverPiSessionFiles(
@@ -151,7 +158,7 @@ async function mapConcurrent<T, R>(
   return results;
 }
 
-async function piFileCandidates(env: NodeJS.ProcessEnv): Promise<PiFileCandidate[]> {
+async function scanPiFileCandidates(env: NodeJS.ProcessEnv): Promise<PiFileCandidate[]> {
   const { root, files } = await discoverPiSessionFiles(env);
   const configuredAcpRoot = piAcpSessionStoreRoot(env);
   const acpRoot = configuredAcpRoot ? await realpathOrResolve(configuredAcpRoot) : undefined;
@@ -175,6 +182,38 @@ async function piFileCandidates(env: NodeJS.ProcessEnv): Promise<PiFileCandidate
   return candidates
     .filter((candidate): candidate is PiFileCandidate => candidate !== undefined)
     .toSorted((left, right) => right.mtimeMs - left.mtimeMs);
+}
+
+async function piFileCandidates(env: NodeJS.ProcessEnv): Promise<PiFileCandidate[]> {
+  const store = piSessionStore(env);
+  const key = `${store.root}\0${store.flat}\0${piAcpSessionStoreRoot(env) ?? ""}`;
+  const cached = piFileCandidateCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    piFileCandidateCache.delete(key);
+    piFileCandidateCache.set(key, cached);
+    return await cached.candidates;
+  }
+  if (cached) {
+    piFileCandidateCache.delete(key);
+  }
+  const candidates = scanPiFileCandidates(env);
+  const entry = { expiresAt: Date.now() + PI_FILE_CANDIDATE_CACHE_TTL_MS, candidates };
+  piFileCandidateCache.set(key, entry);
+  while (piFileCandidateCache.size > PI_FILE_CANDIDATE_CACHE_MAX_ENTRIES) {
+    const oldest = piFileCandidateCache.keys().next();
+    if (oldest.done) {
+      break;
+    }
+    piFileCandidateCache.delete(oldest.value);
+  }
+  try {
+    return await candidates;
+  } catch (error) {
+    if (piFileCandidateCache.get(key) === entry) {
+      piFileCandidateCache.delete(key);
+    }
+    throw error;
+  }
 }
 
 function pathIsWithin(root: string, candidate: string): boolean {
@@ -215,17 +254,6 @@ function textFromContent(content: unknown): string {
     .join("\n");
 }
 
-function timestampMs(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === "string") {
-    const parsed = Date.parse(value);
-    return Number.isNaN(parsed) ? undefined : parsed;
-  }
-  return undefined;
-}
-
 function processSummaryLine(state: PiSummaryScanState, line: Buffer): void {
   const content = line.at(-1) === 0x0d ? line.subarray(0, -1) : line;
   const entry = parsePiJsonLines(content.toString("utf8"))[0];
@@ -242,14 +270,14 @@ function processSummaryLine(state: PiSummaryScanState, line: Buffer): void {
   }
   if (entry.type === "session_info") {
     // Latest metadata wins, including an explicit empty-name clear.
-    state.name = optionalString(entry.name, 1_000);
+    state.name = readBoundedString(entry.name, 1_000);
   } else if (
     !state.firstMessage &&
     entry.type === "message" &&
     isRecord(entry.message) &&
     entry.message.role === "user"
   ) {
-    state.firstMessage = optionalString(textFromContent(entry.message.content), 1_000);
+    state.firstMessage = readBoundedString(textFromContent(entry.message.content), 1_000);
   }
 }
 
@@ -376,10 +404,10 @@ async function readPiSessionSummary(
     const { header, name, firstMessage } = projectedState;
     const version =
       header?.type === "session" && typeof header.version === "number" ? header.version : 1;
-    const threadId = header?.type === "session" ? optionalString(header.id, 256) : undefined;
+    const threadId = header?.type === "session" ? readBoundedString(header.id, 256) : undefined;
     if (header && threadId && SESSION_ID_PATTERN.test(threadId)) {
-      const cwd = optionalString(header.cwd, 4_096);
-      const createdAt = timestampMs(header.timestamp);
+      const cwd = readBoundedString(header.cwd, 4_096);
+      const createdAt = parsePiSessionTimestampMs(header.timestamp);
       summary = {
         file: candidate.file,
         version,

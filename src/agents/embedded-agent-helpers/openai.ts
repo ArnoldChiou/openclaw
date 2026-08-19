@@ -1,7 +1,9 @@
 /**
  * Normalizes OpenAI Responses reasoning/tool-call history for safe replay.
  */
-import { sha256HexPrefix } from "../../infra/crypto-digest.js";
+import { replaceCompactionReplayOwnerContent } from "@openclaw/ai/transports";
+import { parseDateFirstTimestampMs } from "@openclaw/normalization-core/number-coercion";
+import { sha256HexPrefixCore } from "../../infra/crypto-digest.js";
 import type { AgentMessage } from "../runtime/index.js";
 
 type OpenAIThinkingBlock = {
@@ -21,7 +23,7 @@ type OpenAIReasoningSignature = {
 };
 
 type DowngradeOpenAIReasoningBlocksOptions = {
-  dropReplayableReasoning?: boolean;
+  dropReplayableReasoningBefore?: number;
 };
 
 const OPENAI_RESPONSES_ID_MAX_LENGTH = 64;
@@ -60,6 +62,10 @@ function parseOpenAIReasoningSignature(value: unknown): OpenAIReasoningSignature
   return null;
 }
 
+function parseTimestampMs(value: unknown): number | null {
+  return parseDateFirstTimestampMs(value) ?? null;
+}
+
 function hasFollowingNonThinkingBlock(
   content: Extract<AgentMessage, { role: "assistant" }>["content"],
   index: number,
@@ -95,7 +101,7 @@ function isOpenAIToolCallType(type: unknown): boolean {
 }
 
 function shortOpenAIResponsesIdHash(id: string): string {
-  return sha256HexPrefix(id, 10);
+  return sha256HexPrefixCore(id, 10);
 }
 
 function sanitizeOpenAIResponsesIdTail(value: string): string {
@@ -215,7 +221,7 @@ export function normalizeOpenAIResponsesToolCallIds(messages: AgentMessage[]): A
         }
         assistantChanged = true;
         return {
-          ...(block as unknown as Record<string, unknown>),
+          ...block,
           id: nextId,
         } as typeof block;
       });
@@ -225,7 +231,7 @@ export function normalizeOpenAIResponsesToolCallIds(messages: AgentMessage[]): A
         continue;
       }
       changed = true;
-      rewrittenMessages.push({ ...assistantMsg, content: nextContent } as AgentMessage);
+      rewrittenMessages.push(replaceCompactionReplayOwnerContent(assistantMsg, nextContent));
       continue;
     }
 
@@ -327,7 +333,7 @@ export function downgradeOpenAIFunctionCallReasoningPairs(
         assistantChanged = true;
         localRewrittenIds.set(toolCallBlock.id, pairing.callId);
         return {
-          ...(block as unknown as Record<string, unknown>),
+          ...block,
           id: pairing.callId,
         } as typeof block;
       });
@@ -338,7 +344,7 @@ export function downgradeOpenAIFunctionCallReasoningPairs(
         continue;
       }
       changed = true;
-      rewrittenMessages.push({ ...assistantMsg, content: nextContent } as AgentMessage);
+      rewrittenMessages.push(replaceCompactionReplayOwnerContent(assistantMsg, nextContent));
       continue;
     }
 
@@ -434,6 +440,12 @@ export function downgradeOpenAIReasoningBlocks(
       out.push(msg);
       continue;
     }
+    const messageTimestamp = parseTimestampMs((assistantMsg as { timestamp?: unknown }).timestamp);
+    // Timestamp-less legacy entries cannot prove they belong to the new route;
+    // treat them as pre-switch so stale provider ids never re-enter replay.
+    const dropReplayableReasoning =
+      options.dropReplayableReasoningBefore !== undefined &&
+      (messageTimestamp === null || messageTimestamp <= options.dropReplayableReasoningBefore);
 
     let changed = false;
     let droppedReplayableReasoning = false;
@@ -459,7 +471,7 @@ export function downgradeOpenAIReasoningBlocks(
         nextContent.push(block);
         continue;
       }
-      if (options.dropReplayableReasoning) {
+      if (dropReplayableReasoning) {
         changed = true;
         droppedReplayableReasoning = true;
         continue;
@@ -503,7 +515,7 @@ export function downgradeOpenAIReasoningBlocks(
         })
       : nextContent;
 
-    out.push({ ...assistantMsg, content: finalContent } as AgentMessage);
+    out.push(replaceCompactionReplayOwnerContent(assistantMsg, finalContent));
   }
 
   return anyChanged ? out : messages;

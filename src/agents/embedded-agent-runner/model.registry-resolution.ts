@@ -1,14 +1,18 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ModelRegistry as CoreModelRegistry } from "../../llm/model-registry.js";
 import type { Model } from "../../llm/types.js";
+import type { PluginMetadataSnapshotOwnerMaps } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { ensureAuthProfileStore, resolveAuthProfileOrder } from "../auth-profiles.js";
 import type { AuthProfileCredential } from "../auth-profiles/types.js";
 import { resolveAgentHarnessPolicy } from "../harness/policy.js";
 import { normalizeStaticProviderModelId } from "../model-ref-shared.js";
 import { normalizeProviderId } from "../model-selection.js";
-import { shouldSuppressBuiltInModel, shouldUnconditionallySuppress } from "../model-suppression.js";
+import {
+  shouldSuppressBuiltInModelCore,
+  shouldUnconditionallySuppress,
+} from "../model-suppression.js";
 import { listOpenAIAuthProfileProvidersForAgentRuntime } from "../openai-routing.js";
-import { resolveConfiguredFallbackModel } from "./model.configured-fallback.js";
+import { buildConfiguredFallbackModel } from "./model.configured-fallback.js";
 import {
   applyConfiguredProviderOverrides,
   findInlineModelMatch,
@@ -17,6 +21,7 @@ import {
   shouldSuppressConfiguredModel,
   type StaticCatalogFallbackModel,
 } from "./model.configured-overrides.js";
+import type { InlineModelEntry } from "./model.inline-provider.js";
 import {
   DEFAULT_PROVIDER_RUNTIME_HOOKS,
   normalizeResolvedModel,
@@ -34,6 +39,16 @@ type ExplicitModelResolution =
   | { kind: "resolved"; dropOnRuntimeMiss: boolean; model: Model; source: "registry" }
   | { kind: "suppressed" };
 
+function getRegistryProviderMetadataOwners(
+  modelRegistry: CoreModelRegistry,
+): PluginMetadataSnapshotOwnerMaps | undefined {
+  return (
+    modelRegistry as CoreModelRegistry & {
+      getProviderMetadataOwners?: () => PluginMetadataSnapshotOwnerMaps | undefined;
+    }
+  ).getProviderMetadataOwners?.();
+}
+
 export function resolveExplicitModelWithRegistry(params: {
   provider: string;
   modelId: string;
@@ -43,11 +58,15 @@ export function resolveExplicitModelWithRegistry(params: {
   manifestAlias: ManifestModelCatalogProviderAliasMetadata;
   workspaceDir?: string;
   runtimeHooks?: ProviderRuntimeHooks;
+  preparedInlineProviderModels?: readonly InlineModelEntry[];
+  getStaticCatalogModel?: () => StaticCatalogFallbackModel | undefined;
 }): ExplicitModelResolution | undefined {
   const { provider, modelId, modelRegistry, cfg, agentDir, workspaceDir, runtimeHooks } = params;
+  const providerMetadataOwners = getRegistryProviderMetadataOwners(modelRegistry);
   const providerConfig = resolveConfiguredProviderConfig(cfg, provider);
   const inlineMatch = findInlineModelMatch({
     providers: cfg?.models?.providers ?? {},
+    preparedModels: params.preparedInlineProviderModels,
     provider,
     modelId,
   });
@@ -72,13 +91,7 @@ export function resolveExplicitModelWithRegistry(params: {
     ) {
       return { kind: "suppressed" };
     }
-    const staticCatalogModel = resolveBundledStaticCatalogModel({
-      provider,
-      modelId,
-      cfg,
-      workspaceDir,
-      includeRuntimeDiscovery: true,
-    }) as StaticCatalogFallbackModel | undefined;
+    const staticCatalogModel = params.getStaticCatalogModel?.();
     return {
       kind: "resolved",
       source: "configured",
@@ -94,9 +107,11 @@ export function resolveExplicitModelWithRegistry(params: {
           modelId,
           cfg,
           manifestAlias: params.manifestAlias,
+          providerMetadataOwners,
           runtimeHooks,
           workspaceDir,
           preferDiscoveredTransport: true,
+          staticCatalogModel,
         }),
         runtimeHooks,
       }),
@@ -122,7 +137,7 @@ export function resolveExplicitModelWithRegistry(params: {
         : undefined;
     const effectiveBaseUrl = configuredBaseUrl ?? discoveredBaseUrl;
     if (
-      shouldSuppressBuiltInModel({
+      shouldSuppressBuiltInModelCore({
         provider,
         id: modelId,
         ...(cfg ? { config: cfg } : {}),
@@ -151,7 +166,9 @@ export function resolveExplicitModelWithRegistry(params: {
           modelId,
           cfg,
           manifestAlias: params.manifestAlias,
+          providerMetadataOwners,
           runtimeHooks,
+          getStaticCatalogModel: params.getStaticCatalogModel,
           workspaceDir,
         }),
         runtimeHooks,
@@ -165,7 +182,7 @@ export function resolveExplicitModelWithRegistry(params: {
     return undefined;
   }
   if (
-    shouldSuppressBuiltInModel({
+    shouldSuppressBuiltInModelCore({
       provider,
       id: modelId,
       ...(cfg ? { config: cfg } : {}),
@@ -248,6 +265,7 @@ function resolvePluginDynamicModelWithRegistry(params: {
   authProfileMode?: AuthProfileCredential["type"] | "aws-sdk";
   preferredProfile?: string;
   runtimeHooks?: ProviderRuntimeHooks;
+  getStaticCatalogModel?: () => StaticCatalogFallbackModel | undefined;
 }): Model | undefined {
   const { provider, modelId, modelRegistry, cfg, agentDir, workspaceDir } = params;
   const runtimeHooks = params.runtimeHooks ?? DEFAULT_PROVIDER_RUNTIME_HOOKS;
@@ -302,9 +320,11 @@ function resolvePluginDynamicModelWithRegistry(params: {
     modelId,
     cfg,
     manifestAlias: params.manifestAlias,
+    providerMetadataOwners: getRegistryProviderMetadataOwners(modelRegistry),
     runtimeHooks,
     workspaceDir,
     preferDiscoveredModelMetadata,
+    getStaticCatalogModel: params.getStaticCatalogModel,
   });
   return normalizeResolvedModel({
     provider,
@@ -317,9 +337,7 @@ function resolvePluginDynamicModelWithRegistry(params: {
 }
 
 export function resolveRuntimePreferredSuppressedModel(
-  params: ResolveModelWithRegistryParams & {
-    manifestAlias: ManifestModelCatalogProviderAliasMetadata;
-  },
+  params: ResolveModelWithPreparedRegistryParams,
 ): Model | undefined {
   const runtimeHooks = params.runtimeHooks ?? DEFAULT_PROVIDER_RUNTIME_HOOKS;
   if (!shouldCompareProviderRuntimeResolvedModel({ ...params, runtimeHooks })) {
@@ -405,10 +423,13 @@ type ResolveModelWithRegistryParams = {
   skipConfiguredFallback?: boolean;
 };
 
+type ResolveModelWithPreparedRegistryParams = ResolveModelWithRegistryParams & {
+  manifestAlias: ManifestModelCatalogProviderAliasMetadata;
+  getStaticCatalogModel?: () => StaticCatalogFallbackModel | undefined;
+};
+
 export function resolveModelWithPreparedRegistry(
-  params: ResolveModelWithRegistryParams & {
-    manifestAlias: ManifestModelCatalogProviderAliasMetadata;
-  },
+  params: ResolveModelWithPreparedRegistryParams,
 ): Model | undefined {
   // Competing activated owners leave credentials and transport authority unresolved.
   // Refuse the route before configured fallbacks can accidentally select either owner.
@@ -439,7 +460,12 @@ export function resolveModelWithPreparedRegistry(
   if (pluginDynamicModel) {
     return pluginDynamicModel;
   }
-  return params.skipConfiguredFallback ? undefined : resolveConfiguredFallbackModel(params);
+  return params.skipConfiguredFallback
+    ? undefined
+    : buildConfiguredFallbackModel({
+        ...params,
+        providerMetadataOwners: getRegistryProviderMetadataOwners(params.modelRegistry),
+      });
 }
 
 export function resolveModelWithRegistry(
@@ -447,11 +473,27 @@ export function resolveModelWithRegistry(
 ): Model | undefined {
   const workspaceDir = params.workspaceDir ?? params.cfg?.agents?.defaults?.workspace;
   const normalizedRef = normalizeProviderModelRef({ ...params, workspaceDir });
+  let staticCatalogResolved = false;
+  let staticCatalogModel: StaticCatalogFallbackModel | undefined;
+  const getStaticCatalogModel = () => {
+    if (!staticCatalogResolved) {
+      staticCatalogResolved = true;
+      staticCatalogModel = resolveBundledStaticCatalogModel({
+        provider: normalizedRef.provider,
+        modelId: normalizedRef.model,
+        cfg: params.cfg,
+        workspaceDir,
+        includeRuntimeDiscovery: true,
+      });
+    }
+    return staticCatalogModel;
+  };
   return resolveModelWithPreparedRegistry({
     ...params,
     provider: normalizedRef.provider,
     modelId: normalizedRef.model,
     manifestAlias: normalizedRef.manifestAlias,
+    getStaticCatalogModel,
     ...(workspaceDir !== undefined ? { workspaceDir } : {}),
   });
 }

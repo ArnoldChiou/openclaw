@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   primeRemoteSkillsCache: vi.fn(),
   refreshRemoteBinsForConnectedNodes: vi.fn(),
   registerSkillsChangeListener: vi.fn(),
+  closeSkillsWatchers: vi.fn(),
   skillsChangeUnsub: vi.fn(),
   ensureContextWindowCacheLoaded: vi.fn(),
   ensureTaskRuntimeStateReady: vi.fn(),
@@ -37,6 +38,7 @@ vi.mock("../skills/runtime/remote.js", () => ({
 
 vi.mock("../skills/runtime/refresh.js", () => ({
   registerSkillsChangeListener: mocks.registerSkillsChangeListener,
+  closeSkillsWatchers: mocks.closeSkillsWatchers,
 }));
 
 vi.mock("../agents/context.js", () => ({
@@ -98,6 +100,7 @@ describe("startGatewayEarlyRuntime", () => {
     mocks.primeRemoteSkillsCache.mockReset();
     mocks.refreshRemoteBinsForConnectedNodes.mockReset();
     mocks.registerSkillsChangeListener.mockReset();
+    mocks.closeSkillsWatchers.mockReset();
     mocks.registerSkillsChangeListener.mockReturnValue(mocks.skillsChangeUnsub);
     mocks.skillsChangeUnsub.mockReset();
     mocks.ensureContextWindowCacheLoaded.mockReset();
@@ -142,8 +145,70 @@ describe("startGatewayEarlyRuntime", () => {
     expect(mocks.registerSkillsChangeListener).toHaveBeenCalledTimes(1);
     expect(earlyRuntime.getActiveTaskCount()).toBe(1);
 
-    earlyRuntime.skillsChangeUnsub();
+    await earlyRuntime.skillsChangeUnsub();
     expect(mocks.skillsChangeUnsub).toHaveBeenCalledTimes(1);
+    expect(mocks.closeSkillsWatchers).toHaveBeenCalledTimes(1);
+  });
+
+  it("broadcasts remote-node skill invalidations to operator clients", async () => {
+    const broadcast = vi.fn();
+
+    await startGatewayEarlyRuntime(
+      earlyRuntimeInput({
+        minimalTestGateway: false,
+        broadcast,
+      }),
+    );
+
+    const listener = mocks.registerSkillsChangeListener.mock.calls.at(-1)?.[0] as
+      | ((event: { reason: "remote-node" }) => void)
+      | undefined;
+    expect(listener).toBeDefined();
+
+    listener?.({ reason: "remote-node" });
+
+    expect(broadcast).toHaveBeenCalledWith("skills.changed", { reason: "remote-node" });
+    expect(mocks.refreshRemoteBinsForConnectedNodes).not.toHaveBeenCalled();
+  });
+
+  it("broadcasts local skill changes after the coalesced remote-bin refresh", async () => {
+    vi.useFakeTimers();
+    const broadcast = vi.fn();
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let finishRefresh: (() => void) | undefined;
+    mocks.refreshRemoteBinsForConnectedNodes.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishRefresh = resolve;
+        }),
+    );
+    try {
+      await startGatewayEarlyRuntime(
+        earlyRuntimeInput({
+          minimalTestGateway: false,
+          broadcast,
+          getSkillsRefreshTimer: () => refreshTimer,
+          setSkillsRefreshTimer: (timer) => {
+            refreshTimer = timer;
+          },
+        }),
+      );
+
+      const listener = mocks.registerSkillsChangeListener.mock.calls.at(-1)?.[0] as
+        | ((event: { reason: "watch" }) => void)
+        | undefined;
+      listener?.({ reason: "watch" });
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(mocks.refreshRemoteBinsForConnectedNodes).toHaveBeenCalledWith({});
+      expect(broadcast).not.toHaveBeenCalled();
+
+      finishRefresh?.();
+      await Promise.resolve();
+      expect(broadcast).toHaveBeenCalledWith("skills.changed", { reason: "watch" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails before discovery and task maintenance when task state cannot restore", async () => {

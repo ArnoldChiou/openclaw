@@ -32,7 +32,15 @@ import {
   into the prompt/session context. Pass channel-owned sender/chat metadata
   through `channelContext`, which plugin hooks see as `ctx.channelContext`.
   Augment `PluginHookChannelSenderContext` or `PluginHookChannelChatContext`
-  from this subpath for channel-specific fields.
+  from this subpath for channel-specific fields. This public standalone builder
+  is non-authoritative and cannot mint participant evidence. Bundled production
+  receive paths use the host-injected registered
+  `runtime.channel.inbound.buildContext` and pass the exact resolver result as
+  `channelIngress`. Resolve that result with `contextBinding` after final route
+  selection. Core accepts it once only when the same active plugin record,
+  lifecycle epoch, agent, session, message, event, and admission scope still
+  match; receive paths must not rebuild participant provenance from context fields. Only a named,
+  source-proven unsupported path passes `channelIngress: "unsupported"`.
 - `runChannelInboundEvent(...)`: runs ingest, classify, preflight, resolve,
   record, dispatch, and finalize for one inbound platform event.
 - `dispatchChannelInboundReply(...)`: records and dispatches an already
@@ -143,6 +151,14 @@ receives the settled result after that observation.
 has `visibleReplySent: false`, does not emit `message_sent`, and does not count
 as a visible queued reply. This lets plugins distinguish hook cancellation
 from provider failure without inventing a native message identity.
+
+By default, routed turns record inbound metadata against
+`ctxPayload.SessionKey ?? route.sessionKey`. Set `record.sessionKey` only when a
+native command intentionally executes in one command session while updating a
+different provider-routed target session. The override affects inbound metadata,
+transcript-context merge, and record-stage diagnostics; it does not change dispatch
+routing or hook correlation. An explicit override must be non-empty and contain no
+surrounding whitespace.
 
 Reject `deliver` or `finalization` when native delivery fails. If no provider
 send was attempted, throw `PlatformMessageNotDispatchedError` from

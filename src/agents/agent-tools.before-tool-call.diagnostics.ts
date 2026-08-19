@@ -25,6 +25,7 @@ import {
   freezeDiagnosticTraceContext,
   type DiagnosticTraceContext,
 } from "../infra/diagnostic-trace-context.js";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
 import type { SessionState } from "../logging/diagnostic-session-state.js";
 import { redactToolDetail } from "../logging/redact.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -44,10 +45,10 @@ import type {
   ToolOutcomeObserver,
 } from "./agent-tools.before-tool-call.types.js";
 import { normalizeFileToolPathParam } from "./agent-tools.params.js";
-import { BEFORE_TOOL_CALL_SOURCE_TOOL } from "./before-tool-call-metadata.js";
+import { getBeforeToolCallSourceTool } from "./before-tool-call-metadata.js";
 import { getChannelAgentToolMeta } from "./channel-tools.js";
 import { resolveAgentRunAbortLifecycleFields } from "./run-termination.js";
-import { normalizeToolName } from "./tool-policy.js";
+import { normalizeToolPolicyName } from "./tool-policy.js";
 import {
   resolveToolExecutionErrorKind,
   resolveToolResultFailureKind,
@@ -78,10 +79,7 @@ export function resolveToolTerminalPresentation(params: {
   result: Awaited<ReturnType<AnyAgentTool["execute"]>>;
 }): string | undefined {
   try {
-    const taggedTool = params.tool as unknown as Record<symbol, unknown>;
-    const sourceTool = taggedTool[BEFORE_TOOL_CALL_SOURCE_TOOL];
-    const presentationTool =
-      sourceTool && typeof sourceTool === "object" ? (sourceTool as AnyAgentTool) : params.tool;
+    const presentationTool = getBeforeToolCallSourceTool(params.tool) ?? params.tool;
     const text = getToolTerminalPresentation(presentationTool)?.(
       params.toolParams,
       params.result,
@@ -118,13 +116,7 @@ export function rememberPendingTerminalPresentation(params: {
     toolParams: structuredClone(params.toolParams),
     toolCallOrdinal: params.toolCallOrdinal,
   });
-  while (pendingTerminalPresentationByToolCall.size > MAX_PENDING_TERMINAL_PRESENTATIONS) {
-    const oldestKey = pendingTerminalPresentationByToolCall.keys().next().value;
-    if (!oldestKey) {
-      break;
-    }
-    pendingTerminalPresentationByToolCall.delete(oldestKey);
-  }
+  pruneMapToMaxSize(pendingTerminalPresentationByToolCall, MAX_PENDING_TERMINAL_PRESENTATIONS);
 }
 
 /** Finalizes a trusted terminal summary after harness result middleware. */
@@ -396,7 +388,7 @@ export function findSkillUsageMatch(params: {
 }): SkillUsageMatch | undefined {
   const command = params.ctx?.skillCommand;
   if (command) {
-    const commandToolName = normalizeToolName(command.toolName ?? params.toolName);
+    const commandToolName = normalizeToolPolicyName(command.toolName ?? params.toolName);
     if (!commandToolName || commandToolName === params.toolName) {
       const skillSource = resolveSkillTelemetrySourceValue(command.skillSource);
       const snapshotMatch = findResolvedSkillUsageMatch({
@@ -468,23 +460,29 @@ export function emitToolBlockedSecurityEvent(params: {
   paramsSummary?: DiagnosticToolParamsSummary;
 }): void {
   const control =
-    params.deniedReason === "tool-loop"
+    params.deniedReason === "client-voice-confirmation"
       ? ({
-          policyId: "tool-loop-detection",
-          controlId: "tool-loop-detection",
-          family: "authorization",
+          policyId: "talk-client-voice-confirmation",
+          controlId: "talk-client-voice-confirmation",
+          family: "approval",
         } as const)
-      : params.deniedReason === "plugin-approval"
+      : params.deniedReason === "tool-loop"
         ? ({
-            policyId: "plugin-tool-approval",
-            controlId: "plugin-tool-approval",
-            family: "approval",
+            policyId: "tool-loop-detection",
+            controlId: "tool-loop-detection",
+            family: "authorization",
           } as const)
-        : ({
-            policyId: "plugin-before-tool-call",
-            controlId: "before-tool-call",
-            family: "approval",
-          } as const);
+        : params.deniedReason === "plugin-approval"
+          ? ({
+              policyId: "plugin-tool-approval",
+              controlId: "plugin-tool-approval",
+              family: "approval",
+            } as const)
+          : ({
+              policyId: "plugin-before-tool-call",
+              controlId: "before-tool-call",
+              family: "approval",
+            } as const);
   emitTrustedSecurityEvent({
     category: "tool",
     action: "tool.execution.blocked",
@@ -575,13 +573,49 @@ export function shouldEmitLoopWarning(
     return false;
   }
   state.toolLoopWarningBuckets.set(warningKey, bucket);
-  if (state.toolLoopWarningBuckets.size > MAX_LOOP_WARNING_KEYS) {
-    const oldest = state.toolLoopWarningBuckets.keys().next().value;
-    if (oldest) {
-      state.toolLoopWarningBuckets.delete(oldest);
-    }
-  }
+  pruneMapToMaxSize(state.toolLoopWarningBuckets, MAX_LOOP_WARNING_KEYS);
   return true;
+}
+
+/** Reconcile loop liveness with the final post-policy arguments before execution. */
+export async function reconcileLoopCallExecutionParams(args: {
+  ctx?: HookContext;
+  toolName: string;
+  toolParams: unknown;
+  toolCallId?: string;
+}): Promise<void> {
+  if ((!args.ctx?.sessionKey && !args.ctx?.sessionId) || args.ctx.loopDetection?.enabled !== true) {
+    return;
+  }
+  try {
+    const {
+      getDiagnosticSessionState,
+      markDiagnosticArgumentChurnObservation,
+      reconcileToolCallExecutionParams,
+      resolveToolLoopWarningThreshold,
+    } = await loadBeforeToolCallRuntime();
+    const sessionState = getDiagnosticSessionState({
+      sessionKey: args.ctx.sessionKey,
+      sessionId: args.ctx.sessionId,
+    });
+    const churn = reconcileToolCallExecutionParams(sessionState, {
+      toolName: args.toolName,
+      toolParams: args.toolParams,
+      toolCallId: args.toolCallId,
+      runId: args.ctx.runId,
+      warningThreshold: resolveToolLoopWarningThreshold(),
+    });
+    markDiagnosticArgumentChurnObservation({
+      sessionKey: args.ctx.sessionKey,
+      sessionId: args.ctx.sessionId,
+      runId: args.ctx.runId,
+      active: churn.active,
+    });
+  } catch (err) {
+    log.warn(
+      `tool loop execution-param reconciliation failed: tool=${args.toolName} error=${String(err)}`,
+    );
+  }
 }
 
 export async function recordLoopOutcome(args: {
@@ -591,6 +625,7 @@ export async function recordLoopOutcome(args: {
   toolCallId?: string;
   result?: unknown;
   error?: unknown;
+  resultContentSource?: AnyAgentTool["resultContentSource"];
   toolCallOrdinal?: number;
   terminalPresentation?: string;
 }): Promise<void> {
@@ -599,7 +634,12 @@ export async function recordLoopOutcome(args: {
   }
   let recordedOutcome: ToolOutcomeObservation | undefined;
   try {
-    const { getDiagnosticSessionState, recordToolCallOutcome } = await loadBeforeToolCallRuntime();
+    const {
+      getArgumentChurnNoProgressStreak,
+      getDiagnosticSessionState,
+      markDiagnosticArgumentChurnObservation,
+      recordToolCallOutcome,
+    } = await loadBeforeToolCallRuntime();
     const sessionState = getDiagnosticSessionState({
       sessionKey: args.ctx.sessionKey,
       sessionId: args.ctx.sessionId,
@@ -613,11 +653,26 @@ export async function recordLoopOutcome(args: {
       config: args.ctx.loopDetection,
       ...(args.ctx.runId && { runId: args.ctx.runId }),
     });
+    const churnContinues =
+      record !== undefined &&
+      getArgumentChurnNoProgressStreak(
+        (sessionState.toolCallHistory ?? []).filter((call) => call.runId === record.runId),
+        record.toolName,
+        record.argsHash,
+      ).count > 0;
+    markDiagnosticArgumentChurnObservation({
+      sessionKey: args.ctx.sessionKey,
+      sessionId: args.ctx.sessionId,
+      runId: args.ctx.runId,
+      active: churnContinues,
+      existingOnly: true,
+    });
     if (record?.resultHash && args.ctx.onToolOutcome) {
       recordedOutcome = {
         toolName: record.toolName,
         argsHash: record.argsHash,
         resultHash: record.resultHash,
+        ...(args.resultContentSource ? { resultContentSource: args.resultContentSource } : {}),
         ...(args.toolCallOrdinal !== undefined ? { toolCallOrdinal: args.toolCallOrdinal } : {}),
         ...(args.terminalPresentation ? { terminalPresentation: args.terminalPresentation } : {}),
       };

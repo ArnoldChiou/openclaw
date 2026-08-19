@@ -93,6 +93,8 @@ export type ModelCompatConfig = SupportedOpenAICompatFields &
     visibleReasoningDetailTypes?: string[];
     /** Whether this model supports tool/function calling. */
     supportsTools?: boolean;
+    /** Code-mode tier consumed by `tools.codeMode.enabled: "auto"`; absent means "capable". */
+    codeMode?: "preferred" | "capable";
     /** Whether provider accepts prompt-cache/session affinity keys. */
     supportsPromptCacheKey?: boolean;
     /** Whether all message parts must be coerced to plain strings. */
@@ -180,7 +182,7 @@ export type ModelDefinitionConfig = {
     }>;
   };
   /** Provider/native maximum context window in tokens. */
-  contextWindow: number;
+  contextWindow?: number;
   /**
    * Optional effective runtime cap used for compaction/session budgeting.
    * Keeps provider/native contextWindow metadata intact while letting configs
@@ -214,10 +216,6 @@ export type ModelProviderConfig = {
   auth?: ModelProviderAuthMode;
   /** Default API adapter for models under this provider. */
   api?: ModelApi;
-  /** Provider-level default context window. */
-  contextWindow?: number;
-  /** Provider-level effective runtime context cap. */
-  contextTokens?: number;
   /** Provider-level default max output tokens. */
   maxTokens?: number;
   /** Provider request timeout in seconds. */

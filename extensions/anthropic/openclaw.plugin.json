@@ -1,5 +1,16 @@
 {
   "id": "anthropic",
+  "doctorContract": {},
+  "sessionRouteStateOwners": [
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "providerIds": ["anthropic", "claude-cli"],
+      "runtimeIds": ["claude-cli"],
+      "cliSessionKeys": ["claude-cli"],
+      "authProfilePrefixes": ["anthropic:", "claude-cli:"]
+    }
+  ],
   "name": "Anthropic",
   "description": "Anthropic models, Claude CLI, and native Claude session catalog.",
   "icon": "https://cdn.simpleicons.org/anthropic",
@@ -126,7 +137,8 @@
               "minimal": "low",
               "xhigh": "xhigh",
               "max": "max"
-            }
+            },
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-opus-5",
@@ -151,7 +163,8 @@
             "thinkingLevelMap": {
               "xhigh": "xhigh",
               "max": "max"
-            }
+            },
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-sonnet-5",
@@ -176,7 +189,8 @@
             "thinkingLevelMap": {
               "xhigh": "xhigh",
               "max": "max"
-            }
+            },
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-mythos-5",
@@ -203,7 +217,8 @@
               "minimal": "low",
               "xhigh": "xhigh",
               "max": "max"
-            }
+            },
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-opus-4-8",
@@ -220,7 +235,8 @@
               }
             },
             "contextWindow": 1000000,
-            "maxTokens": 128000
+            "maxTokens": 128000,
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-haiku-4-5",
@@ -235,7 +251,8 @@
               }
             },
             "contextWindow": 200000,
-            "maxTokens": 64000
+            "maxTokens": 64000,
+            "compat": { "codeMode": "preferred" }
           }
         ]
       }

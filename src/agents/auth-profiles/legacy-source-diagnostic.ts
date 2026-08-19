@@ -3,11 +3,12 @@ import path from "node:path";
 import { resolveOAuthDir } from "../../config/paths.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { shortenHomePath } from "../../utils.js";
+import { resolveSharedAuthStorePath } from "./path-resolve.js";
 import { resolveSharedMainAuthAgentDir } from "./shared-main-dir.js";
 import { resolveAuthProfileDatabasePath } from "./sqlite.js";
 
 const AUTH_PROFILE_MIGRATION_REQUIRED_CODE = "AUTH_PROFILE_MIGRATION_REQUIRED" as const;
-const AUTH_PROFILE_MIGRATION_COMMAND = "openclaw doctor --fix" as const;
+export const AUTH_PROFILE_MIGRATION_COMMAND = "openclaw doctor --fix" as const;
 const log = createSubsystemLogger("auth-profiles/persistence");
 
 type LegacyAuthProfileSourceKind = "auth-profiles" | "auth-state" | "legacy-auth" | "legacy-oauth";
@@ -17,12 +18,25 @@ type LegacyAuthProfileSource = {
   path: string;
 };
 
+function isCredentialSource(source: LegacyAuthProfileSource): boolean {
+  return source.kind !== "auth-state";
+}
+
 export function resolveLegacyOAuthPath(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(resolveOAuthDir(env), "oauth.json");
 }
 
-function resolveAgentDir(agentDir?: string): string {
-  return path.dirname(resolveAuthProfileDatabasePath(agentDir));
+function resolveAuthProfileOwnerPath(agentDir?: string): string {
+  return agentDir ? resolveAuthProfileDatabasePath(agentDir) : resolveSharedAuthStorePath();
+}
+
+function resolveLegacySourceAgentDir(
+  agentDir: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return agentDir
+    ? path.dirname(resolveAuthProfileOwnerPath(agentDir))
+    : resolveSharedMainAuthAgentDir(env);
 }
 
 /** Detects retired auth files by name only; runtime code must never read their contents. */
@@ -30,7 +44,7 @@ export function listLegacyAuthProfileSources(params: {
   agentDir?: string;
   env?: NodeJS.ProcessEnv;
 }): LegacyAuthProfileSource[] {
-  const agentDir = resolveAgentDir(params.agentDir);
+  const agentDir = resolveLegacySourceAgentDir(params.agentDir, params.env);
   const candidates: LegacyAuthProfileSource[] = [
     { kind: "auth-profiles", path: path.join(agentDir, "auth-profiles.json") },
     { kind: "auth-state", path: path.join(agentDir, "auth-state.json") },
@@ -79,20 +93,33 @@ export function listLegacyAuthProfileArchives(params: {
 }
 
 export function hasLegacyAuthProfileCredentialSource(agentDir?: string): boolean {
-  return listLegacyAuthProfileSources({ agentDir }).some((source) => source.kind !== "auth-state");
+  return listLegacyAuthProfileSources({ agentDir }).some(isCredentialSource);
+}
+
+function listStartupLegacyAuthProfileSources(params: {
+  agentDirs: readonly string[];
+  env?: NodeJS.ProcessEnv;
+}): Array<{
+  agentDir: string;
+  sources: LegacyAuthProfileSource[];
+  credentialSources: LegacyAuthProfileSource[];
+}> {
+  const sharedMainDir = resolveSharedMainAuthAgentDir(params.env);
+  return [...new Set([...params.agentDirs, sharedMainDir])].map((agentDir) => {
+    const sources = listLegacyAuthProfileSources({ agentDir, env: params.env });
+    return { agentDir, sources, credentialSources: sources.filter(isCredentialSource) };
+  });
 }
 
 export function hasLegacyAuthProfileSourcesForStartup(params: {
   agentDirs: readonly string[];
   env?: NodeJS.ProcessEnv;
 }): boolean {
-  const sharedMainDir = resolveSharedMainAuthAgentDir(params.env);
-  const candidates = new Set([...params.agentDirs, sharedMainDir]);
   let detected = false;
-  for (const agentDir of candidates) {
-    const sources = listLegacyAuthProfileSources({ agentDir, env: params.env });
+  for (const { agentDir, sources, credentialSources } of listStartupLegacyAuthProfileSources(
+    params,
+  )) {
     detected ||= sources.length > 0;
-    const credentialSources = sources.filter((source) => source.kind !== "auth-state");
     if (credentialSources.length > 0) {
       markAuthProfileMigrationRequired(
         agentDir,
@@ -103,6 +130,17 @@ export function hasLegacyAuthProfileSourcesForStartup(params: {
   return detected;
 }
 
+/** Agent auth stores whose retired credential files make gateway startup fail until Doctor migrates them. */
+export function listAuthProfileStoresRequiringMigration(params: {
+  agentDirs: readonly string[];
+  env?: NodeJS.ProcessEnv;
+}): string[] {
+  const owners = listStartupLegacyAuthProfileSources(params)
+    .filter(({ credentialSources }) => credentialSources.length > 0)
+    .map(({ agentDir }) => shortenHomePath(resolveAuthProfileDatabasePath(agentDir)));
+  return [...new Set(owners)].toSorted();
+}
+
 export class AuthProfileMigrationRequiredError extends Error {
   readonly code = AUTH_PROFILE_MIGRATION_REQUIRED_CODE;
   readonly action = AUTH_PROFILE_MIGRATION_COMMAND;
@@ -110,7 +148,7 @@ export class AuthProfileMigrationRequiredError extends Error {
   readonly sourceKinds: LegacyAuthProfileSourceKind[];
 
   constructor(params: { agentDir?: string; sources: readonly LegacyAuthProfileSource[] }) {
-    const ownerId = shortenHomePath(resolveAuthProfileDatabasePath(params.agentDir));
+    const ownerId = shortenHomePath(resolveAuthProfileOwnerPath(params.agentDir));
     const sourceKinds = [...new Set(params.sources.map((source) => source.kind))].toSorted();
     super(
       `Auth profile store ${ownerId} requires legacy credential migration; run ${AUTH_PROFILE_MIGRATION_COMMAND}.`,
@@ -127,7 +165,7 @@ export class AuthProfileStoreUnreadableError extends Error {
 
   constructor(agentDir?: string) {
     super(
-      `Auth profile store ${shortenHomePath(resolveAuthProfileDatabasePath(agentDir))} is unreadable; run ${AUTH_PROFILE_MIGRATION_COMMAND}.`,
+      `Auth profile store ${shortenHomePath(resolveAuthProfileOwnerPath(agentDir))} is unreadable; run ${AUTH_PROFILE_MIGRATION_COMMAND}.`,
     );
     this.name = "AuthProfileStoreUnreadableError";
   }
@@ -143,7 +181,7 @@ export function warnLegacyAuthProfileSourcesIgnored(params: {
   if (params.sources.length === 0) {
     return;
   }
-  const databasePath = resolveAuthProfileDatabasePath(params.agentDir);
+  const databasePath = resolveAuthProfileOwnerPath(params.agentDir);
   if (warnedLegacySourceDatabases.has(databasePath)) {
     return;
   }
@@ -160,17 +198,17 @@ export function markAuthProfileMigrationRequired(
   agentDir: string | undefined,
   error: AuthProfileMigrationRequiredError,
 ): void {
-  const databasePath = resolveAuthProfileDatabasePath(agentDir);
+  const databasePath = resolveAuthProfileOwnerPath(agentDir);
   migrationRequiredByDatabase.set(databasePath, error);
 }
 
 export function clearAuthProfileMigrationRequired(agentDir?: string): void {
-  const databasePath = resolveAuthProfileDatabasePath(agentDir);
+  const databasePath = resolveAuthProfileOwnerPath(agentDir);
   migrationRequiredByDatabase.delete(databasePath);
 }
 
 export function assertAuthProfileMigrationReady(agentDir?: string): void {
-  const databasePath = resolveAuthProfileDatabasePath(agentDir);
+  const databasePath = resolveAuthProfileOwnerPath(agentDir);
   const error = migrationRequiredByDatabase.get(databasePath);
   if (error) {
     // The activated secrets snapshot for this owner is empty. Only an explicit
@@ -179,9 +217,7 @@ export function assertAuthProfileMigrationReady(agentDir?: string): void {
   }
   // Older shipped processes and restores can recreate these three fixed files
   // after startup, so this credential boundary deliberately rechecks their names.
-  const sources = listLegacyAuthProfileSources({ agentDir }).filter(
-    (source) => source.kind !== "auth-state",
-  );
+  const sources = listLegacyAuthProfileSources({ agentDir }).filter(isCredentialSource);
   if (sources.length > 0) {
     const migrationError = new AuthProfileMigrationRequiredError({ agentDir, sources });
     markAuthProfileMigrationRequired(agentDir, migrationError);
