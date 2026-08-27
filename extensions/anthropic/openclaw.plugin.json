@@ -41,6 +41,11 @@
               }
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000
           },
           {
@@ -56,6 +61,11 @@
               }
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000
           },
           {
@@ -71,6 +81,11 @@
               }
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000
           },
           {
@@ -131,9 +146,13 @@
               "cacheWrite": 12.5
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000,
             "thinkingLevelMap": {
-              "off": "low",
               "minimal": "low",
               "xhigh": "xhigh",
               "max": "max"
@@ -159,6 +178,11 @@
               "cacheWrite": 6.25
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000,
             "thinkingLevelMap": {
               "xhigh": "xhigh",
@@ -185,6 +209,11 @@
               "cacheWrite": 2.5
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000,
             "thinkingLevelMap": {
               "xhigh": "xhigh",
@@ -213,7 +242,6 @@
             "contextWindow": 1000000,
             "maxTokens": 128000,
             "thinkingLevelMap": {
-              "off": "low",
               "minimal": "low",
               "xhigh": "xhigh",
               "max": "max"
@@ -305,7 +333,7 @@
   },
   "cliBackends": ["claude-cli"],
   "syntheticAuthRefs": ["claude-cli"],
-  "nonSecretAuthMarkers": ["openclaw:claude-cli-api-key-helper"],
+  "nonSecretAuthMarkers": ["openclaw:claude-cli-native-auth"],
   "setup": {
     "providers": [
       {

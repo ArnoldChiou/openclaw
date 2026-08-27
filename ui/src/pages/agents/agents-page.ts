@@ -72,7 +72,6 @@ import { clearAgentSkillFilter, loadAgentSkills } from "./skills.ts";
 import { renderAgents } from "./view.ts";
 
 const AGENTS_DOCS_URL = "https://docs.openclaw.ai/concepts/multi-agent";
-
 type AgentsRequestSources = Partial<
   Pick<ApplicationContext, "agents" | "agentIdentity" | "sessions">
 >;
@@ -106,6 +105,7 @@ class AgentsPage
   @state() agentFileDrafts: Record<string, string> = {};
   @state() agentFileActive: string | null = null;
   @state() agentFileSaving = false;
+  readonly agentFileWriteRevisions = new Map<string, number>();
   @state() agentIdentityLoading = false;
   @state() agentIdentityError: string | null = null;
   @state() identityDraft: AgentIdentityDraft = { name: null, emoji: null, avatar: null };
@@ -252,6 +252,10 @@ class AgentsPage
     return this.context.sessions;
   }
 
+  get agents() {
+    return this.context.agents;
+  }
+
   get client() {
     return this.gateway.client;
   }
@@ -282,6 +286,7 @@ class AgentsPage
   }
 
   override disconnectedCallback() {
+    this.githubIdentity.dispose();
     this.subscriptions.clear();
     super.disconnectedCallback();
   }
@@ -332,17 +337,18 @@ class AgentsPage
       return;
     }
     this.agentFilesList = status.list;
-    this.agentFilesError = status.error;
     void this.selectDefaultAgentFile(agentId);
   }
 
-  private async selectDefaultAgentFile(agentId: string) {
+  private async selectDefaultAgentFile(agentId: string, force = false) {
     const files = this.agentFilesList?.files ?? [];
     if (!this.agentFileActive || !files.some((file) => file.name === this.agentFileActive)) {
       this.agentFileActive = files.find((file) => file.name === "AGENTS.md")?.name ?? null;
     }
     if (this.agentFileActive) {
-      await loadAgentFileContent(this, agentId, this.agentFileActive);
+      await loadAgentFileContent(this, agentId, this.agentFileActive, {
+        force,
+      });
     }
   }
 
@@ -369,8 +375,7 @@ class AgentsPage
     this.agentSkillsLoading = false;
     this.toolsCatalogLoading = false;
     this.toolsCatalogLoadingAgentId = null;
-    this.toolsEffectiveLoading = false;
-    this.toolsEffectiveLoadingKey = null;
+    resetToolsEffectiveState(this);
     this.cron = {
       ...this.cron,
       cronLoading: false,
@@ -530,7 +535,7 @@ class AgentsPage
       }
       this.loadEffectiveToolsForAgent(agentId);
       if (
-        this.githubIdentity.supported &&
+        this.githubIdentity.statusReadable &&
         !this.githubIdentity.status &&
         !this.githubIdentity.loading &&
         !this.githubIdentity.error
@@ -558,13 +563,21 @@ class AgentsPage
   }
 
   private syncGitHubIdentity(agentId: string | null) {
+    const snapshot = this.context.gateway.snapshot;
+    const hasScope = (method: string, scope: GatewayMethodOperatorScope) =>
+      canCallGatewayMethod(snapshot, method, scope, { requireAdvertisement: false });
     this.githubIdentity.sync({
       client: this.client,
       connected: this.connected,
       agentId,
       config: currentConfigObject(this.context.runtimeConfig.state),
-      supported: this.canCall("tools.github.status", "operator.read"),
-      configurable: this.canCall("tools.github.configure", "operator.admin"),
+      statusReadable: hasScope("tools.github.status", "operator.read"),
+      configurable: hasScope("tools.github.configure", "operator.admin"),
+      authorizable: [
+        "tools.github.authorize.start",
+        "tools.github.authorize.poll",
+        "tools.github.authorize.cancel",
+      ].every((method) => hasScope(method, "operator.admin")),
       clientRevision: this.requestGeneration,
     });
   }
@@ -662,14 +675,13 @@ class AgentsPage
         return;
       }
       this.agentFilesList = list ?? agents.files(agentId).list;
-      this.agentFilesError = agents.files(agentId).error;
     } finally {
       if (this.isCurrentRequest(client, generation, agentId, { agents })) {
         this.agentFilesLoading = false;
       }
     }
     if (this.isCurrentRequest(client, generation, agentId, { agents })) {
-      await this.selectDefaultAgentFile(agentId);
+      await this.selectDefaultAgentFile(agentId, force);
     }
   }
 
@@ -736,6 +748,7 @@ class AgentsPage
     this.agentFileActive = null;
     this.agentFileContents = {};
     this.agentFileDrafts = {};
+    this.agentFileWriteRevisions.clear();
     this.agentFilesLoading = false;
     this.agentFileSaving = false;
     this.agentSkillsReport = null;
@@ -849,17 +862,7 @@ class AgentsPage
     if (!this.canCall("agents.files.set", "operator.admin")) {
       return;
     }
-    const client = this.client;
-    const generation = this.requestGeneration;
-    const agents = this.context.agents;
-    if (!client) {
-      return;
-    }
-    void saveAgentFile(this, agentId, name, content).then((saved) => {
-      if (saved && this.isCurrentRequest(client, generation, agentId, { agents })) {
-        void this.loadAgentFiles(agentId, true);
-      }
-    });
+    void saveAgentFile(this, agentId, name, content);
   }
 
   private reloadConfig() {
@@ -943,11 +946,7 @@ class AgentsPage
             loading: configState.configLoading,
             saving: configState.configSaving,
             dirty: configState.configFormDirty,
-            error:
-              configState.configAutoSaveStatus === "error" ||
-              configState.configAutoSaveStatus === "conflict"
-                ? configState.lastError
-                : null,
+            error: configState.lastError,
           },
           channels: {
             snapshot: this.context.channels.state.channelsSnapshot,
@@ -969,7 +968,7 @@ class AgentsPage
           agentFiles: {
             list: this.agentFilesList,
             loading: this.agentFilesLoading,
-            error: this.agentFilesError,
+            error: this.agentFilesError ?? this.context.agents.files(selectedAgentId).error,
             active: this.agentFileActive,
             contents: this.agentFileContents,
             drafts: this.agentFileDrafts,

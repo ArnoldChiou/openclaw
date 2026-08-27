@@ -3,6 +3,9 @@ import { WORKER_PUBLIC_INGRESS_PATH } from "../../packages/gateway-protocol/src/
 import {
   NODE_WORKER_BUNDLE_INSTALL_COMMAND,
   NODE_WORKER_CAPACITY_EXHAUSTED_ERROR_CODE,
+  NODE_WORKER_DESKTOP_LAUNCH_COMMAND,
+  NODE_WORKER_DESKTOP_STREAM_COMMAND,
+  NODE_WORKER_PORTAL_STREAM_COMMAND,
   NODE_WORKER_SUPERVISOR_CANCEL_COMMAND,
   NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND,
   NODE_WORKER_SUPERVISOR_STATUS_COMMAND,
@@ -31,6 +34,8 @@ import {
   parseWorkerConnectionEndpoint,
   type WorkerConnectionEndpoint,
 } from "../worker/worker-connection-endpoint.js";
+import { invokeNodeWorkerDesktopLaunch } from "./desktop-launch-command.js";
+import { invokeNodeWorkerDesktopStream } from "./desktop-stream-command.js";
 import type { NodeWorkerBundleInstallerControl } from "./node-worker-bundle-installer.js";
 import { NodeWorkerCapacityExhaustedError } from "./node-worker-capacity.js";
 import {
@@ -42,6 +47,7 @@ import {
   type NodeWorkerSupervisorReceipt,
 } from "./node-worker-supervisor-contract.js";
 import type { NodeWorkerWorkspaceRuntime } from "./node-worker-workspace.js";
+import { invokeNodeWorkerPortalStream } from "./portal-stream-command.js";
 
 type NodeWorkerSupervisorCommandResult =
   | { handled: false }
@@ -53,6 +59,7 @@ type NodeWorkerSupervisorCommandResult =
         | NodeWorkerSupervisorReceipt
         | NodeWorkerWorkspaceExecResult
         | NodeWorkerWorkspaceRetainResult
+        | { status: "ready" }
         | null;
     }
   | {
@@ -119,7 +126,10 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
     params.command === NODE_WORKER_SUPERVISOR_STATUS_COMMAND ||
     params.command === NODE_WORKER_SUPERVISOR_CANCEL_COMMAND ||
     params.command === NODE_WORKER_WORKSPACE_EXEC_COMMAND ||
-    params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND;
+    params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND ||
+    params.command === NODE_WORKER_DESKTOP_STREAM_COMMAND ||
+    params.command === NODE_WORKER_DESKTOP_LAUNCH_COMMAND ||
+    params.command === NODE_WORKER_PORTAL_STREAM_COMMAND;
   if (!recognized) {
     return { handled: false };
   }
@@ -226,6 +236,36 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
                 ...(bundleStatus ? { bundleStatus } : {}),
               }
             : workspace,
+      };
+    }
+    if (params.command === NODE_WORKER_DESKTOP_STREAM_COMMAND) {
+      await invokeNodeWorkerDesktopStream({
+        paramsJSON: params.paramsJSON,
+        gatewayUrl: params.gatewayUrl,
+        gatewayTlsFingerprint: params.gatewayTlsFingerprint,
+        gatewayCloudflareAccess: params.gatewayCloudflareAccess,
+        signal: params.signal,
+      });
+      return { handled: true, ok: true, payload: null };
+    }
+    if (params.command === NODE_WORKER_PORTAL_STREAM_COMMAND) {
+      await invokeNodeWorkerPortalStream({
+        paramsJSON: params.paramsJSON,
+        gatewayUrl: params.gatewayUrl,
+        gatewayTlsFingerprint: params.gatewayTlsFingerprint,
+        gatewayCloudflareAccess: params.gatewayCloudflareAccess,
+        signal: params.signal,
+      });
+      return { handled: true, ok: true, payload: null };
+    }
+    if (params.command === NODE_WORKER_DESKTOP_LAUNCH_COMMAND) {
+      return {
+        handled: true,
+        ok: true,
+        payload: await invokeNodeWorkerDesktopLaunch({
+          paramsJSON: params.paramsJSON,
+          signal: params.signal,
+        }),
       };
     }
     const receipt =

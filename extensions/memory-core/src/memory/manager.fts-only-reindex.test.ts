@@ -4,7 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { resolveOpenClawAgentSqlitePath } from "openclaw/plugin-sdk/sqlite-runtime";
+import { closeOpenClawAgentDatabasesForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { closeAllMemorySearchManagers, getMemorySearchManager } from "./index.js";
 import type { MemoryIndexMeta } from "./manager-reindex-state.js";
@@ -34,7 +36,7 @@ const createEmbeddingProviderMock = vi.hoisted(() =>
             }
             return texts.map(() => [1, 0]);
           },
-          embedQuery: async () => {
+          embed: async () => {
             providerQueryCalls += 1;
             return [1, 0];
           },
@@ -107,6 +109,10 @@ describe("memory manager FTS-only reindex", () => {
 
   afterAll(async () => {
     await closeAllMemorySearchManagers();
+    // The agent close releases its leases through shared state and reopens it, so the
+    // shared handle is released second; otherwise Windows fails the removal with EBUSY.
+    closeOpenClawAgentDatabasesForTest();
+    resetPluginStateStoreForTests();
     if (fixtureRoot) {
       await fs.rm(fixtureRoot, { recursive: true, force: true });
     }

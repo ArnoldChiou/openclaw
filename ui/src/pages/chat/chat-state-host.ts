@@ -22,6 +22,7 @@ import type { ChatProps } from "./chat-view.ts";
 import type { BackgroundTasksHost } from "./components/chat-background-tasks.ts";
 import type { SessionWorkspaceHost } from "./components/chat-session-workspace.ts";
 import type { SidebarContent } from "./components/chat-sidebar.ts";
+import type { ChatExportResult } from "./export.ts";
 import type { ChatInputHistoryKeyInput, ChatInputHistoryKeyResult } from "./input-history.ts";
 import type { RenderLifecycle } from "./render-lifecycle.ts";
 import type { PendingChatAbort } from "./run-lifecycle.ts";
@@ -62,11 +63,13 @@ export type ChatPageHost = ChatHost &
     chatSendingScopeKey: string | null;
     chatMessagesBySession: ChatMessageCache;
     basePath: string;
+    resourceBasePath: string;
     chatAvatarUrl: string | null;
     chatAvatarSource: string | null;
     chatAvatarStatus: "none" | "local" | "remote" | "data" | null;
     chatAvatarReason: string | null;
     chatModelSwitchPromises: Record<string, Promise<boolean>>;
+    chatModelPickerOpenSessionKey?: string | null;
     chatModelCatalog: ModelCatalogEntry[];
     chatModelCatalogError: string | null;
     modelAuthStatusResult: ModelAuthStatusResult | null;
@@ -118,6 +121,7 @@ export type ChatPageHost = ChatHost &
     chatScrollToEnd?: (options: { behavior?: ScrollBehavior }) => void;
     sidebarLayout: SidebarLayout;
     sidebarContent: SidebarContent | null;
+    attachmentSidebarContent: Extract<SidebarContent, { kind: "attachment" }> | null;
     sidebarFocusPanelId: string;
     sidebarFocusVersion: number;
     updateSidebarActivePanel: (panelId: string) => void;
@@ -134,7 +138,11 @@ export type ChatPageHost = ChatHost &
     handleChatScroll: (event: Event) => void;
     handleChatDraftChange: (next: string) => void;
     handleChatInputHistoryKey: (input: ChatInputHistoryKeyInput) => ChatInputHistoryKeyResult;
-    handleSendChat: (messageOverride?: string, options?: unknown) => Promise<void>;
+    handleSendChat: (
+      messageOverride?: string,
+      options?: unknown,
+      submissionAction?: Event,
+    ) => Promise<void>;
     handleAbortChat: (options?: unknown) => Promise<void>;
     removeQueuedMessage: (id: string) => void;
     retryQueuedChatMessage: (id: string) => Promise<void>;
@@ -144,7 +152,7 @@ export type ChatPageHost = ChatHost &
     updateQueuedChatMessageEdit: (draftText: string) => void;
     submitQueuedChatMessageEdit: () => void;
     cancelQueuedChatMessageEdit: () => void;
-    handleCloseSidebar: () => void;
+    handleCloseSidebar: (slot: "detail" | "workspace") => void;
     updateSidebarLayout: (layout: SidebarLayout) => void;
     beginImageOpen: () => number;
     handleOpenImage: (item: ImageLightboxItem, requestVersion?: number) => void;
@@ -152,7 +160,7 @@ export type ChatPageHost = ChatHost &
     announceSessionSwitch?: (sessionKey: string, label: string) => void;
     createChatSession?: () => Promise<boolean>;
     confirmConversationReset?: () => Promise<boolean>;
-    exportCurrentChat?: () => Promise<void> | void;
+    exportCurrentChat?: () => Promise<ChatExportResult> | ChatExportResult;
     refreshCurrentSessionTools?: () => Promise<void>;
     refreshCurrentChat?: () => Promise<void>;
     refreshSessionPullRequests?: (options?: { refresh?: boolean }) => Promise<void>;

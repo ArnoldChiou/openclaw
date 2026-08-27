@@ -68,6 +68,7 @@ export type MemoryIndexEntry = {
   contentText?: string;
   lineMap?: number[];
   lineProvenance?: MemoryEntryProvenance[];
+  sessionId?: string;
 };
 
 export type MemoryIndexWorkItem = {
@@ -123,6 +124,10 @@ export abstract class MemoryManagerSyncBase {
     timeoutMs: number;
   };
   protected readonly sources: Set<MemorySource> = new Set();
+  protected readonly sourceInspections = new Map<
+    MemorySource,
+    { eligible: number | null; issues: string[] }
+  >();
   protected providerKey: string | null = null;
   protected abstract readonly vector: {
     enabled: boolean;
@@ -147,6 +152,7 @@ export abstract class MemoryManagerSyncBase {
   protected memoryWatchPressureStartupTimer: NodeJS.Timeout | null = null;
   protected closed = false;
   protected dirty = false;
+  protected memorySourceProvenanceRepairPending = false;
   // Failed full memory reindexes must retry as full rebuilds, not incremental
   // dirty syncs that can skip unchanged files against the still-live index.
   protected memoryFullRetryDirty = false;

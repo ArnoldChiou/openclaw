@@ -12,8 +12,8 @@ import type {
 export type { WorkerTunnelStatus };
 
 export class WorkerTunnelOwnerDisconnectedError extends Error {
-  constructor() {
-    super("Worker tunnel owner is no longer connected");
+  constructor(message = "Worker tunnel owner is no longer connected") {
+    super(message);
     this.name = "WorkerTunnelOwnerDisconnectedError";
   }
 }
@@ -57,6 +57,7 @@ export type WorkerWorkspaceSyncRequest = {
   localPath: string;
   sessionId: string;
   generation: number;
+  gitAuthor?: { name?: string; email?: string };
 };
 
 export type WorkerWorkspaceSyncResult = {
@@ -103,6 +104,9 @@ export type WorkerTurnLaunchRequest = {
   plan: WorkerLaunchPlan;
   turnClaim: WorkerSessionTurnClaim;
   timeoutMs?: number;
+  // Expiry of the minted admission credential; launch adapters cap admission
+  // re-arms so no advertised retry can outlive it.
+  credentialExpiresAtMs?: number;
   signal?: AbortSignal;
   onDispatchReady?: () => void;
 };

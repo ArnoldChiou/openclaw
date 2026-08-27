@@ -11,6 +11,8 @@ const BuzzGroupConfigSchema = z
   .object({
     enabled: z.boolean().optional(),
     requireMention: z.boolean().optional(),
+    groupPolicy: GroupPolicySchema.optional(),
+    groupAllowFrom: z.array(z.union([z.string(), z.number()])).optional(),
   })
   .strict();
 
@@ -19,6 +21,7 @@ const RawBuzzConfigSchema = z
     name: z.string().optional(),
     enabled: z.boolean().optional(),
     configWrites: z.boolean().optional(),
+    responsePrefix: z.string().optional(),
     markdown: MarkdownConfigSchema,
     relayUrl: z
       .string()

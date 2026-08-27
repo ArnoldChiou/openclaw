@@ -1,4 +1,7 @@
-import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import {
+  buildChannelInboundEventContext,
+  runPreparedInboundReply,
+} from "openclaw/plugin-sdk/channel-inbound";
 import { resolveStableChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
 // Buzz tests cover inbound room admission, mention gating, and reply delivery.
 import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
@@ -73,8 +76,9 @@ function createMessage(overrides: Partial<BuzzInboundMessage> = {}): BuzzInbound
   };
 }
 
-function createSignal(): AbortSignal {
-  return new AbortController().signal;
+function createLifecycle() {
+  const signal = new AbortController().signal;
+  return { signal, assertCurrent: () => signal.throwIfAborted() };
 }
 
 function createBus(): BuzzBus {
@@ -110,18 +114,18 @@ describe("handleBuzzInbound", () => {
   it("accepts a native Nostr public-key mention", async () => {
     const runtime = createPluginRuntimeMock();
     setBuzzRuntime(runtime);
-    const signal = createSignal();
+    const lifecycle = createLifecycle();
 
     await handleBuzzInbound({
       account: createAccount(),
       cfg: {} satisfies OpenClawConfig,
       bus: createBus(),
       message: createMessage({ mentionedPubkeys: [BOT_PUBLIC_KEY] }),
-      signal,
+      ...lifecycle,
     });
 
     expect(runtime.channel.inbound.dispatch).toHaveBeenCalledTimes(1);
-    expect(firstDispatch(runtime).replyOptions?.abortSignal).toBe(signal);
+    expect(firstDispatch(runtime).replyOptions?.abortSignal).toBe(lifecycle.signal);
     expect(firstDispatch(runtime).ctxPayload).toMatchObject({
       WasMentioned: true,
       SenderId: SENDER_PUBLIC_KEY,
@@ -190,7 +194,7 @@ describe("handleBuzzInbound", () => {
       cfg: {} satisfies OpenClawConfig,
       bus,
       message: createMessage(),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     expect(firstDispatch(runtime).ctxPayload).toMatchObject({
@@ -213,7 +217,7 @@ describe("handleBuzzInbound", () => {
       cfg: {} satisfies OpenClawConfig,
       bus: createBus(),
       message: createMessage({ text: "@openclaw status" }),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     expect(runtime.channel.inbound.dispatch).toHaveBeenCalledTimes(1);
@@ -229,11 +233,64 @@ describe("handleBuzzInbound", () => {
       cfg: {} satisfies OpenClawConfig,
       bus: createBus(),
       message: createMessage(),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["membership", true],
+    ["shutdown", true],
+    ["membership", false],
+    ["shutdown", false],
+  ] as const)(
+    "rechecks %s after asynchronous ingress admission (mentioned: %s)",
+    async (change, mentioned) => {
+      const runtime = createPluginRuntimeMock();
+      setBuzzRuntime(runtime);
+      const actual = await vi.importActual<
+        typeof import("openclaw/plugin-sdk/channel-ingress-runtime")
+      >("openclaw/plugin-sdk/channel-ingress-runtime");
+      const abort = new AbortController();
+      let currentMember = true;
+      let releaseAdmission: () => void = () => {};
+      const admissionGate = new Promise<void>((resolve) => {
+        releaseAdmission = resolve;
+      });
+      vi.mocked(resolveStableChannelMessageIngress).mockImplementationOnce(async (params) => {
+        const access = await actual.resolveStableChannelMessageIngress(params);
+        await admissionGate;
+        return access;
+      });
+      const params = {
+        account: createAccount(),
+        cfg: {} satisfies OpenClawConfig,
+        bus: createBus(),
+        message: createMessage({ mentionedPubkeys: mentioned ? [BOT_PUBLIC_KEY] : [] }),
+        signal: abort.signal,
+        assertCurrent: () => {
+          abort.signal.throwIfAborted();
+          if (!currentMember) {
+            throw new Error("Buzz sender is no longer a room member");
+          }
+        },
+      };
+      const inbound = handleBuzzInbound(params);
+      await vi.waitFor(() => expect(resolveStableChannelMessageIngress).toHaveBeenCalledOnce());
+      if (change === "membership") {
+        currentMember = false;
+      } else {
+        abort.abort(new Error("Buzz bus closed"));
+      }
+      releaseAdmission();
+
+      await expect(inbound).rejects.toThrow(
+        change === "membership" ? "no longer a room member" : "Buzz bus closed",
+      );
+      expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
+    },
+  );
 
   it("drops mentioned room messages from senders outside the allowlist", async () => {
     const runtime = createPluginRuntimeMock();
@@ -247,10 +304,151 @@ describe("handleBuzzInbound", () => {
       cfg: {} satisfies OpenClawConfig,
       bus: createBus(),
       message: createMessage({ mentionedPubkeys: [BOT_PUBLIC_KEY] }),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { role: "bot", enabled: true, dispatches: 1 },
+    { role: "member", enabled: true, dispatches: 2 },
+    { role: undefined, enabled: true, dispatches: 2 },
+    { role: "bot", enabled: false, dispatches: 2 },
+  ])(
+    "bounds current roster role $role with protection enabled=$enabled",
+    async ({ role, enabled, dispatches }) => {
+      const runtime = createPluginRuntimeMock();
+      const runDispatch = vi.fn(async () => ({
+        queuedFinal: false,
+        counts: { tool: 0, block: 0, final: 1 },
+      }));
+      const recordInboundSession = vi.fn(async () => undefined);
+      vi.mocked(runtime.channel.inbound.dispatch).mockImplementation(async (params) =>
+        runPreparedInboundReply({
+          ...params,
+          routeSessionKey: params.route.sessionKey,
+          storePath: "/unused/buzz-bot-loop",
+          recordInboundSession,
+          runDispatch,
+        }),
+      );
+      setBuzzRuntime(runtime);
+      const bus = createBus();
+      bus.directory.replaceMemberships(
+        new Map([
+          [
+            ROOM_ID,
+            {
+              roomId: ROOM_ID,
+              createdAt: 1_777_000_000,
+              eventId: "membership-bot-loop",
+              publisherPublicKey: OTHER_PUBLIC_KEY,
+              members: new Set([BOT_PUBLIC_KEY, SENDER_PUBLIC_KEY]),
+              roles: new Map(role ? [[SENDER_PUBLIC_KEY, role]] : []),
+            },
+          ],
+        ]),
+      );
+      const account = createAccount({ groups: { [ROOM_ID]: { requireMention: false } } });
+      const relayHost = `loop-${role ?? "unknown"}-${enabled}.example.test`;
+      account.relayUrl = `wss://${relayHost}/`;
+      const cfg = {
+        channels: {
+          defaults: {
+            botLoopProtection: {
+              enabled,
+              maxEventsPerWindow: 1,
+              windowSeconds: 60,
+              cooldownSeconds: 60,
+            },
+          },
+        },
+      } satisfies OpenClawConfig;
+      for (const [index, id] of ["loop-first", "loop-second"].entries()) {
+        if (index === 1) {
+          account.relayUrl = `wss://${relayHost.toUpperCase()}:443/`;
+        }
+        await handleBuzzInbound({
+          account,
+          cfg,
+          bus,
+          message: createMessage({ id, threadId: id, createdAt: 1_777_000_000 + index * 86_400 }),
+          ...createLifecycle(),
+        });
+      }
+
+      expect(runDispatch).toHaveBeenCalledTimes(dispatches);
+      expect(recordInboundSession).toHaveBeenCalledTimes(dispatches);
+    },
+  );
+
+  it.each([
+    {
+      name: "restricts an otherwise open account to the room allowlist",
+      accountPolicy: "open",
+      accountAllowFrom: undefined,
+      room: { groupPolicy: "allowlist", groupAllowFrom: [OTHER_PUBLIC_KEY] },
+      dispatches: false,
+    },
+    {
+      name: "opens one room without changing the account allowlist",
+      accountPolicy: "allowlist",
+      accountAllowFrom: [OTHER_PUBLIC_KEY],
+      room: { groupPolicy: "open" },
+      dispatches: true,
+    },
+    {
+      name: "inherits the account policy with a room-specific allowlist",
+      accountPolicy: "allowlist",
+      accountAllowFrom: [OTHER_PUBLIC_KEY],
+      room: { groupAllowFrom: [SENDER_PUBLIC_KEY] },
+      dispatches: true,
+    },
+    {
+      name: "keeps an explicitly empty room allowlist fail-closed",
+      accountPolicy: "allowlist",
+      accountAllowFrom: [SENDER_PUBLIC_KEY],
+      room: { groupAllowFrom: [] },
+      dispatches: false,
+    },
+    {
+      name: "inherits the account allowlist when a room only sets its policy",
+      accountPolicy: "open",
+      accountAllowFrom: [SENDER_PUBLIC_KEY],
+      room: { groupPolicy: "allowlist" },
+      dispatches: true,
+    },
+    {
+      name: "disables one room without changing the account policy",
+      accountPolicy: "open",
+      accountAllowFrom: undefined,
+      room: { groupPolicy: "disabled" },
+      dispatches: false,
+    },
+  ] as const)("$name", async ({ accountPolicy, accountAllowFrom, room, dispatches }) => {
+    const runtime = createPluginRuntimeMock();
+    setBuzzRuntime(runtime);
+
+    await handleBuzzInbound({
+      account: createAccount({
+        groupPolicy: accountPolicy,
+        groupAllowFrom: accountAllowFrom ? [...accountAllowFrom] : undefined,
+        groups: {
+          [ROOM_ID]: {
+            requireMention: false,
+            ...room,
+            groupAllowFrom: room.groupAllowFrom ? [...room.groupAllowFrom] : undefined,
+          },
+        },
+      }),
+      cfg: {} satisfies OpenClawConfig,
+      bus: createBus(),
+      message: createMessage(),
+      ...createLifecycle(),
+    });
+
+    expect(runtime.channel.inbound.dispatch).toHaveBeenCalledTimes(dispatches ? 1 : 0);
   });
 
   it("authorizes commands from an allowlisted room sender", async () => {
@@ -262,14 +460,15 @@ describe("handleBuzzInbound", () => {
     await handleBuzzInbound({
       account: createAccount({
         groupPolicy: "allowlist",
-        groupAllowFrom: [SENDER_PUBLIC_KEY],
+        groupAllowFrom: [OTHER_PUBLIC_KEY],
+        groups: { [ROOM_ID]: { requireMention: true, groupAllowFrom: [SENDER_PUBLIC_KEY] } },
       }),
       cfg: {} satisfies OpenClawConfig,
       bus: createBus(),
       message: createMessage({
         text: "/status",
       }),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     expect(runtime.channel.inbound.dispatch).toHaveBeenCalledTimes(1);
@@ -290,13 +489,13 @@ describe("handleBuzzInbound", () => {
       cfg: {} satisfies OpenClawConfig,
       bus: createBus(),
       message: createMessage({ text: "/status" }),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
   });
 
-  it("preserves Buzz thread and reply identifiers for agent replies", async () => {
+  it("anchors Buzz agent replies and typing to the original thread root", async () => {
     const runtime = createPluginRuntimeMock();
     setBuzzRuntime(runtime);
     const bus = createBus();
@@ -310,7 +509,7 @@ describe("handleBuzzInbound", () => {
         threadId: "event-root",
         mentionedPubkeys: [BOT_PUBLIC_KEY],
       }),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     const dispatch = firstDispatch(runtime);
@@ -329,7 +528,7 @@ describe("handleBuzzInbound", () => {
       channelId: ROOM_ID,
       text: "threaded reply to @Alice",
       threadId: "event-root",
-      replyToId: "event-reply",
+      replyToId: "event-root",
     });
 
     const typing = dispatch.replyPipeline?.typing;
@@ -338,7 +537,7 @@ describe("handleBuzzInbound", () => {
     expect(bus.sendTyping).toHaveBeenCalledWith({
       channelId: ROOM_ID,
       threadId: "event-root",
-      replyToId: "event-reply",
+      replyToId: "event-root",
     });
   });
 
@@ -368,7 +567,7 @@ describe("handleBuzzInbound", () => {
           truncated: true,
         },
       }),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     expect(runtime.channel.commands.shouldComputeCommandAuthorized).not.toHaveBeenCalled();
@@ -407,7 +606,7 @@ describe("handleBuzzInbound", () => {
           truncated: false,
         },
       }),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     expect(runtime.channel.mentions.matchesMentionPatterns).not.toHaveBeenCalled();
@@ -423,7 +622,7 @@ describe("handleBuzzInbound", () => {
       cfg: {} satisfies OpenClawConfig,
       bus: createBus(),
       message: createMessage({ mentionedPubkeys: [BOT_PUBLIC_KEY] }),
-      signal: createSignal(),
+      ...createLifecycle(),
     });
 
     const dispatch = firstDispatch(runtime);

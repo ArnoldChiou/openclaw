@@ -1,6 +1,8 @@
 // Verifies default config values and environment-sensitive overrides.
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProviderResolveModelRoutesContext } from "../plugin-sdk/provider-model-types.js";
+import { resolveProviderModelRoutes } from "../plugins/provider-model-routes.js";
 import {
   DEFAULT_SUBAGENT_ARCHIVE_AFTER_MINUTES,
   DEFAULT_SUBAGENT_MAX_CONCURRENT,
@@ -11,6 +13,8 @@ import {
   applyContextPruningDefaults,
   applyMessageDefaults,
 } from "./defaults.js";
+import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "./runtime-snapshot.js";
+import type { OpenClawConfig } from "./types.openclaw.js";
 
 const mocks = vi.hoisted(() => ({
   applyProviderConfigDefaultsForConfig: vi.fn(),
@@ -32,6 +36,7 @@ describe("config defaults", () => {
   });
 
   afterEach(() => {
+    clearRuntimeConfigSnapshot();
     vi.unstubAllEnvs();
   });
 
@@ -158,6 +163,7 @@ describe("applyModelDefaults catalog seeding", () => {
                   maxTokens: 128_000,
                   cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
                   thinkingLevelMap: { off: "none" },
+                  compat: { supportsStore: false },
                 },
               ],
             },
@@ -243,6 +249,46 @@ describe("applyModelDefaults catalog seeding", () => {
     expect(model.maxTokens).toBe(4_096);
   });
 
+  it("keeps catalog-seeded compatibility out of authored route overrides", async () => {
+    const { applyModelDefaults } = await import("./defaults.js");
+    const sourceConfig: OpenClawConfig = {
+      models: {
+        providers: {
+          openai: {
+            baseUrl: "https://api.openai.com/v1",
+            models: [
+              {
+                id: "gpt-5.6-sol",
+                name: "GPT-5.6 Sol",
+                reasoning: true,
+                input: ["text"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                maxTokens: 8192,
+              },
+            ],
+          },
+        },
+      },
+    };
+    const runtimeConfig = applyModelDefaults(sourceConfig, { manifestRegistry: catalogRegistry });
+    setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
+    const resolveModelRoutes = vi.fn((_context: ProviderResolveModelRoutesContext) => ({
+      kind: "indeterminate" as const,
+    }));
+
+    resolveProviderModelRoutes({
+      provider: "openai",
+      modelId: "gpt-5.6-sol",
+      config: runtimeConfig,
+      env: {},
+      surface: { resolveModelRoutes },
+    });
+
+    expect(resolveModelRoutes.mock.calls[0]?.[0]).toMatchObject({
+      requestTransportOverrides: "none",
+    });
+  });
+
   it("preserves catalog tiered pricing when flat cost fields are authored", async () => {
     const { applyModelDefaults } = await import("./defaults.js");
     const tieredRegistry = {
@@ -308,6 +354,56 @@ describe("applyModelDefaults catalog seeding", () => {
     expect(model.cost?.input).toBe(4);
     expect(model.cost?.tieredPricing).toHaveLength(1);
     expect(model.input).toEqual(["text", "image"]);
+  });
+
+  it("copies frozen catalog metadata before downstream normalization", async () => {
+    const supportedReasoningEfforts = Object.freeze(["low", "high"]);
+    const compat = Object.freeze({ supportedReasoningEfforts });
+    const frozenRegistry = {
+      plugins: [
+        {
+          id: "openai",
+          modelCatalog: {
+            providers: {
+              openai: {
+                models: [
+                  Object.freeze({
+                    id: "gpt-5.6-sol",
+                    name: "GPT-5.6 Sol",
+                    reasoning: true,
+                    compat,
+                  }),
+                ],
+              },
+            },
+          },
+        },
+      ],
+      // SAFETY: minimal frozen manifest record reproducing production registry ownership.
+    } as never;
+    const { applyModelDefaults } = await import("./defaults.js");
+    const cfg = applyModelDefaults(
+      {
+        models: {
+          providers: {
+            openai: {
+              baseUrl: "https://api.openai.com/v1",
+              models: [{ id: "gpt-5.6-sol", name: "GPT-5.6" } as never],
+            },
+          },
+        },
+      },
+      { manifestRegistry: frozenRegistry },
+    );
+    const model = expectDefined(
+      cfg.models?.providers?.openai?.models?.[0],
+      "materialized model entry",
+    );
+
+    expect(() => {
+      model.compat!.supportedReasoningEfforts = ["low"];
+    }).not.toThrow();
+    expect(compat.supportedReasoningEfforts).toEqual(["low", "high"]);
   });
 
   it("falls back to generic defaults when no catalog row matches", async () => {

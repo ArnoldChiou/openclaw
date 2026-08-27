@@ -11,6 +11,7 @@ import type { PluginRegistry } from "../registry-types.js";
 
 type PluginRuntimeGatewayRequestScope = {
   context?: GatewayRequestContext;
+  resolveGatewayContext?: GatewayContextResolver;
   client?: GatewayRequestOptions["client"];
   isWebchatConnect: GatewayRequestOptions["isWebchatConnect"];
   pluginId?: string;
@@ -31,6 +32,7 @@ type PluginRuntimePluginScope = {
 const PLUGIN_RUNTIME_GATEWAY_REQUEST_SCOPE_KEY: unique symbol = Symbol.for(
   "openclaw.pluginRuntimeGatewayRequestScope",
 );
+const GATEWAY_CONTEXT_RESOLVERS_KEY: unique symbol = Symbol.for("openclaw.gatewayContextResolvers");
 
 const pluginRuntimeGatewayRequestScope = resolveGlobalSingleton<
   AsyncLocalStorage<PluginRuntimeGatewayRequestScope>
@@ -38,7 +40,11 @@ const pluginRuntimeGatewayRequestScope = resolveGlobalSingleton<
   PLUGIN_RUNTIME_GATEWAY_REQUEST_SCOPE_KEY,
   () => new AsyncLocalStorage<PluginRuntimeGatewayRequestScope>(),
 );
-const gatewayContextResolvers = new WeakMap<object, GatewayContextResolver>();
+// Built plugin chunks and source Gateway code must redeem the same host-issued owner bindings.
+const gatewayContextResolvers = resolveGlobalSingleton<WeakMap<object, GatewayContextResolver>>(
+  GATEWAY_CONTEXT_RESOLVERS_KEY,
+  () => new WeakMap(),
+);
 
 export function bindGatewayContextResolver(
   owner: object,
@@ -53,6 +59,15 @@ export const getGatewayContextResolver = (owner: object) => gatewayContextResolv
 
 export const clearGatewayContextResolver = (owner: object) => gatewayContextResolvers.delete(owner);
 
+export function getSharedGatewayContextResolver(
+  owners: readonly object[],
+): GatewayContextResolver | undefined {
+  const first = owners[0] ? gatewayContextResolvers.get(owners[0]) : undefined;
+  return first && owners.every((owner) => gatewayContextResolvers.get(owner) === first)
+    ? first
+    : undefined;
+}
+
 /**
  * Runs plugin gateway handlers with request-scoped context that runtime helpers can read.
  */
@@ -61,6 +76,27 @@ export function withPluginRuntimeGatewayRequestScope<T>(
   run: () => T,
 ): T {
   return pluginRuntimeGatewayRequestScope.run(scope, run);
+}
+
+/** Runs detached plugin work against one lifecycle-fenced Gateway instance. */
+export function withPluginRuntimeGatewayContextResolver<T>(
+  resolveGatewayContext: GatewayContextResolver,
+  run: () => T,
+  options?: { inheritRequestScope?: boolean },
+): T {
+  // Scheduler-owned work must not retain the request-local client or context
+  // that happened to exist when its timer was armed.
+  const current =
+    options?.inheritRequestScope === false
+      ? undefined
+      : pluginRuntimeGatewayRequestScope.getStore();
+  const scoped: PluginRuntimeGatewayRequestScope = {
+    ...current,
+    isWebchatConnect: current?.isWebchatConnect ?? (() => false),
+    resolveGatewayContext,
+  };
+  delete scoped.context;
+  return pluginRuntimeGatewayRequestScope.run(scoped, run);
 }
 
 /** Runs work against an owned registry handle while preserving any gateway request facts. */

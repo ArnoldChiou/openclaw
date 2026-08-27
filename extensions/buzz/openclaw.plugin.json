@@ -26,6 +26,9 @@
           "enabled": {
             "type": "boolean"
           },
+          "responsePrefix": {
+            "type": "string"
+          },
           "markdown": {
             "type": "object",
             "properties": {
@@ -212,6 +215,23 @@
                 },
                 "requireMention": {
                   "type": "boolean"
+                },
+                "groupPolicy": {
+                  "type": "string",
+                  "enum": ["open", "disabled", "allowlist"]
+                },
+                "groupAllowFrom": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "number"
+                      }
+                    ]
+                  }
                 }
               },
               "additionalProperties": false

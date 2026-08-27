@@ -2,10 +2,15 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionsDiffResult } from "../../../../../packages/gateway-protocol/src/index.js";
+import {
+  clearNativeGatewayTestState,
+  setNativeGatewayTestState,
+} from "../../../test-helpers/native-gateways.ts";
 import type { SessionDiffFileTextLoader, SessionDiffLoader } from "./session-diff-panel.ts";
 import "./session-diff-panel.ts";
 
 type SessionDiffElement = HTMLElement & {
+  execNode: string | null;
   loadFileText: SessionDiffFileTextLoader | null;
   loader: SessionDiffLoader | null;
   readonly updateComplete: Promise<boolean>;
@@ -69,9 +74,98 @@ function fileResult(patch: string): SessionsDiffResult {
 
 afterEach(() => {
   document.body.replaceChildren();
+  clearNativeGatewayTestState();
+  vi.restoreAllMocks();
+  Reflect.deleteProperty(navigator, "clipboard");
 });
 
 describe("SessionDiffPanel", () => {
+  it.each([
+    { surface: "file", failed: false, feedback: "Copied!" },
+    { surface: "file", failed: true, feedback: "Copy failed" },
+    { surface: "sync", failed: false, feedback: "Copied!" },
+    { surface: "sync", failed: true, feedback: "Copy failed" },
+  ])(
+    "keeps $surface path copy feedback visible: $feedback",
+    async ({ surface, failed, feedback }) => {
+      const writeText = failed
+        ? vi.fn().mockRejectedValue(new DOMException("Clipboard access denied", "NotAllowedError"))
+        : vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText },
+      });
+      setNativeGatewayTestState(null);
+      const panel = document.createElement("openclaw-session-diff") as SessionDiffElement;
+      panel.loader = vi.fn(async () => ({ ...fileResult(SNAPSHOT_PATCH), root: "/workspace" }));
+      document.body.append(panel);
+
+      const triggerSelector =
+        surface === "file" ? ".session-diff__file-menu" : ".session-diff__toolbar-button";
+      await vi.waitFor(() => expect(panel.querySelector(triggerSelector)).not.toBeNull());
+      panel.querySelector<HTMLButtonElement>(triggerSelector)?.click();
+      await panel.updateComplete;
+
+      const menu = panel.querySelector("openclaw-session-diff-menu");
+      expect(menu).not.toBeNull();
+      const label = surface === "file" ? "Copy Path" : "Checkout path";
+      const button = menu?.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+
+      button?.click();
+      await vi.waitFor(() => expect(button?.getAttribute("aria-label")).toBe(feedback));
+
+      expect(writeText).toHaveBeenCalledWith(surface === "file" ? "example.txt" : "/workspace");
+      expect(button?.dataset[failed ? "error" : "copied"]).toBe("1");
+      expect(panel.querySelector("openclaw-session-diff-menu")).toBe(menu);
+    },
+  );
+
+  it.each([
+    { name: "plain browser", nativeGateway: null, offered: false },
+    { name: "native local gateway", nativeGateway: "local", offered: true },
+    { name: "native remote gateway", nativeGateway: "remote", offered: false },
+    {
+      name: "remote execution node",
+      nativeGateway: "local",
+      execNode: "build-mac",
+      offered: false,
+    },
+  ] as const)("offers file editors only for native-local checkouts: $name", async (testCase) => {
+    setNativeGatewayTestState(testCase.nativeGateway);
+    const panel = document.createElement("openclaw-session-diff") as SessionDiffElement;
+    panel.execNode = "execNode" in testCase ? (testCase.execNode ?? null) : null;
+    panel.loader = vi.fn(async () => ({ ...fileResult(SNAPSHOT_PATCH), root: "/workspace" }));
+    document.body.append(panel);
+
+    await vi.waitFor(() => expect(panel.querySelector(".session-diff__file-menu")).not.toBeNull());
+    panel.querySelector<HTMLButtonElement>(".session-diff__file-menu")?.click();
+    await panel.updateComplete;
+
+    const menu = panel.querySelector("openclaw-session-diff-menu");
+    expect(menu?.textContent?.includes("Open in Editor")).toBe(testCase.offered);
+    expect(menu?.textContent?.includes("Cursor")).toBe(testCase.offered);
+  });
+
+  it("closes an open editor menu when the native gateway switches to remote", async () => {
+    setNativeGatewayTestState("local");
+    const panel = document.createElement("openclaw-session-diff") as SessionDiffElement;
+    panel.loader = vi.fn(async () => ({ ...fileResult(SNAPSHOT_PATCH), root: "/workspace" }));
+    document.body.append(panel);
+
+    await vi.waitFor(() => expect(panel.querySelector(".session-diff__file-menu")).not.toBeNull());
+    panel.querySelector<HTMLButtonElement>(".session-diff__file-menu")?.click();
+    await panel.updateComplete;
+    expect(panel.querySelector("openclaw-session-diff-menu")?.textContent).toContain(
+      "Open in Editor",
+    );
+
+    setNativeGatewayTestState("remote");
+    await panel.updateComplete;
+
+    expect(panel.querySelector("openclaw-session-diff-menu")).toBeNull();
+  });
+
   it("commits only the latest loader result after a rapid loader change", async () => {
     const first = deferred<SessionsDiffResult>();
     const second = deferred<SessionsDiffResult>();

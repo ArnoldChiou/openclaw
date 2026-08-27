@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { resolveSystemAgentTargetAgentId } from "../agents/agent-scope-config.js";
+import { resolveAmbientOwnerAgentId } from "../agents/agent-scope-config.js";
 import {
   type CodexCliApiKeyCredential,
   readCodexCliActiveApiKey,
@@ -125,7 +125,7 @@ async function activateSetupInferenceUnredacted(
   // The source snapshot includes raw compatibility migrations for comparison,
   // while the writer still projects changes back onto the untouched authored bytes.
   const sourceCfg: OpenClawConfig = snapshot.sourceConfig ?? snapshot.config;
-  const routeAgentId = resolveSystemAgentTargetAgentId(cfg, params.agentId);
+  const routeAgentId = resolveAmbientOwnerAgentId(cfg, params.agentId);
   const workspace = params.workspace?.trim()
     ? resolveUserPath(params.workspace)
     : (
@@ -189,7 +189,7 @@ async function activateSetupInferenceUnredacted(
       testPlan = {
         ...plan,
         config: stagedConfig,
-        routeAgentId: resolveSystemAgentTargetAgentId(stagedConfig, params.agentId),
+        routeAgentId: resolveAmbientOwnerAgentId(stagedConfig, params.agentId),
       };
     }
 
@@ -223,16 +223,11 @@ async function activateSetupInferenceUnredacted(
         runtime: params.runtime,
         workspaceDir: tempDir,
       });
-      if (!ensured.installed) {
+      if (!ensured.ok) {
         return {
           ok: false,
           status: ensured.status === "timed_out" ? "timeout" : "unavailable",
-          error:
-            ensured.status === "timed_out"
-              ? "Codex runtime plugin installation timed out. Try again."
-              : ensured.reason
-                ? `Could not enable the Codex runtime plugin: ${ensured.reason}.`
-                : "Could not install the Codex runtime plugin. Try again once the plugin is available.",
+          error: ensured.message,
         };
       }
       codexRegistryNeedsReload = true;
@@ -527,6 +522,7 @@ async function activateSetupInferenceUnredacted(
     }
     let committedConfig: OpenClawConfig | undefined;
     let autoLocalModelLeanApplied = false;
+    let gatewayRestartRequired = false;
     if (!needsPersistence) {
       const latestSnapshot = await readSnapshot();
       const latestRuntime =
@@ -571,6 +567,7 @@ async function activateSetupInferenceUnredacted(
         committedConfig,
         autoLocalModelLeanApplied,
         codexInstallOwnership,
+        gatewayRestartRequired,
       };
       const persistenceFailure = await persistActivatedSetupInference({
         params,
@@ -597,7 +594,12 @@ async function activateSetupInferenceUnredacted(
       if (persistenceFailure) {
         return persistenceFailure;
       }
-      ({ committedConfig, autoLocalModelLeanApplied, codexInstallOwnership } = persistenceState);
+      ({
+        committedConfig,
+        autoLocalModelLeanApplied,
+        codexInstallOwnership,
+        gatewayRestartRequired,
+      } = persistenceState);
     }
     if (codexRegistryNeedsReload && committedConfig) {
       const reloadedRuntimeConfig = await reloadCodexRegistryAfterActivation({
@@ -663,6 +665,9 @@ async function activateSetupInferenceUnredacted(
       modelRef: plan.modelRef,
       latencyMs: test.latencyMs,
       lines,
+      ...(params.surface === "gateway" && gatewayRestartRequired
+        ? { gatewayRestartRequired: true as const }
+        : {}),
     };
   } finally {
     let codexCleanupError: SetupInferenceActivationIndeterminateError | undefined;

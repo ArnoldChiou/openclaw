@@ -27,6 +27,14 @@ import {
   type AbortAndDrainEmbeddedAgentRunResult,
   type EmbeddedAgentQueueMessageOptions,
 } from "../agents/embedded-agent-runner/runs.js";
+import { runStructuredInput } from "../agents/harness/structured-input-execution.js";
+import {
+  compileStructuredInputForm,
+  compileStructuredInputQuestions,
+  compileStructuredInputUrl,
+  isStructuredInputRecord,
+  snapshotStructuredInput,
+} from "../agents/harness/structured-input.js";
 import type { SandboxFsBridge } from "../agents/sandbox/fs-bridge.js";
 import { inferToolMetaFromArgsCore } from "../agents/tool-display.js";
 import {
@@ -254,6 +262,15 @@ export {
   claimPendingAgentQuestionAnswer,
   runAgentHarnessGatewayQuestion,
 } from "../agents/harness/gateway-question.js";
+/** Bounded structured-input compilation and execution for native agent harnesses. */
+export const agentHarnessStructuredInput = Object.freeze({
+  compileForm: compileStructuredInputForm,
+  compileQuestions: compileStructuredInputQuestions,
+  compileUrl: compileStructuredInputUrl,
+  isRecord: isStructuredInputRecord,
+  run: runStructuredInput,
+  snapshot: snapshotStructuredInput,
+});
 export {
   buildSkillWorkshopPromptSection,
   SKILL_WORKSHOP_TOOL_NAME,
@@ -521,6 +538,8 @@ export {
   awaitAgentEndSideEffects,
   runAgentEndSideEffects,
 } from "../agents/harness/agent-end-side-effects.js";
+export { buildEmbeddedForegroundPromptContext } from "../agents/embedded-agent-runner/run/agent-end-context.js";
+export type { EmbeddedForegroundPromptContext } from "../agents/embedded-agent-runner/run/params.js";
 export {
   awaitAgentHarnessAgentEndHook,
   getAgentHarnessHookRunner,

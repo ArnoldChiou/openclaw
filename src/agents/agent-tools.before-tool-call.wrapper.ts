@@ -13,12 +13,17 @@ import {
   freezeDiagnosticTraceContext,
 } from "../infra/diagnostic-trace-context.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
-import { copyPluginToolMeta, getPluginToolMeta } from "../plugins/tools.js";
+import { getPluginToolMeta } from "../plugins/tools.js";
 import { recordRunSkillUsage } from "../skills/runtime/run-usage.js";
+import { copyBeforeToolCallWrapperMetadata } from "./agent-tool-metadata.js";
 import {
   copyAgentToolSourceExecutionGuard,
   runAgentToolSourceExecutionGuard,
 } from "./agent-tool-source-execution-guard.js";
+import {
+  recordGenericToolActionDecision,
+  runWithGenericToolActionDecision,
+} from "./agent-tools.before-tool-call.decision.js";
 import {
   buildToolContentPrivateData,
   emitSkillUsedDiagnostic,
@@ -71,7 +76,7 @@ import {
   getBeforeToolCallSourceTool,
   type BeforeToolCallDiagnosticOptions,
 } from "./before-tool-call-metadata.js";
-import { copyChannelAgentToolMeta, getChannelAgentToolMeta } from "./channel-tools.js";
+import { getChannelAgentToolMeta } from "./channel-tools.js";
 import {
   getCodeModeExecBeforeHookMetadata,
   normalizeCodeModeExecBeforeHookParams,
@@ -84,8 +89,8 @@ import {
   formatToolExecutionErrorMessage,
   isTrustedToolExecutionPreflightError,
   protectNetworkToolExecutionError,
+  registerTrustedToolNoStartError,
 } from "./tool-result-error.js";
-import { copyToolTerminalPresentation } from "./tool-terminal-presentation.js";
 import type { AnyAgentTool } from "./tools/common.js";
 
 type BeforeToolCallWrapperOptions = {
@@ -126,7 +131,7 @@ export function finalizeBeforeToolCallExecutionParams(params: {
   finalizerMode: "adapter" | "wrapped";
 }): unknown {
   const reconciledParams = reconcileCodeModeExecBeforeHookParams({
-    tool: params.tool,
+    owner: { tool: params.tool },
     originalParams: params.preparedParams,
     hookParams: params.hookParams,
     adjustedParams: params.adjustedParams,
@@ -174,6 +179,7 @@ class BeforeToolCallFailureError extends Error {
 function tagBeforeToolCallFailure(
   error: unknown,
   signal?: AbortSignal,
+  stage?: "tool_preparation" | "before_tool_call",
 ): BeforeToolCallFailureError {
   try {
     if (error instanceof BeforeToolCallFailureError) {
@@ -184,7 +190,11 @@ function tagBeforeToolCallFailure(
   }
   const message = formatToolExecutionErrorMessage(error, "before_tool_call failed");
   const disposition = resolveToolErrorDiagnostic(error, signal).terminalReason;
-  return new BeforeToolCallFailureError(message, disposition, error);
+  const tagged = new BeforeToolCallFailureError(message, disposition, error);
+  if (stage === "tool_preparation" && isTrustedToolExecutionPreflightError(error)) {
+    registerTrustedToolNoStartError(tagged);
+  }
+  return tagged;
 }
 
 /** Return the closed terminal disposition carried by a before-tool failure. */
@@ -382,7 +392,11 @@ export function wrapToolWithBeforeToolCallHook(
         reason: string;
         deniedReason: HookBlockedReason;
         toolParams: unknown;
+        genericDecision?: true;
       }) => {
+        if (blockedCall.genericDecision) {
+          recordGenericToolActionDecision(tool, toolCallId, "denied");
+        }
         const eventBase = buildEventBase(blockedCall.toolParams);
         if (hookOptions.emitDiagnostics) {
           emitTrustedDiagnosticEvent({
@@ -427,7 +441,7 @@ export function wrapToolWithBeforeToolCallHook(
         });
       } catch (error) {
         recordPreExecutionError(error, params, "tool_preparation");
-        throw tagBeforeToolCallFailure(error, signal);
+        throw tagBeforeToolCallFailure(error, signal, "tool_preparation");
       }
       const hookParams = normalizeCodeModeExecBeforeHookParams({ tool, params: preparedParams });
       const hookMetadata = getCodeModeExecBeforeHookMetadata({ tool, params: preparedParams });
@@ -444,7 +458,7 @@ export function wrapToolWithBeforeToolCallHook(
         });
       } catch (error) {
         recordPreExecutionError(error, hookParams, "before_tool_call");
-        throw tagBeforeToolCallFailure(error, signal);
+        throw tagBeforeToolCallFailure(error, signal, "before_tool_call");
       }
       if (outcome.blocked) {
         if (outcome.kind !== "veto") {
@@ -460,6 +474,7 @@ export function wrapToolWithBeforeToolCallHook(
           reason: outcome.reason,
           deniedReason: outcome.deniedReason ?? "plugin-before-tool-call",
           toolParams: outcome.params ?? hookParams,
+          genericDecision: outcome.genericDecision,
         });
       }
       let executeParams: unknown;
@@ -487,12 +502,13 @@ export function wrapToolWithBeforeToolCallHook(
         });
       } catch (error) {
         recordPreExecutionError(error, outcome.params ?? hookParams, "tool_preparation");
-        throw tagBeforeToolCallFailure(error, signal);
+        throw tagBeforeToolCallFailure(error, signal, "tool_preparation");
       }
       let onImplementationStart: (() => void) | undefined;
       if (prepareControl) {
         const decision = await prepareControl.pause(executeParams);
         if (!decision.launch) {
+          recordGenericToolActionDecision(tool, toolCallId, "suppressed");
           return INTERNAL_DISPOSED_RESULT;
         }
         onImplementationStart = decision.start;
@@ -528,13 +544,11 @@ export function wrapToolWithBeforeToolCallHook(
       try {
         let result: Awaited<ReturnType<ForwardedToolExecution>>;
         try {
-          result = await (execute as ForwardedToolExecution)(
-            toolCallId,
-            executeParams,
-            signal,
-            forwardedOnUpdate,
-            ...executionArgs,
-          );
+          const args = [toolCallId, executeParams, signal, forwardedOnUpdate, ...executionArgs];
+          const invoke = () => (execute as ForwardedToolExecution)(...args);
+          result = outcome.ownerDecision
+            ? await invoke()
+            : await runWithGenericToolActionDecision(tool, toolCallId, invoke);
         } catch (error) {
           throw tool.resultContentSource === "network" &&
             getBeforeToolCallFailureDisposition(error) === undefined
@@ -676,9 +690,7 @@ export function wrapToolWithBeforeToolCallHook(
       prepared.dispose();
     }
   };
-  copyPluginToolMeta(tool, wrappedTool);
-  copyChannelAgentToolMeta(tool as never, wrappedTool as never);
-  copyToolTerminalPresentation(tool, wrappedTool);
+  copyBeforeToolCallWrapperMetadata(tool, wrappedTool);
   Object.defineProperty(wrappedTool, BEFORE_TOOL_CALL_WRAPPED, {
     value: true,
     enumerable: true,
@@ -715,9 +727,7 @@ export function rewrapToolWithBeforeToolCallHook(
     execute: sourceTool.execute,
   };
   clearBeforeToolCallWrappedMarker(rewrapSource);
-  copyPluginToolMeta(tool, rewrapSource);
-  copyChannelAgentToolMeta(tool as never, rewrapSource as never);
-  copyToolTerminalPresentation(tool, rewrapSource);
+  copyBeforeToolCallWrapperMetadata(tool, rewrapSource);
   copyAgentToolSourceExecutionGuard(tool, rewrapSource);
   return wrapToolWithBeforeToolCallHook(rewrapSource, ctx ?? preservedContext, options);
 }

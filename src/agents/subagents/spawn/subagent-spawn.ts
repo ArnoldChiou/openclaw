@@ -19,6 +19,7 @@ import {
   recordSessionCreated,
   recordSubagentSpawned,
 } from "../../../sessions/session-state-events.js";
+import { hasPromptUnsafeControlCharacter } from "../../sanitize-for-prompt.js";
 import {
   runSpawnPipeline,
   type SpawnBackendAdapter,
@@ -91,16 +92,6 @@ function sanitizeMountPathHint(value?: string): string | undefined {
     return undefined;
   }
   return trimmed;
-}
-
-function hasPromptUnsafeControlCharacter(value: string): boolean {
-  for (const char of value) {
-    const code = char.charCodeAt(0);
-    if (code <= 0x1f || code === 0x7f || code === 0x85 || code === 0x2028 || code === 0x2029) {
-      return true;
-    }
-  }
-  return false;
 }
 
 export async function spawnSubagentDirect(
@@ -197,6 +188,7 @@ export async function spawnSubagentDirect(
       completionOwnerSessionKey: ownership.completionRequesterSessionKey,
       spawnedWorkspaceDir,
       spawnedCwd,
+      sessionPermissionPolicy: ctx.sessionPermissionPolicy,
       admissionPatch: admission.childSessionPatch,
       inheritedToolAllowlist: ctx.inheritedToolAllowlist,
       inheritedToolDenylist: ctx.inheritedToolDenylist,

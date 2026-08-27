@@ -33,6 +33,7 @@ export async function prepareGatewayKernelRequestRuntime(params: {
     getPortalService,
     terminalLaunchPolicy,
     execApprovalManager,
+    questionManager,
     cancelRunBoundApprovals,
     forwardPluginApprovalRequest,
     pluginApprovalIosPushDelivery,
@@ -67,6 +68,8 @@ export async function prepareGatewayKernelRequestRuntime(params: {
     workerEnvironmentStartup,
     workerPlacementRuntime,
     workerPlacementControlAvailable,
+    githubPublicationRuntime,
+    githubPublicationService,
     terminalSessions,
     agentRunSeq,
     chatAbortControllers,
@@ -106,10 +109,18 @@ export async function prepareGatewayKernelRequestRuntime(params: {
     minimalTestGateway,
     log,
   });
+  const configRevisionProjector = await startupTrace.measure(
+    "gateway.config-revision-key",
+    async () => {
+      const { loadGatewayConfigRevisionProjector } = await import("./config-revision-token.js");
+      return loadGatewayConfigRevisionProjector({ env: process.env });
+    },
+  );
   const gatewayRequestContext = await startupTrace.measure("gateway.request-context", async () => {
     const { createGatewayRequestContext } = await import("./server-request-context.js");
     return createGatewayRequestContext({
       deps,
+      configRevisionProjector,
       runtimeState,
       sessionCompanion,
       getRuntimeConfig,
@@ -122,6 +133,7 @@ export async function prepareGatewayKernelRequestRuntime(params: {
       resolveTerminalLaunchPolicy: terminalLaunchPolicy.resolve,
       isTerminalEnabled: terminalLaunchPolicy.isEnabled,
       execApprovalManager,
+      questionManager,
       cancelRunBoundApprovals,
       forwardPluginApprovalRequest,
       pluginApprovalIosPushDelivery,
@@ -167,11 +179,15 @@ export async function prepareGatewayKernelRequestRuntime(params: {
         ? { workerSessionPlacementService: workerEnvironmentStartup.placementStore }
         : {}),
       ...(workerPlacementRuntime
-        ? { workerPlacementDiskSpaceReader: workerPlacementRuntime.diskSpace }
+        ? {
+            workerPlacementDiskSpaceReader: workerPlacementRuntime.diskSpace,
+            workerPlacementRunnerAvailabilityReader: workerPlacementRuntime.runnerAvailability,
+          }
         : {}),
       ...(workerPlacementControlAvailable
         ? { workerPlacementDispatchService: workerPlacementControlAvailable }
         : {}),
+      ...(githubPublicationService ? { githubPublicationService } : {}),
       validateAgentRuntimeApprovalAuthority,
       terminalSessions,
       agentRunSeq,
@@ -217,9 +233,19 @@ export async function prepareGatewayKernelRequestRuntime(params: {
     flushPendingSessionsChangedEvents: shutdownRuntime.flushPendingSessionsChangedEvents,
     minimalTestGateway,
     logWarning: (message) => log.warn(message),
+    ...(!workerPlacementRuntime && githubPublicationRuntime
+      ? { reconcileGitHubPublications: githubPublicationRuntime.reconcilePublications }
+      : {}),
     sidecars: runtimeState.gatewayLifetimeSidecars,
   });
   pluginGatewayContext.current = gatewayRequestContext;
+  gatewayRequestContext.dispatchHookAgentTurn = async (pluginId, hookParams) => {
+    const transport = runtime.transportBridge.current();
+    if (!transport) {
+      throw new Error("Gateway listener must start before plugin hook dispatch");
+    }
+    return await transport.dispatchHookAgentTurn(pluginId, hookParams);
+  };
   const { createGatewayInstanceRuntime } = await import("./server-instance-runtime.js");
   const gatewayInstanceRuntime = createGatewayInstanceRuntime({
     getContext: () => gatewayRequestContext,
